@@ -265,6 +265,7 @@ work at open time, which is what we see. On a real disk the result may differ.
 | N08 | SWAR F1/F2 timestamp parse | B | `48a91c9` | CI gate PASS | CI 5.052 vs 5.136 (−1.6%, 5/7) | – | CI 16.854 vs 16.888 (−0.2%, 3/5) | – | 11.4 GB RSS | **Revert** (below −2%) |
 | N10 | Packed person key carried with rows | B | `70531fc` | CI gate PASS | CI 3.360 vs 4.401 (**−23.6%**, 7/7) | – | CI 11.433 vs 15.276 (**−25.2%**, 5/5) | – | 12.1 GB RSS | **Keep** |
 | N13 | Flat open-addressing name table | B | not pushed | local only | local 20M scan 2.40 vs 2.18 s | – | – | – | – | **Revert** (slower) |
+| N11 | NB 512 → 256 | A | `ca17f21` | CI gate PASS | CI 6.365 vs 6.561 (−3.0%, 6/7) | – | CI 22.402 vs 23.129 (−3.1%, 4/5) | – | 11.4 GB RSS | **Keep** |
 
 ## Overnight loop (2026-11-21, CI x86 timing)
 
@@ -392,3 +393,14 @@ CI (`70531fc` vs `68c57c0`; EPYC 9V45): gate PASS; **20M 4.401 → 3.360 s (−2
 Screened out locally, not pushed: *night-13 flat open-addressing name table* (one segment per link partition,
 32-byte entries at load ≤ 1/2): 20M scan 2.18 → 2.40 s, slower (the table is larger than hashbrown's, so more misses).
 *glibc `malloc.hugetlb=1`* (env only, as a probe): no change in faults or time.
+
+### Night-11: `NB` 512 → 256 hash partitions: **KEEP**
+
+A3 (on the Mac) had found 128–256 partitions faster at 20M but slower at 60M, because per-partition dedup tables
+outgrew the caches. After night-03/07/10 the tables and records are much smaller, so the sweep point was retried
+(the partition-spread test now scales with `NB`).
+
+CI (`ca17f21` vs `68c57c0`, i.e. measured before night-10 was merged; EPYC 7763): gate PASS; **20M 6.561 → 6.365 s
+(−3.0%, 6/7)**; **60M 23.129 → 22.402 s (−3.1%, 4/5)**. Merged on top of night-10; the combination was checked
+locally (all gates; 20M Parquet equal; 4 local pairs, combined build faster in 4/4, about −7%) and is timed by every
+later candidate and by the final comparison runs. BEST → this merge (night-01…07, 10, 11).
