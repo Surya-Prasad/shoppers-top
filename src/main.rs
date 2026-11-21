@@ -241,6 +241,21 @@ fn main() {
         return;
     }
 
+    // v2: nothing reads the events/clicks/links mappings after the scans (records hold keys;
+    // interned IDs own copies; products/campaigns stay mapped for output names), so they
+    // are unmapped in the background instead of during process teardown.
+    let unmapper = {
+        let spans: Vec<(usize, usize)> = all[2..].iter().map(|s| (s.bytes().as_ptr() as usize, s.bytes().len())).collect();
+        std::thread::spawn(move || {
+            for (p, l) in spans {
+                if l > 0 {
+                    // SAFETY: each span is a whole leaked mapping that is never read again
+                    unsafe { libc::munmap(p as *mut libc::c_void, l) };
+                }
+            }
+        })
+    };
+
     // ---------------------------------------------------------------- clicks
     let clicks_by_person = clicks_dedup(click_copies, &stats);
     lap("clicks");
@@ -318,7 +333,11 @@ fn main() {
     }
     // cheap self-check from rules.md: assists >= credited non-organic sessions
     assert!(stats.get(K::AssistPairs) >= stats.get(K::CreditedSessions), "assist invariant violated");
+    let _ = unmapper.join();
     lap("done");
+    // v2 P5: the outputs are complete and renamed into place; skip the destructors of the
+    // remaining tables (the kernel reclaims everything at exit anyway)
+    std::process::exit(0);
 }
 
 /// SS_EXP2=1: single-thread cost of the v2 fast-path layers (profiling only).

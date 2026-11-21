@@ -49,6 +49,8 @@ fn intern(s: S) -> u64 {
         return k;
     }
     let k = INTERNED | g.bytes.len() as u64;
+    // v2: own copy, so the input mappings can be released once the scans are done
+    let s: S = Box::leak(s.to_vec().into_boxed_slice());
     g.bytes.push(s);
     g.map.insert(s, k);
     k
