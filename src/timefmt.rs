@@ -81,7 +81,7 @@ fn f3_13(b: &[u8]) -> Option<i64> {
 ///
 /// Night-08: a SWAR check of the F1/F2 layout; same results as the
 /// original byte-by-byte parser (`parse_ref`, kept for the equivalence test).
-#[inline]
+#[inline(always)]
 pub fn parse(b: &[u8]) -> Option<i64> {
     let n = b.len();
     if (n == 20 || n == 25) && b[4] == b'-' {
@@ -115,6 +115,7 @@ fn nondigit_mask(x: u64) -> u64 {
 
 /// F1 (len 20, `Z`) or F2 (len 25, `±HH:MM`); `b[4] == '-'` is known.
 #[inline]
+#[inline(always)]
 fn parse_dt(b: &[u8]) -> Option<i64> {
     let n = b.len();
     let offset = if n == 20 {
@@ -216,7 +217,7 @@ pub fn parse_ref(b: &[u8]) -> Option<i64> {
 }
 
 /// Parse and check a half-open window `[lo, hi)`; BAD if either fails.
-#[inline]
+#[inline(always)]
 pub fn parse_in(b: &[u8], lo: i64, hi: i64) -> i64 {
     match parse(b) {
         Some(v) if v >= lo && v < hi => v,
