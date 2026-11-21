@@ -1,0 +1,5 @@
+# docker check of dbda359c2a827e71831711b99857c00ef432647f on AMD EPYC 9V45 96-Core Processor
+- image build: OK in 101s, size 29953390 bytes, user 1000:1000
+- fixtures in container: 36/36 fixtures passed
+- dev set in container: exit 0, 0.92 s, compare: MATCH
+- output files: 4 user_daily, 1 campaign_daily
