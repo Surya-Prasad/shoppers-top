@@ -31,7 +31,7 @@ use hashing::Seeded as RandomState;
 // whose failure would score zero; RW11 leaves it unregistered (the system allocator is used).
 use rayon::prelude::*;
 
-use dialect::{Source, chunks, for_each_record_idx, for_each_record_ix, for_each_record_swar, csv_files, data_region, for_each_line, for_each_record, header_order, split};
+use dialect::{Source, chunks, for_each_record_bq, for_each_record_idx, for_each_record_ix, for_each_record_swar, csv_files, data_region, for_each_line, for_each_record, header_order, split};
 use keys::{KeyMap, key_of};
 use packed::{IdMap, pack9};
 use timefmt::{BAD, DAY};
@@ -301,6 +301,7 @@ fn experiment(src: &[&'static Source], products: &IdMap, lo: i64, hi: i64, names
                     "v1" => for_each_record::<7>(c, &mut g),
                     "swar" => for_each_record_swar::<7>(c, &mut g),
                     "ix" => for_each_record_ix::<7>(c, &mut g),
+                    "bq" => for_each_record_bq::<7>(c, &mut g),
                     "lines" => for_each_line(c, |l| acc = acc.wrapping_add(l.len() as u64)),
                     "ix1" => acc = acc.wrapping_add(dialect::ix_stage1(c) as u64),
                     "masks" => acc = acc.wrapping_add(dialect::masks_only(c)),
@@ -539,7 +540,7 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
             let mut v = Vec::new();
             let (mut lines, mut bad, mut empty) = (0u64, 0u64, 0u64);
             // night-04: fused one-pass line + field scanner (same dialect as split)
-            for_each_record_ix::<2>(chunk, |rec| {
+            for_each_record_bq::<2>(chunk, |rec| {
                 lines += 1;
                 match rec {
                     None => bad += 1,
@@ -829,7 +830,7 @@ fn clicks(src: &[&'static Source], campaigns: &IdMap, lo: i64, hi: i64, names: &
                 r.person = person;
                 parts[keys::part(r.cid, LOG_NB)].push(r);
             };
-            for_each_record_ix::<4>(chunk, |rec| {
+            for_each_record_bq::<4>(chunk, |rec| {
                 lines += 1;
                 let Some(f) = rec else {
                     bad += 1;
@@ -988,7 +989,7 @@ fn events(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: i64, 
                 }
                 pend.clear();
             };
-            for_each_record_ix::<7>(chunk, |rec| {
+            for_each_record_bq::<7>(chunk, |rec| {
                 lines += 1;
                 let Some(f) = rec else {
                     bad += 1;

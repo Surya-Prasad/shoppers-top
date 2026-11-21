@@ -752,6 +752,114 @@ pub fn for_each_record_ix<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut
     }
 }
 
+
+// ====================================================================== RW16: branch-free quotes
+
+/// RW16 scanner: stage 1 lists separator positions (`,` and `\n`) and keeps a quote bitmask
+/// per 64-byte block; stage 2 takes the next N separators of a line and, when they are
+/// N-1 commas then a newline, cuts the fields with a branch-free quote rule:
+///   q = field starts with '"', qe = field ends with '"' (for a field of 2+ bytes);
+///   every field needs q == qe (and 2+ bytes if quoted), and the line's quote count must
+///   equal the sum of q + qe, so any other quote (inner, lone, misplaced) is caught.
+/// Lines failing either check, and every irregular line, are re-split by the exact `split`.
+#[inline]
+pub fn for_each_record_bq<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(Option<[&'a [u8]; N]>)) {
+    let len = chunk.len();
+    let mut seps: Vec<u32> = vec![0u32; WIN + OV + 64 + 16];
+    let mut qmm = [0u64; MB];
+    let mut s = 0usize;
+    // the final line of a chunk without '\n' is handled by the exact path below
+    let body = if len > 0 && chunk[len - 1] != b'\n' { chunk[..len].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1) } else { len };
+    while s < body {
+        let w = s;
+        let wend = (w + WIN + OV).min(body);
+        let mut n = 0usize;
+        let nblk = (wend - w).div_ceil(64);
+        for b in 0..nblk {
+            let p = w + 64 * b;
+            let (a, c, q) = if p + 64 <= len {
+                masks64(chunk[p..p + 64].try_into().unwrap())
+            } else {
+                let mut pad = [0u8; 64];
+                pad[..len - p].copy_from_slice(&chunk[p..len]);
+                masks64(&pad)
+            };
+            let valid = if p + 64 <= wend { !0u64 } else { (1u64 << (wend - p)) - 1 };
+            push_bits(&mut seps, &mut n, (64 * b) as u32, (a | c) & valid);
+            qmm[b] = q & valid;
+        }
+        let limit = (w + WIN).min(body);
+        let mut t = 0usize;
+        while s < limit {
+            if t + N <= n {
+                // every listed position is < body <= len, so indexing is in bounds
+                let e = w + seps[t + N - 1] as usize;
+                let mut ok = chunk[e] == b'\n';
+                for j in 0..N - 1 {
+                    ok &= chunk[w + seps[t + j] as usize] == b',';
+                }
+                if ok {
+                    let mut out: [&'a [u8]; N] = [&[]; N];
+                    let mut fs = s;
+                    let mut qsum = 0u32;
+                    for j in 0..N {
+                        let fe = w + seps[t + j] as usize;
+                        let l = fe - fs;
+                        let q = (l > 0 && chunk[fs] == b'"') as usize;
+                        let qe = (l > 1 && chunk[fe - 1] == b'"') as usize;
+                        ok &= q == qe;
+                        qsum += (q + qe) as u32;
+                        out[j] = &chunk[fs + q..fe - qe];
+                        fs = fe + 1;
+                    }
+                    // quotes in [s, e) from the per-block masks
+                    let (rs, re) = (s - w, e - w);
+                    let mut qn = 0u32;
+                    for b in rs / 64..=(re.max(rs + 1) - 1) / 64 {
+                        let mut x = qmm[b];
+                        if b == rs / 64 {
+                            x &= !0u64 << (rs % 64);
+                        }
+                        let end = re - b * 64;
+                        if end < 64 {
+                            x &= (1u64 << end) - 1;
+                        }
+                        qn += x.count_ones();
+                    }
+                    if ok && qn == qsum {
+                        f(Some(out));
+                    } else {
+                        f(split::<N>(&chunk[s..e]));
+                    }
+                    s = e + 1;
+                    t += N;
+                    continue;
+                }
+            }
+            // irregular line: its newline among the listed separators, then exact split
+            let mut u = t;
+            while u < n && chunk[w + seps[u] as usize] != b'\n' {
+                u += 1;
+            }
+            if u < n {
+                let e = w + seps[u] as usize;
+                f(if e == s { None } else { split::<N>(&chunk[s..e]) });
+                s = e + 1;
+                t = u + 1;
+            } else {
+                let e = memchr::memchr(b'\n', &chunk[s..]).map_or(len, |i| s + i);
+                f(if e == s { None } else { split::<N>(&chunk[s..e]) });
+                s = e + 1;
+                break;
+            }
+        }
+    }
+    // final line without '\n'
+    if s < len {
+        f(split::<N>(&chunk[s..len]));
+    }
+}
+
 #[cfg(test)]
 mod fused_tests {
     use super::*;
@@ -778,6 +886,9 @@ mod fused_tests {
         let mut y = Vec::new();
         for_each_record_ix::<N>(chunk, |r| y.push(r.map(|a| a.iter().map(|x| x.to_vec()).collect())));
         assert_eq!(v, y, "night-04 and RW10 index scanners disagree");
+        let mut x = Vec::new();
+        for_each_record_bq::<N>(chunk, |r| x.push(r.map(|a| a.iter().map(|x| x.to_vec()).collect())));
+        assert_eq!(v, x, "night-04 and RW16 branch-free-quote scanners disagree");
         v
     }
 
