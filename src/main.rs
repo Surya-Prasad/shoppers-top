@@ -646,19 +646,35 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
     }
     drop(side);
     st.mark("links: union");
-    // RW7: compare IDs by key (packed keys are byte-ordered; interned ones by bytes)
+    // RW18: roots and person names in parallel. After union-find the parent array is fixed;
+    // read-only finds are shallow (union by size). A person's name is the byte-wise smallest
+    // member ID: for packed keys that is the smallest key (atomic fetch_min per root); the
+    // rare interned IDs then get an exact byte-order pass.
+    use std::sync::atomic::AtomicU64;
     let kid: Vec<u64> = ids.par_iter().map(|s| key_of(s)).collect();
-    let less = |a: usize, b: usize| -> bool {
-        let (x, y) = (kid[a], kid[b]);
-        if (x | y) & keys::INTERNED == 0 { x < y } else { ids[a] < ids[b] }
+    let parent_ro = &parent;
+    let find_ro = |mut x: u32| -> u32 {
+        while parent_ro[x as usize] != x {
+            x = parent_ro[x as usize];
+        }
+        x
     };
-    let mut name: Vec<u32> = (0..n as u32).collect(); // per root: index of the smallest member
-    let mut root = vec![0u32; n];
+    let root: Vec<u32> = (0..n as u32).into_par_iter().map(find_ro).collect();
+    let min_key: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(u64::MAX)).collect();
+    (0..n).into_par_iter().for_each(|i| {
+        let k = kid[i];
+        if k & keys::INTERNED == 0 {
+            min_key[root[i] as usize].fetch_min(k, Relaxed);
+        }
+    });
+    let mut name_key: Vec<u64> = min_key.into_iter().map(AtomicU64::into_inner).collect();
     for i in 0..n {
-        let r = find(&mut parent, i as u32);
-        root[i] = r;
-        if less(i, name[r as usize] as usize) {
-            name[r as usize] = i as u32;
+        if kid[i] & keys::INTERNED != 0 {
+            let r = root[i] as usize;
+            let cur = name_key[r];
+            if cur == u64::MAX || keys::cmp_bytes(kid[i], cur) == std::cmp::Ordering::Less {
+                name_key[r] = kid[i];
+            }
         }
     }
     let mut multi = 0u64;
@@ -678,9 +694,9 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
         .map(|p| {
             let mut v = Vec::new();
             for i in poff[p]..poff[p + 1] {
-                let ni = name[root[i] as usize] as usize;
-                if ni != i {
-                    v.push((kid[i], kid[ni])); // distinct interned ids are distinct IDs
+                let nk = name_key[root[i] as usize];
+                if nk != kid[i] {
+                    v.push((kid[i], nk)); // distinct IDs have distinct keys
                 }
             }
             v
