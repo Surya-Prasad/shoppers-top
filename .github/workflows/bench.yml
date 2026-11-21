@@ -1,0 +1,56 @@
+# x86 A/B benchmark + correctness gate on a GitHub-hosted runner.
+#
+# Runs on every push to an `opt/**` branch that touches the engine, comparing the pushed
+# commit (candidate) against the commit named in `benchmarks/BEST` (current best), or against
+# `base` when started by hand. Results are committed to the `bench-results` branch as
+# `results/<candidate-sha>.md` (+ .json), so a loop can read them with `git fetch`.
+# It never touches main and never submits anything.
+name: bench
+on:
+  push:
+    branches: ['opt/**']
+    paths: ['src/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/bench.yml', 'benchmarks/ci_ab.sh', 'benchmarks/ab_summary.py']
+  workflow_dispatch:
+    inputs:
+      base:
+        description: 'Baseline ref or SHA (default: contents of benchmarks/BEST)'
+        required: false
+permissions:
+  contents: write
+concurrency:
+  group: bench
+  cancel-in-progress: false
+jobs:
+  ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run A/B
+        env:
+          BASE_INPUT: ${{ github.event.inputs.base }}
+        run: bash benchmarks/ci_ab.sh
+      - name: Publish results to bench-results branch
+        if: always()
+        run: |
+          set -eu
+          [ -f "$RUNNER_TEMP/result.md" ] || exit 0
+          cat "$RUNNER_TEMP/result.md" >> "$GITHUB_STEP_SUMMARY"
+          cand=$(git rev-parse HEAD)
+          git config user.name "bench-bot"; git config user.email "bench-bot@users.noreply.github.com"
+          rm -rf "$RUNNER_TEMP/pub"
+          if git ls-remote --exit-code origin bench-results >/dev/null 2>&1; then
+            git clone -q --depth 1 --branch bench-results "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" "$RUNNER_TEMP/pub"
+          else
+            mkdir -p "$RUNNER_TEMP/pub" && cd "$RUNNER_TEMP/pub" && git init -q -b bench-results && \
+              git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" && cd -
+          fi
+          mkdir -p "$RUNNER_TEMP/pub/results"
+          cp "$RUNNER_TEMP/result.md" "$RUNNER_TEMP/pub/results/$cand.md"
+          cp "$RUNNER_TEMP/result.json" "$RUNNER_TEMP/pub/results/$cand.json" 2>/dev/null || true
+          cd "$RUNNER_TEMP/pub"
+          git -c user.name=bench-bot -c user.email=bench-bot@users.noreply.github.com add -A
+          git -c user.name=bench-bot -c user.email=bench-bot@users.noreply.github.com commit -q -m "bench ${cand:0:7} (${{ github.ref_name }})"
+          for i in 1 2 3; do git push -q origin HEAD:bench-results && break; git pull -q --rebase origin bench-results || true; done
