@@ -4,6 +4,8 @@
 FROM rust:1.95-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+# RW25: target-cpu settings (x86-64-v3 on x86-64 Linux) apply to the image build too
+COPY .cargo ./.cargo
 # cache dependencies in their own layer
 RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release --locked && rm -rf src
 COPY src ./src

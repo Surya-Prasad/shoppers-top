@@ -1,0 +1,5 @@
+# RW25: compile for x86-64-v3 (AVX2, BMI1/2, FMA, MOVBE) on x86-64 Linux. Every GitHub CI
+# runner (EPYC Zen 3/4, Xeon Ice Lake and newer) and the scorer (Cascade Lake or newer)
+# support it. Only applies when building for x86_64-unknown-linux-gnu; the Mac is unaffected.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
