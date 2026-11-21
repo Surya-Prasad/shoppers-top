@@ -458,3 +458,26 @@ CI (`1672787` vs `7809b52`; Xeon 8573C): gate PASS; 20M 5.006 → 4.923 s (−1.
 
 **Final BEST: `7809b52`** (night-01…07, 10, 11, 14, 15). Final comparison runs (workflow_dispatch, same engine
 source on `opt/overnight`): see `benchmarks/OVERNIGHT_REPORT.md`.
+
+## Rewrite track (2026-11-21, after the 3.05 s practice score of `7809b52`)
+
+Goal set by the user: win, with every optimization and rewrite in scope, and ideas from other public
+entries allowed (no copied code). Scored: `34a18e7` 5.79 s, then `7809b52` **3.05 s** (rank 224; top 0.30 s).
+
+**Profile of `7809b52` (Mac, 20M, 8 threads):** 1.22 s wall, 7.34 CPU-s, **81 G instructions = ~3,200 per
+input row**. Single-thread per-layer scan cost (`SS_EXP=1`), ns per line: scanner 54 (memchr alone: 9), keys +8,
+ts +10, ingest +6, type/price +4, **person lookup +50 (cache miss into the link table)**, scatter +6.
+
+Each step is on its own branch, stacked; CI compares each against the step before it (`benchmarks/BEST`):
+
+| Step | Branch | Change | Local 20M wall (Mac) | Notes |
+|---|---|---|---:|---|
+| RW1 | `opt/rw1-u64-core` | Every ID is a u64 key end to end (pack9 + exact interner); EvRec 40 B, EvV 24 B; validity decided per copy at scan; flat dedup table pointing at records in place; sessionize sorts `(person, ts)` directly; names decoded at output | 1.23 → 1.22 s | peak memory 2.63 → 1.59 GB; −7% instructions |
+| RW2 | (same commit `b3bd24c`) | Person lookups batched 32 at a time with software prefetch | → **1.05 s** | events scan 0.56 → 0.42 s |
+| RW3 | `opt/rw3-dedup-prefetch` | Dedup probes prefetched 16 at a time | neutral | tables fit Apple L2; aimed at x86 |
+| RW4 | `opt/rw4-struct-scanner` | Structural-index scanner: SIMD `\n` `,` `"` masks per 64 KiB window (SSE2 / NEON), bit-scan line cutting; quoted lines take exact `split` | → 1.00 s | matches `split` on 30,000 random chunks + window edges |
+| RW5 | `opt/rw6-…` | Dedup writes kept rows straight to person partitions | neutral | sys −17% |
+| RW6 | `opt/rw6-…` | Counting sort into ~80-row buckets by person hash, sort buckets | ~0.98 s | sessions 0.16 → 0.13 s |
+
+Every step: unit tests, 36 fixtures, dev answer MATCH, 800–1,200 fuzz cases (strict + adversarial) with 0
+failures, and output identical to the previous step at 20M. x86 CI numbers are added below as they land.
