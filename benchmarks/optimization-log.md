@@ -113,6 +113,42 @@ drive the decision.
 **Decision:** keep. Tier A, every gate green, consistently a little faster (around the noise threshold
 at 20M, 4/4 paired wins at 60M), no memory change, simpler code. `a1` is the new A/B reference.
 
+## A2: drop `EvRaw.line_fields` (Tier A): **KEEP**
+
+Change (`src/main.rs`): `earlier()` now compares only `(ingest_bad, ingest)`. On a tie, the copy already
+kept stays. The 16-byte line slice that existed only to re-split lines for a raw-tuple tie-break is removed.
+Relies on rules.md, Events step 2: *"Copies with equal `ingest_ts` are identical."* (cited in the code).
+**`size_of::<EvRaw>()`: 80 → 64 bytes** (a new `layout::record_sizes` test prints all record sizes).
+
+**Correctness gate (all passed):** unit 5/5; fixtures 36/36; dev MATCH; invariants 15/15; fuzz strict
+1,000 (seed 31) and adversarial 1,000 (seed 32), 0 failures; oracle seeds 3 and 15 MATCH; Parquet equality
+vs A1 in container at 20M s9, 20M s11 and 60M s11: MATCH ×3; 1 vs 8 threads at 20M and 60M: MATCH ×2;
+forced failure exits 101. No fuzz case needed relaxing (the fuzzer only makes identical equal-ingest
+copies, as the rules promise).
+
+**Determinism proof (plan requirement):** the dev set with **106,525 injected equal-`ingest_ts` copies**:
+values identical, quoting re-randomized, half in a new file and half shuffled into the original files so they
+cross 4 MB chunk boundaries (lines parsed with the reference dialect first, so malformed lines are never
+"repaired" into new events). The Python oracle confirms the correct answer is unchanged (still equal to
+the official dev answer). A2 with `NCPU=1` and with `NCPU=8`: both **MATCH the official dev answer**,
+178,478 copies removed in both.
+(A first attempt built copies by stripping quotes from raw lines, which turned malformed lines into valid
+events. A1 and A2 both "differed" on it, exposing the faulty test data; it was rebuilt as above.)
+
+**Performance (A = `a1`, B = `a2`). Cold: one run each. Warm: 5 runs interleaved A,B,A,B…:**
+
+| Data | A cold | B cold | A warm median (min/max) | B warm median (min/max) | Δ warm | B faster |
+|---|---:|---:|---:|---:|---:|---:|
+| 20M s9 | 4.61 s | 3.52 s | 2.760 (2.723 / 2.955) | **2.713** (2.701 / 2.732) | −1.7% | 5/5 |
+| 20M s11 | 3.94 s | 3.43 s | 2.885 (2.643 / 3.514) | **2.740** (2.720 / 3.047) | −5.0% | 4/5 |
+| 60M s11 | 16.10 s | 14.98 s | 12.715 (12.397 / 13.495) | **12.601** (12.281 / 13.536) | −0.9% | 3/5 |
+
+Memory (anon peak): 20M **2.70 → 2.49 GB** (−8%); 60M **8.21 → 7.26 GB** (−12%).
+
+**Decision:** keep. Every gate green, simpler code (no re-split on ties), clearly less memory, faster or
+neutral everywhere (60M is within noise). Host load average was about 7 during the runs; the A/B
+interleaving controls for it. `a2` is the new A/B reference.
+
 ## Register
 
 | ID | Change | Tier | Commit | Correctness | 20M warm (s9 / s11) | 20M cold | 60M warm | 60M cold | anon peak 60M | Decision |
@@ -120,4 +156,5 @@ at 20M, 4/4 paired wins at 60M), no memory change, simpler code. `a1` is the new
 | P0 | Scored baseline | — | `34a18e7` | dev MATCH | 2.814 / 2.752 | 4.57 / 3.71 | 11.298 | 15.15 | 8.2 GB | Preserve |
 | P0i | + stage timers | — | `5d40e99` | all gates | 2.796 / 2.751 | 3.60 / 3.67 | 11.468 | 14.95 | 8.2 GB | Reference |
 | A1 | Single-probe dedup | A | see git log | all gates | 2.795 / 2.730 | 3.87 / 3.67 | 13.092 vs 13.317 (paired) | 17.93 | 8.2 GB | **Keep** |
-| A2 | Drop `line_fields` | A | | | | | | | | next |
+| A2 | Drop `line_fields` (EvRaw 80→64 B) | A | see git log | all gates + equal-ingest proof | 2.713 / 2.740 vs A1 2.760 / 2.885 (paired) | 3.52 / 3.43 | 12.601 vs 12.715 (paired) | 14.98 | **7.3 GB** (−12%) | **Keep** |
+| A3 | NB/CHUNK sweep | A | | | | | | | | next |

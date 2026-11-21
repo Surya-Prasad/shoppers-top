@@ -5,6 +5,8 @@
 #       1 host-cold run (page cache dropped) + WARM_RUNS warm runs, each a fresh container
 #       with the official starter's scorer flags. Prints wall seconds per run, measured in
 #       the VM around `docker run` (container create -> exit).
+#   bench.sh warm IMAGE DATAVOL LABEL N
+#       N warm runs, no cache drop (interleave A/B on a noisy host).
 #   bench.sh mem IMAGE DATAVOL LABEL
 #       one warm run, sampling cgroup memory.peak and peak `anon` (every 20 ms); kept
 #       separate so the sampling never affects timed runs.
@@ -24,8 +26,9 @@ fresh() {  # $1 = output volume name
 drop() { sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null; }
 now() { date +%s.%N; }
 
-if [ "$MODE" = time ]; then
-  i=0
+if [ "$MODE" = time ] || [ "$MODE" = warm ]; then
+  # `warm`: N warm runs only, no cache drop; used to interleave A/B/A/B on a noisy host.
+  i=0; [ "$MODE" = warm ] && i=1
   while [ $i -le "$N" ]; do
     o="o-$LABEL"; fresh "$o"
     kind=warm; [ $i -eq 0 ] && { drop; kind=cold; }

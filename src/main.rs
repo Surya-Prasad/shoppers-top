@@ -529,7 +529,6 @@ const T_BAD: u8 = 3;
 #[derive(Clone, Copy)]
 struct EvRaw {
     eid: S,
-    line_fields: S, // the whole line, re-split only to break an ingest_ts tie
     person: S,      // empty if user_id was empty
     ts: i64,        // BAD if invalid or outside the event window
     ingest: i64,
@@ -619,7 +618,6 @@ fn events(
                 let ingest = parse_ingest(f[3]);
                 parts[part_of(ps, f[0])].push(EvRaw {
                     eid: f[0],
-                    line_fields: line,
                     person: if f[1].is_empty() { b"" } else { person_of(f[1]) },
                     ts: timefmt::parse_in(f[2], lo, hi),
                     ingest: ingest.unwrap_or(i64::MAX),
@@ -700,19 +698,16 @@ fn events(
     t
 }
 
-/// Is copy `a` preferred over `b` in dedup? Smallest parseable ingest_ts first
-/// (unparseable ranks last); equal ingest_ts copies are promised identical, so the
-/// tie is broken by the raw field tuple purely for determinism.
+/// Is copy `a` strictly preferred over `b` in dedup? Smallest parseable ingest_ts
+/// wins; an unparseable ingest_ts ranks last.
+///
+/// A2: on a tie the copy already kept stays. rules.md, Events step 2: "Copies with
+/// equal `ingest_ts` are identical", so which one is kept cannot change the output.
+/// It is still deterministic: rows reach a dedup partition in file-then-chunk order
+/// (`transpose` keeps the scan order), independent of thread count.
 #[inline]
 fn earlier(a: &EvRaw, b: &EvRaw) -> bool {
-    let ka = (a.ingest_bad, a.ingest);
-    let kb = (b.ingest_bad, b.ingest);
-    if ka != kb {
-        return ka < kb;
-    }
-    let fa = split::<7>(a.line_fields).unwrap();
-    let fb = split::<7>(b.line_fields).unwrap();
-    fa < fb
+    (a.ingest_bad, a.ingest) < (b.ingest_bad, b.ingest)
 }
 
 // ====================================================================== sessions
@@ -870,3 +865,13 @@ fn sessionize(
     (rows, camp)
 }
 
+
+#[cfg(test)]
+mod layout {
+    /// Record sizes drive memory traffic in the scan/partition phase (P0 profile).
+    #[test]
+    fn record_sizes() {
+        eprintln!("EvRaw={} EvV={} ClickRaw={} ClickV={}", std::mem::size_of::<super::EvRaw>(),
+            std::mem::size_of::<super::EvV>(), std::mem::size_of::<super::ClickRaw>(), std::mem::size_of::<super::ClickV>());
+    }
+}
