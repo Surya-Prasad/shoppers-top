@@ -1,0 +1,59 @@
+# x86 CPU profile of one commit (manual): perf record on the 20M dataset, results committed
+# to the bench-results branch as profiles/<sha>.txt. Never touches main; submits nothing.
+name: profile
+on:
+  workflow_dispatch:
+    inputs:
+      events:
+        description: 'Events to generate (default 20M)'
+        required: false
+        default: '20000000'
+permissions:
+  contents: write
+concurrency:
+  group: profile-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Profile
+        run: |
+          set -eux
+          W=$RUNNER_TEMP/p; mkdir -p $W
+          sudo apt-get install -y -qq linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || sudo apt-get install -y -qq linux-tools-generic >/dev/null 2>&1 || true
+          PERF=$(command -v perf || ls /usr/lib/linux-tools/*/perf | head -1)
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 >/dev/null
+          rustup default stable >/dev/null 2>&1 || true
+          CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --locked -q
+          B=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          (cd $W && curl -fsSL -o gen.zip $B/generator.zip && unzip -qo gen.zip -d gen)
+          GD=$(dirname "$(find $W/gen -name Cargo.toml | head -1)"); (cd $GD && cargo build --release -q)
+          $GD/target/release/generate --seed 11 --events ${{ github.event.inputs.events }} --clicks $(( ${{ github.event.inputs.events }} / 4 )) --output $W/d >/dev/null
+          BIN=target/release/shopping-sessions
+          DATA_DIR=$W/d OUTPUT_DIR=$W/o0 NCPU=$(nproc) $BIN 2>/dev/null   # warm the page cache
+          OUT=$RUNNER_TEMP/profile.txt
+          { echo "# x86 profile of $(git rev-parse --short HEAD) ($(lscpu | sed -n 's/^Model name: *//p') x $(nproc)), ${{ github.event.inputs.events }} events"
+            echo; echo '## stage timings'; DATA_DIR=$W/d OUTPUT_DIR=$W/o1 NCPU=$(nproc) $BIN 2>&1 | grep -E '^\[|^    '
+            echo; echo '## perf stat'; DATA_DIR=$W/d OUTPUT_DIR=$W/o2 NCPU=$(nproc) $PERF stat -e task-clock,cycles,instructions,branches,branch-misses,cache-misses,page-faults $BIN 2>&1 >/dev/null | grep -vE '^\[|^    |^ *$|stats|"' | tail -15
+          } > $OUT 2>&1 || true
+          DATA_DIR=$W/d OUTPUT_DIR=$W/o3 NCPU=$(nproc) $PERF record -F 2999 -g -o $W/perf.data $BIN >/dev/null 2>&1 || true
+          { echo; echo '## hottest symbols (self)'; $PERF report -i $W/perf.data --no-children --sort symbol --stdio 2>/dev/null | grep -E '^ +[0-9]' | head -40
+            echo; echo '## hottest source lines (self)'; $PERF report -i $W/perf.data --no-children --sort srcline --stdio 2>/dev/null | grep -E '^ +[0-9]' | head -40
+          } >> $OUT 2>&1 || true
+          cat $OUT
+      - name: Publish
+        if: always()
+        run: |
+          set -eu
+          [ -f "$RUNNER_TEMP/profile.txt" ] || exit 0
+          cat "$RUNNER_TEMP/profile.txt" >> "$GITHUB_STEP_SUMMARY"
+          sha=$(git rev-parse HEAD)
+          git clone -q --depth 1 --branch bench-results "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" "$RUNNER_TEMP/pub"
+          mkdir -p "$RUNNER_TEMP/pub/profiles"; cp "$RUNNER_TEMP/profile.txt" "$RUNNER_TEMP/pub/profiles/$sha.txt"
+          cd "$RUNNER_TEMP/pub"
+          git -c user.name=bench-bot -c user.email=bench-bot@users.noreply.github.com add -A
+          git -c user.name=bench-bot -c user.email=bench-bot@users.noreply.github.com commit -q -m "profile ${sha:0:7} (${{ github.ref_name }})"
+          for i in 1 2 3; do git push -q origin HEAD:bench-results && break; git pull -q --rebase origin bench-results || true; done
