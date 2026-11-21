@@ -25,6 +25,17 @@ pub fn pack9(s: &[u8]) -> Option<u64> {
     ok.then_some(v)
 }
 
+/// Hash of an ID for partitioning: of its packed form when it packs, else of its bytes.
+/// Equal IDs always get the same hash.
+#[inline]
+pub fn id_hash(st: &crate::RandomState, s: &[u8]) -> u64 {
+    use std::hash::BuildHasher;
+    match pack9(s) {
+        Some(k) => st.hash_one(k),
+        None => st.hash_one(s),
+    }
+}
+
 pub struct PMap<V> {
     packed: Map<u64, V>,
     other: Map<S, V>,
@@ -43,6 +54,14 @@ impl<V> PMap<V> {
     }
     pub fn contains_key(&self, s: &[u8]) -> bool {
         self.get(s).is_some()
+    }
+    /// Value of `s`, inserting `f()` first if absent.
+    #[inline]
+    pub fn get_or_insert_with(&mut self, s: S, f: impl FnOnce() -> V) -> &V {
+        match pack9(s) {
+            Some(k) => self.packed.entry(k).or_insert_with(f),
+            None => self.other.entry(s).or_insert_with(f),
+        }
     }
     /// Insert unless the key is present (first occurrence wins).
     pub fn insert_first(&mut self, s: S, v: V) {

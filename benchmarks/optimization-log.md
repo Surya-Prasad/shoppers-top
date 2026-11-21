@@ -259,6 +259,7 @@ work at open time, which is what we see. On a real disk the result may differ.
 | N02 | Parallel link resolution | B | `77b6ec0` | CI gate PASS | CI 7.163 vs 7.530 (−4.9%, 7/7) | – | CI 24.272 vs 25.778 (−5.8%, 5/5) | – | 11.9 GB RSS | **Keep** |
 | N04 | Fused SSE2 line+field scanner | B | `45bdcbd` | CI gate PASS | CI 7.239 vs 7.610 (−4.9%, 7/7) | – | CI 24.865 vs 26.080 (−4.7%, 5/5) | – | 11.4 GB RSS | **Keep** |
 | N05 | Packed product/campaign lookup keys (`PMap`) | B | `83fe1be` | CI gate PASS | CI 6.808 vs 7.001 (−2.8%, 5/7) | – | CI 22.137 vs 24.086 (−8.1%, 5/5) | – | 11.4 GB RSS | **Keep** |
+| N06 | Packed link interning + name map | B | `3aa0b90` | CI gate PASS | CI 6.506 vs 6.799 (−4.3%, 6/7) | – | CI 23.070 vs 24.202 (−4.7%, 5/5) | – | 11.4 GB RSS | **Keep** |
 
 ## Overnight loop (2026-11-21, CI x86 timing)
 
@@ -335,3 +336,13 @@ spread of packed keys.
 CI (`83fe1be` = night-05 on BEST `ae88fb7`, vs `ae88fb7`; EPYC 9V45): gate PASS; **20M 7.001 → 6.808 s (−2.8%, 5/7)**;
 **60M 24.086 → 22.137 s (−8.1%, 5/5)**. Merged on top of night-01…04 (import conflict only; local checks green,
 20M Parquet equal). BEST → this merge (night-01…05).
+
+### Night-06: packed keys for link interning and the person-name map: **KEEP**
+
+Link IDs are interned per partition in a `PMap<u32>` and the name map is a `PMap<&[u8]>` per partition; partitions are
+chosen by `packed::id_hash` (hash of the packed u64 when the ID packs, else of its bytes, so equal IDs always meet).
+`person_of` (one lookup per event and per click) therefore hashes and compares one integer for every packable ID.
+Spread test updated to `id_hash`.
+
+CI (`3aa0b90` = night-06 on BEST `baf6156`, vs `baf6156`; EPYC 7763): gate PASS; **20M 6.799 → 6.506 s (−4.3%, 6/7)**;
+**60M 24.202 → 23.070 s (−4.7%, 5/5)**. Merged (no conflict, source identical to `3aa0b90`). BEST → this merge (night-01…06).
