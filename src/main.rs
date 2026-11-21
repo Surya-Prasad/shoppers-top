@@ -259,23 +259,27 @@ fn main() {
     // RW17: credited counters ([sessions, purchasing, revenue]) and assists (u32) live in
     // separate per-fold arrays: ~104M assist increments at 60M hit a ~112 KB array that
     // stays in L2 instead of a ~900 KB array of 32-byte cells.
-    type Acc = (Vec<[u64; 3]>, Vec<u32>);
+    type Acc = (Vec<[u64; 3]>, Vec<u32>, SessScratch);
+    // v2 P3: radix sessions sort needs event ts - ws and click ts - (ws - 7 d) to fit u32 and
+    // category indexes below 256 (checked per row too)
+    let rx = (fast_enabled() && we - (ws - WEEK) <= u32::MAX as i64 && cat_names.len() <= 256).then_some((ws, ws - WEEK));
     let folded: Vec<(Vec<Vec<output::UserRow>>, Acc)> = (0..NB)
         .into_par_iter()
         .fold(
-            || (Vec::new(), (Vec::new(), Vec::new())),
+            || (Vec::new(), (Vec::new(), Vec::new(), SessScratch::default())),
             |(mut rows, mut acc): (Vec<Vec<output::UserRow>>, Acc), b| {
                 if acc.0.is_empty() {
-                    acc = (vec![[0u64; 3]; dense_len], vec![0u32; dense_len]);
+                    acc.0 = vec![[0u64; 3]; dense_len];
+                    acc.1 = vec![0u32; dense_len];
                 }
-                rows.push(sessionize(b, &events_by_person, &clicks_by_person, ncamp, day0, ndays, &mut acc.0, &mut acc.1, &stats));
+                rows.push(sessionize(b, &events_by_person, &clicks_by_person, ncamp, day0, ndays, &mut acc.0, &mut acc.1, &stats, rx, &mut acc.2));
                 (rows, acc)
             },
         )
         .collect();
     let mut dense = vec![[0u64; 4]; dense_len];
     let mut user_parts = Vec::with_capacity(NB);
-    for (rows, (cred, assist)) in folded {
+    for (rows, (cred, assist, _)) in folded {
         user_parts.extend(rows);
         for ((d, c), a) in dense.iter_mut().zip(cred.iter()).zip(assist.iter()) {
             d[0] += c[0];
@@ -292,6 +296,7 @@ fn main() {
             camp_agg.insert((c, day0 + d as i32), *v);
         }
     }
+    eprintln!("    sessions cpu: sorts {:.3}s walk {:.3}s radix partitions {}", SESS_T[0].load(Relaxed) as f64 / 1e9, SESS_T[1].load(Relaxed) as f64 / 1e9, SESS_T[2].load(Relaxed));
     lap("sessions");
 
     // RW30: returning gigabytes of event/click vectors to the OS takes ~0.06 s on one
@@ -1427,6 +1432,169 @@ fn bucket_sort<T: Copy>(parts: &[Vec<T>], n: usize, nbk: usize, bucket: impl Fn(
     (out, starts)
 }
 
+/// v2 P3: per-thread buffers of the sessions sort, reused across partitions.
+#[derive(Default)]
+pub struct SessScratch {
+    tab: Vec<(u64, u32)>,    // person -> dense index (person 0 = free slot)
+    eidx: Vec<u32>,          // per event row: person index
+    cidx: Vec<u32>,
+    cnt: Vec<u32>,           // per person: start offsets
+    ccnt: Vec<u32>,
+    ekeys: Vec<u64>,         // ts offset << 32 | price << 8 | cat, grouped by person
+    citems: Vec<(u64, u64, u32)>, // (ts offset, click_id, campaign), grouped by person
+    persons: Vec<u64>,       // index -> person
+    ev: Vec<EvV>,
+    cl: Vec<ClickV>,
+}
+
+/// v2 P3: the sessions sort of one person partition. Persons get dense indexes in first-seen
+/// order (one probe of a small table per row), rows are counting-sorted by index, and each
+/// person's run is sorted by ts (events: u64 keys; clicks: ts asc, click_id desc in byte
+/// order). Output in `sc.ev` / `sc.cl`, persons in index order on both sides; `sc.cl[i].person`
+/// holds the person *index* (the walk only compares click persons). False (caller falls back)
+/// if a value does not fit the compact keys.
+fn sort_radix(evp: &[Vec<EvV>], clp: &[Vec<ClickV>], n: usize, nc: usize, eb: i64, cb: i64, sc: &mut SessScratch) -> bool {
+    let mut cap = 4096usize;
+    sc.tab.clear();
+    sc.tab.resize(cap, (0, 0));
+    sc.persons.clear();
+    let SessScratch { tab, eidx, cidx, cnt, ccnt, ekeys, citems, persons, ev, cl } = sc;
+    let mut index = |p: u64| -> u32 {
+        let mut i = (packed::fmix(p) as usize) & (cap - 1);
+        loop {
+            let s = tab[i];
+            if s.0 == p {
+                return s.1;
+            }
+            if s.0 == 0 {
+                let ix = persons.len() as u32;
+                tab[i] = (p, ix);
+                persons.push(p);
+                if persons.len() * 2 > cap {
+                    let old = std::mem::replace(tab, vec![(0, 0); cap * 2]);
+                    cap *= 2;
+                    for (q, v) in old {
+                        if q != 0 {
+                            let mut k = (packed::fmix(q) as usize) & (cap - 1);
+                            while tab[k].0 != 0 {
+                                k = (k + 1) & (cap - 1);
+                            }
+                            tab[k] = (q, v);
+                        }
+                    }
+                }
+                return ix;
+            }
+            i = (i + 1) & (cap - 1);
+        }
+    };
+    eidx.clear();
+    eidx.reserve(n);
+    for part in evp {
+        for e in part.iter() {
+            let rel = e.ts - eb;
+            if e.person == 0 || e.cat > 255 || e.price >= 1 << 24 || !(0..=u32::MAX as i64).contains(&rel) {
+                return false;
+            }
+            eidx.push(index(e.person));
+        }
+    }
+    cidx.clear();
+    cidx.reserve(nc);
+    for part in clp {
+        for c in part.iter() {
+            let rel = c.ts - cb;
+            if c.person == 0 || !(0..=u32::MAX as i64).contains(&rel) {
+                return false;
+            }
+            cidx.push(index(c.person));
+        }
+    }
+    let np = persons.len();
+    // counting sort by person index
+    let count = |cnt: &mut Vec<u32>, idx: &[u32]| {
+        cnt.clear();
+        cnt.resize(np + 1, 0);
+        for &i in idx {
+            cnt[i as usize + 1] += 1;
+        }
+        for i in 1..=np {
+            cnt[i] += cnt[i - 1];
+        }
+    };
+    count(cnt, eidx);
+    count(ccnt, cidx);
+    ekeys.clear();
+    ekeys.reserve(n);
+    {
+        let out = ekeys.spare_capacity_mut();
+        let mut at: Vec<u32> = cnt[..np].to_vec();
+        let mut r = 0usize;
+        for part in evp {
+            for e in part.iter() {
+                let i = eidx[r] as usize;
+                r += 1;
+                out[at[i] as usize].write(((e.ts - eb) as u64) << 32 | (e.price as u64) << 8 | e.cat as u64);
+                at[i] += 1;
+            }
+        }
+        // SAFETY: the counting pass wrote each of the n slots exactly once
+        unsafe { ekeys.set_len(n) };
+    }
+    citems.clear();
+    citems.reserve(nc);
+    {
+        let out = citems.spare_capacity_mut();
+        let mut at: Vec<u32> = ccnt[..np].to_vec();
+        let mut r = 0usize;
+        for part in clp {
+            for c in part.iter() {
+                let i = cidx[r] as usize;
+                r += 1;
+                out[at[i] as usize].write(((c.ts - cb) as u64, c.cid, c.camp));
+                at[i] += 1;
+            }
+        }
+        // SAFETY: as above
+        unsafe { citems.set_len(nc) };
+    }
+    ev.clear();
+    ev.reserve(n);
+    cl.clear();
+    cl.reserve(nc);
+    for (pi, &p) in persons.iter().enumerate() {
+        let run = &mut ekeys[cnt[pi] as usize..cnt[pi + 1] as usize];
+        if run.len() > 1 {
+            run.sort_unstable();
+        }
+        for &k in run.iter() {
+            ev.push(EvV { person: p, ts: eb + (k >> 32) as i64, cat: (k & 0xff) as u32, price: ((k >> 8) & 0xff_ffff) as u32 });
+        }
+        let run = &mut citems[ccnt[pi] as usize..ccnt[pi + 1] as usize];
+        if run.len() > 1 {
+            run.sort_unstable_by(|x, y| x.0.cmp(&y.0).then_with(|| keys::cmp_bytes(y.1, x.1)));
+        }
+        for &(t, cid, camp) in run.iter() {
+            cl.push(ClickV { person: pi as u64, ts: cb + t as i64, cid, camp });
+        }
+    }
+    true
+}
+
+/// v2 P3: the person index of `p` in the last `sort_radix` (p is known to be there).
+#[inline]
+fn person_index(sc: &SessScratch, p: u64) -> u64 {
+    let cap = sc.tab.len();
+    let mut i = (packed::fmix(p) as usize) & (cap - 1);
+    while sc.tab[i].0 != p {
+        i = (i + 1) & (cap - 1);
+    }
+    sc.tab[i].1 as u64
+}
+
+/// Sub-stage CPU time of `sessionize` (sorts, walk), ns summed over partitions (stderr only).
+static SESS_T: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
 fn sessionize(
     b: usize,
     evs: &ByPerson<EvV>,
@@ -1437,6 +1605,8 @@ fn sessionize(
     camp: &mut [[u64; 3]],
     assist: &mut [u32],
     stats: &Stats,
+    rx: Option<(i64, i64)>,
+    sc: &mut SessScratch,
 ) -> Vec<output::UserRow> {
     // RW6: events and clicks are grouped by bucket (bits of fmix(person) below the
     // partition bits) with one counting-sort pass, then each small bucket is sorted by
@@ -1449,15 +1619,36 @@ fn sessionize(
     let bshift = 64 - LOG_NB - nbk.trailing_zeros();
     let bucket = |person: u64| -> usize { ((packed::fmix(person) >> bshift) as usize) & (nbk - 1) };
     // events sort on one u128 key: person, then ts (sign-flipped so unsigned order = signed)
-    let (ev, es) = bucket_sort(&evs[b], n, nbk, |e: &EvV| bucket(e.person), |v: &mut [EvV]| {
-        v.sort_unstable_by_key(|e| ((e.person as u128) << 64) | ((e.ts as u64) ^ (1 << 63)) as u128)
-    });
-    // clicks: (person, ts asc, click_id desc in byte order), so the last click of a
-    // window is the latest one with the byte-wise smallest click_id
-    let (cl, cs) = bucket_sort(&cls[b], nc, nbk, |c: &ClickV| bucket(c.person), |v: &mut [ClickV]| {
-        v.sort_unstable_by(|x, y| (x.person, x.ts).cmp(&(y.person, y.ts)).then_with(|| keys::cmp_bytes(y.cid, x.cid)))
-    });
+    let t0 = Instant::now();
+    // v2 P3: radix order by (32-bit person hash, ts) when the hash is collision-free in this
+    // partition and the values fit (checked inside); otherwise the RW6 bucket sort. Either
+    // way every person's rows are together and time-ordered, and `ord` gives the person
+    // order both sides share (the walk below merges events and clicks by it).
+    let hashed = rx.is_some_and(|(eb, cb)| sort_radix(&evs[b], &cls[b], n, nc, eb, cb, sc));
+    SESS_T[2].fetch_add(hashed as u64, Relaxed);
+    let (es, cs, nbk) = match hashed {
+        true => (vec![0, n as u32], vec![0, nc as u32], 1),
+        false => {
+            let (ev, es) = bucket_sort(&evs[b], n, nbk, |e: &EvV| bucket(e.person), |v: &mut [EvV]| {
+                v.sort_unstable_by_key(|e| ((e.person as u128) << 64) | ((e.ts as u64) ^ (1 << 63)) as u128)
+            });
+            // clicks: (person, ts asc, click_id desc in byte order), so the last click of a
+            // window is the latest one with the byte-wise smallest click_id
+            let (cl, cs) = bucket_sort(&cls[b], nc, nbk, |c: &ClickV| bucket(c.person), |v: &mut [ClickV]| {
+                v.sort_unstable_by(|x, y| (x.person, x.ts).cmp(&(y.person, y.ts)).then_with(|| keys::cmp_bytes(y.cid, x.cid)))
+            });
+            sc.ev = ev;
+            sc.cl = cl;
+            (es, cs, nbk)
+        }
+    };
+    let (ev, cl) = (&sc.ev[..], &sc.cl[..]);
+    // the merge order of persons: index order (radix path; click rows hold the index) or key
+    // order inside each bucket (RW6 path)
+    let ordp = |p: u64| -> u64 { if hashed { person_index(sc, p) } else { p } };
 
+    let t1 = Instant::now();
+    SESS_T[0].fetch_add((t1 - t0).as_nanos() as u64, Relaxed);
     let mut rows: Vec<output::UserRow> = Vec::with_capacity(n / 8 + 16);
     // sliding-window distinct-campaign set: count per campaign + list of active ones
     let mut cnt = vec![0u32; ncamp];
@@ -1479,11 +1670,12 @@ fn sessionize(
         while pe < e1 && ev[pe].person == p {
             pe += 1;
         }
-        while j < c1 && cl[j].person < p {
+        let op = ordp(p);
+        while j < c1 && cl[j].person < op {
             j += 1;
         }
         let mut pc = j;
-        while pc < c1 && cl[pc].person == p {
+        while pc < c1 && cl[pc].person == op {
             pc += 1;
         }
         let (mut lo, mut hi) = (j, j); // window [lo, hi) of this person's clicks
@@ -1583,6 +1775,7 @@ fn sessionize(
         j = pc;
     }
     }
+    SESS_T[1].fetch_add(t1.elapsed().as_nanos() as u64, Relaxed);
     stats.add(K::Sessions, sessions_total);
     stats.add(K::CreditedSessions, credited);
     stats.add(K::AssistPairs, assists);
@@ -1796,6 +1989,56 @@ mod fast_click_tests {
             let b = f(clicks_scan_items(&items, &camps, lo - 7 * DAY, hi, &s2, false));
             assert_eq!(a, b, "case {case}");
             assert_eq!(s1.json(), s2.json(), "case {case}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod sessions_sort_tests {
+    use super::*;
+
+    /// v2 P3: sessionize with the dense-index sort equals the RW6 bucket sort path (rows,
+    /// campaign accumulators, stats) on random partitions with equal timestamps, 30-minute
+    /// edges, same-millisecond clicks, a whale person and many small ones.
+    #[test]
+    fn radix_path_equals_bucket_path() {
+        let ws = timefmt::parse(b"2026-10-01T00:00:00Z").unwrap();
+        let (day0, ndays, ncamp) = ((ws / DAY) as i32, 14usize, 50usize);
+        let mut x = 3u64;
+        let mut r = || {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x >> 33
+        };
+        for case in 0..12 {
+            let np = 1 + r() % 3000;
+            let mut ev: Vec<EvV> = Vec::new();
+            let mut cl: Vec<ClickV> = Vec::new();
+            for _ in 0..(r() % 40_000) {
+                let p = if r() % 10 == 0 { 1 } else { 2 + r() % np };
+                let t = ws + (r() as i64 * 977) % (14 * DAY);
+                let t = if r() % 5 == 0 { t - t % GAP } else { t };
+                let price = if r() % 30 == 0 { 1 + (r() % 50_000) as u32 } else { 0 };
+                ev.push(EvV { person: p * 7919 + case, ts: t, cat: (r() % 21) as u32, price });
+            }
+            for _ in 0..(r() % 10_000) {
+                let p = if r() % 10 == 0 { 1 } else { 2 + r() % (np + 50) };
+                let t = ws - WEEK + (r() as i64 * 7907) % (21 * DAY);
+                let t = if r() % 4 == 0 { t - t % 60_000 } else { t };
+                cl.push(ClickV { person: p * 7919 + case, ts: t, cid: 1 + r() % 500, camp: (r() % ncamp as u64) as u32 });
+            }
+            let mk = |v: Vec<EvV>| -> ByPerson<EvV> { let mut a: ByPerson<EvV> = (0..NB).map(|_| Vec::new()).collect(); let h = v.len() / 2; a[0] = vec![v[..h].to_vec(), v[h..].to_vec()]; a };
+            let mkc = |v: Vec<ClickV>| -> ByPerson<ClickV> { let mut a: ByPerson<ClickV> = (0..NB).map(|_| Vec::new()).collect(); a[0] = vec![v]; a };
+            let (evs, cls) = (mk(ev), mkc(cl));
+            let run = |rx: Option<(i64, i64)>| {
+                let (mut camp, mut assist) = (vec![[0u64; 3]; (ncamp + 1) * ndays], vec![0u32; (ncamp + 1) * ndays]);
+                let st = Stats::default();
+                let mut sc = SessScratch::default();
+                let rows = sessionize(0, &evs, &cls, ncamp, day0, ndays, &mut camp, &mut assist, &st, rx, &mut sc);
+                let mut rows: Vec<_> = rows.iter().map(|u| (u.user, u.day, u.sessions, u.events, u.revenue, u.top)).collect();
+                rows.sort();
+                (rows, camp, assist, st.json())
+            };
+            assert!(run(Some((ws, ws - WEEK))) == run(None), "case {case}");
         }
     }
 }
