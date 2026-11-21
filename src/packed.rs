@@ -100,6 +100,16 @@ impl IdMap {
     pub fn contains_key(&self, s: &[u8]) -> bool {
         self.get(s).is_some()
     }
+    /// RW15: prefetch the slot of a packed key's mix `m`.
+    #[inline(always)]
+    pub fn prefetch_packed(&self, m: u64) {
+        self.packed.prefetch(m);
+    }
+    /// RW15: lookup of a packed (non-empty) key `k` with mix `m`.
+    #[inline(always)]
+    pub fn get_packed(&self, m: u64, k: u64) -> Option<u32> {
+        self.packed.get_mixed(m, k).map(|v| v as u32)
+    }
     /// Value of `s`, inserting `f()` first if absent (`s` non-empty).
     #[inline]
     pub fn get_or_insert_with(&mut self, s: S, f: impl FnOnce() -> u32) -> u32 {

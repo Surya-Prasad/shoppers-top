@@ -972,10 +972,21 @@ fn events(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: i64, 
         .map(|(order, chunk)| {
             let mut parts: Vec<Vec<EvRec>> = (0..NB).map(|_| Vec::with_capacity(chunk.len() / 80 / NB + 8)).collect();
             let (mut lines, mut bad, mut noid) = (0u64, 0u64, 0u64);
-            let mut pend: Pending<EvRec> = Pending::new();
+            // RW15: (row, user key, user mix, product key or 0, product mix); person and
+            // product slots of a whole batch are prefetched before any lookup runs
+            let mut pend: Vec<(EvRec, u64, u64, u64, u64)> = Vec::with_capacity(PBATCH);
             let mut put = |mut r: EvRec, person: u64| {
                 r.person = person;
                 parts[keys::part(r.eid, LOG_NB)].push(r);
+            };
+            let flush = |pend: &mut Vec<(EvRec, u64, u64, u64, u64)>, put: &mut dyn FnMut(EvRec, u64)| {
+                for &(mut r, user, um, pk, pm) in pend.iter() {
+                    if pk != 0 {
+                        r.cat = products.get_packed(pm, pk).unwrap_or(unknown_cat);
+                    }
+                    put(r, names.person_mixed(um, user));
+                }
+                pend.clear();
             };
             for_each_record_ix::<7>(chunk, |rec| {
                 lines += 1;
@@ -1016,9 +1027,24 @@ fn events(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: i64, 
                             Some(ing) if ing.saturating_sub(ts) <= DAY => {
                                 r.ts = ts;
                                 r.price = price;
-                                r.cat = products.get(f[5]).unwrap_or(unknown_cat);
-                                // RW2: person resolved in a prefetched batch
-                                pend.push(names, r, key_of(f[1]), &mut put);
+                                let (pk, pm) = match pack9(f[5]) {
+                                    Some(k) => {
+                                        let m = packed::fmix(k);
+                                        products.prefetch_packed(m);
+                                        (k, m)
+                                    }
+                                    None => {
+                                        r.cat = products.get(f[5]).unwrap_or(unknown_cat);
+                                        (0, 0)
+                                    }
+                                };
+                                let user = key_of(f[1]);
+                                let um = packed::fmix(user);
+                                names.prefetch(um);
+                                pend.push((r, user, um, pk, pm));
+                                if pend.len() == PBATCH {
+                                    flush(&mut pend, &mut put);
+                                }
                                 return;
                             }
                             _ => r.price = 5,
@@ -1027,7 +1053,7 @@ fn events(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: i64, 
                 }
                 put(r, keys::EMPTY);
             });
-            pend.flush(names, &mut put);
+            flush(&mut pend, &mut put);
             drop(put);
             stats.add(K::EvLines, lines);
             stats.add(K::EvMalformed, bad);
