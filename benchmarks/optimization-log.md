@@ -260,6 +260,8 @@ work at open time, which is what we see. On a real disk the result may differ.
 | N04 | Fused SSE2 line+field scanner | B | `45bdcbd` | CI gate PASS | CI 7.239 vs 7.610 (−4.9%, 7/7) | – | CI 24.865 vs 26.080 (−4.7%, 5/5) | – | 11.4 GB RSS | **Keep** |
 | N05 | Packed product/campaign lookup keys (`PMap`) | B | `83fe1be` | CI gate PASS | CI 6.808 vs 7.001 (−2.8%, 5/7) | – | CI 22.137 vs 24.086 (−8.1%, 5/5) | – | 11.4 GB RSS | **Keep** |
 | N06 | Packed link interning + name map | B | `3aa0b90` | CI gate PASS | CI 6.506 vs 6.799 (−4.3%, 6/7) | – | CI 23.070 vs 24.202 (−4.7%, 5/5) | – | 11.4 GB RSS | **Keep** |
+| N07 | Clicks parsed at scan + packed click_id | B | `2d683c6` | CI gate PASS | CI 6.550 vs 6.706 (−2.3%, 7/7) | – | CI 22.246 vs 22.948 (−3.1%, 5/5) | – | 11.4 GB RSS | **Keep** |
+| N09 | Dedup table of row indices | B | not pushed | local only | local 20M dedup 0.774 vs 0.738 s | – | – | – | – | **Revert** (no local gain) |
 
 ## Overnight loop (2026-11-21, CI x86 timing)
 
@@ -346,3 +348,17 @@ Spread test updated to `id_hash`.
 
 CI (`3aa0b90` = night-06 on BEST `baf6156`, vs `baf6156`; EPYC 7763): gate PASS; **20M 6.799 → 6.506 s (−4.3%, 6/7)**;
 **60M 24.202 → 23.070 s (−4.7%, 5/5)**. Merged (no conflict, source identical to `3aa0b90`). BEST → this merge (night-01…06).
+
+### Night-07: clicks parsed at scan time + packed `click_id`: **KEEP**
+
+The click scan now resolves the person, parses `ts` against the click window and looks up the campaign, so dedup and
+validation no longer go back to the raw fields; `click_id` is packed (exact fallback set, as for events). Dedup keeps
+the **first** copy in scan order: rules.md, Clicks step 2, "Copies of a click have identical values, so keep any one"
+(deterministic: transpose keeps file-then-chunk order). Validation of the kept copy is unchanged (empty user, then
+bad `ts`, then unknown campaign).
+
+CI (`2d683c6` vs `42fa641`; Xeon 8573C): gate PASS; **20M 6.706 → 6.550 s (−2.3%, 7/7)**; **60M 22.948 → 22.246 s
+(−3.1%, 5/5)**. Merged (source identical to `2d683c6`). BEST → this merge (night-01…07).
+
+Screened out locally, not pushed: *dedup table of row indices* (key → (part, row), 16-byte entries instead of
+56-byte records): 20M dedup 0.738 → 0.774 s, no gain.
