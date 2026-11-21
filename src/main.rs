@@ -9,6 +9,7 @@
 //!   5. per person part   sort(person, ts) -> sessionize -> attribute -> aggregate
 //!   6. output            user_daily(user_id, day) PK, campaign_daily(campaign_id, day) PK
 
+mod alloc;
 mod dialect;
 mod hashing;
 mod keys;
@@ -24,6 +25,10 @@ use std::time::Instant;
 use std::hash::BuildHasher;
 
 use hashing::Seeded as RandomState;
+
+// RW8: large allocations on 2 MiB transparent huge pages (Linux); system allocator otherwise
+#[global_allocator]
+static GLOBAL: alloc::HugeAlloc = alloc::HugeAlloc;
 use rayon::prelude::*;
 
 use dialect::{Source, chunks, csv_files, data_region, for_each_line, for_each_record, header_order, split};
