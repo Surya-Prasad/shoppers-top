@@ -20,7 +20,9 @@ log "candidate $CAND  base $BASE  cpus $NPROC  $(lscpu | sed -n 's/^Model name: 
 # ---- toolchain + official tools (cached by nothing; ~2 min) ----
 rustup default stable >/dev/null 2>&1 || true
 [ -x /usr/bin/time ] || { sudo apt-get install -y -qq time >/dev/null 2>&1 || apt-get install -y -qq time >/dev/null 2>&1; }
-python3 -m pip install -q polars pyarrow >/dev/null
+# own virtualenv: system pip is refused on Debian/Ubuntu (PEP 668)
+python3 -m venv "$W/venv" && "$W/venv/bin/pip" install -q polars pyarrow >/dev/null
+PY="$W/venv/bin/python"
 B=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
 ( cd "$W" && curl -fsSL -o gen.zip $B/generator.zip && curl -fsSL -o ans.zip $B/dev-answer.zip \
   && unzip -qo gen.zip -d gen && unzip -qo ans.zip -d ans )
@@ -52,14 +54,14 @@ run() { # bin data out -> prints "wall maxrss_kb rc"
 # ---- correctness gate ----
 GATE=pass; NOTES=()
 ( cd "$REPO" && cargo test --release --locked -q >/dev/null 2>&1 ) || { GATE=fail; NOTES+=("unit tests failed"); }
-fx=$(python3 scripts/run_fixtures.py fixtures -- "$BB" 2>&1 | tail -1) || true
+fx=$("$PY" scripts/run_fixtures.py fixtures -- "$BB" 2>&1 | tail -1) || true
 [[ "$fx" == "36/36 fixtures passed" ]] || { GATE=fail; NOTES+=("fixtures: $fx"); }
 read -r _ _ rc < <(run "$BB" "$W/d1" "$W/o-dev")
-dev=$(python3 scripts/compare.py "$W/o-dev" "$ANS" 2>&1 | tail -1) || true
+dev=$("$PY" scripts/compare.py "$W/o-dev" "$ANS" 2>&1 | tail -1) || true
 [[ "$dev" == "MATCH" && "$rc" == 0 ]] || { GATE=fail; NOTES+=("dev answer: $dev (exit $rc)"); }
 for d in d20 d60; do
   read -r _ _ ra < <(run "$BA" "$W/$d" "$W/oa-$d"); read -r _ _ rb < <(run "$BB" "$W/$d" "$W/ob-$d")
-  eq=$(python3 scripts/compare.py "$W/oa-$d" "$W/ob-$d" 2>&1 | tail -1) || true
+  eq=$("$PY" scripts/compare.py "$W/oa-$d" "$W/ob-$d" 2>&1 | tail -1) || true
   [[ "$eq" == "MATCH" && "$ra" == 0 && "$rb" == 0 ]] || { GATE=fail; NOTES+=("$d A vs B: $eq (exits $ra/$rb)"); }
   rm -rf "$W/oa-$d" "$W/ob-$d"
 done
@@ -80,6 +82,6 @@ if [ "$GATE" = pass ]; then
   done
 fi
 grep -h '^\[' "$W/o-t.log" 2>/dev/null | tail -12 > "$W/phases.txt" || true
-python3 benchmarks/ab_summary.py "$W/times.tsv" "$BASE" "$CAND" "$GATE" "$W/phases.txt" \
+"$PY" benchmarks/ab_summary.py "$W/times.tsv" "$BASE" "$CAND" "$GATE" "$W/phases.txt" \
   "$(lscpu | sed -n 's/^Model name: *//p') x $NPROC" "${NOTES[*]:-}" "$T/result.md" "$T/result.json"
 cat "$T/result.md"
