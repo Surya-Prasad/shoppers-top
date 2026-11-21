@@ -268,6 +268,8 @@ work at open time, which is what we see. On a real disk the result may differ.
 | N11 | NB 512 → 256 | A | `ca17f21` | CI gate PASS | CI 6.365 vs 6.561 (−3.0%, 6/7) | – | CI 22.402 vs 23.129 (−3.1%, 4/5) | – | 11.4 GB RSS | **Keep** |
 | N14 | Single-pack person lookup, fmix-keyed tables | B | `a649871` | CI gate PASS | CI 4.550 vs 4.706 (−3.3%, 6/7) | – | CI 14.415 vs 15.090 (−4.5%, 5/5) | – | 12.2 GB RSS | **Keep** |
 | N15 | Re-test of N08 (SWAR timestamps) on the faster base | B | `36c4091` | CI gate PASS | CI 4.963 vs 5.208 (−4.7%, 7/7) | – | CI 17.510 vs 18.027 (−2.9%, 4/5) | – | 12.3 GB RSS | **Keep** |
+| N16 | Links naming/name map on packed keys | B | `320fbae` | CI gate PASS | CI 4.917 vs 4.968 (−1.0%, 5/7) | – | CI 18.594 vs 17.953 (**+3.6%**, 2/5) | – | 12.3 GB RSS | **Revert** |
+| N18 | Fast exit (forget tables, exit(0)) | A | not pushed | local only | no change | – | – | – | – | **Revert** (no gain) |
 
 ## Overnight loop (2026-11-21, CI x86 timing)
 
@@ -428,3 +430,16 @@ new base: timestamps ≈ 20% of the event scan). Flagged as a re-test, not a fre
 CI (`36c4091` vs `25d725a`; Xeon 8573C): gate PASS; **20M 5.208 → 4.963 s (−4.7%, 7/7)**; **60M 18.027 → 17.510 s
 (−2.9%, 4/5)**. Merged on top of night-14 (timefmt only; local checks green, 20M Parquet equal).
 BEST → this merge (night-01…07, 10, 11, 14, 15).
+
+### Night-16: links naming and name map on packed keys: **REVERT**
+
+Interning also records each distinct ID's packed key; the per-person minimum compares packed keys when both IDs
+pack (order-preserving) and bytes otherwise, and the name map is filled from the key array (no re-packing, no ID byte
+reads). Local 20M links 0.27 → 0.20 s.
+
+CI (`320fbae` vs `fee825f`; EPYC 7763): gate PASS; 20M 4.968 → 4.917 s (−1.0%, 5/7); **60M 17.953 → 18.594 s
+(+3.6%, 2/5)**. Fails both bars: **revert** (branch kept). The 60M regression is unexpected for a links-only change
+(links are about 0.9 s at 60M) and is probably runner noise, but the rule decides.
+
+Screened out locally, not pushed: *night-18 fast exit* (`mem::forget` of the partitioned tables + `process::exit(0)`
+after the outputs are renamed): exit-to-wall time unchanged (about 0.15 s, which is kernel teardown).
