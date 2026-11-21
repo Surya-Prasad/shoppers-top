@@ -664,26 +664,40 @@ fn dedup<T: Copy>(parts: &[Vec<T>], key: impl Fn(&T) -> u64, better: impl Fn(&T,
     let mask = cap - 1;
     let mut slots: Vec<(u64, u64)> = vec![(keys::EMPTY, 0); cap];
     let mut used = 0usize;
+    const B: usize = 16;
+    let mut pend = [(0u64, 0usize, 0u64); B]; // (key, first slot, location)
     for (si, part) in parts.iter().enumerate() {
-        for (pi, r) in part.iter().enumerate() {
-            let k = key(r);
-            let mut i = packed::fmix(k) as usize & mask;
-            loop {
-                let s = &mut slots[i];
-                if s.0 == keys::EMPTY {
-                    *s = (k, ((si as u64) << 32) | pi as u64);
-                    used += 1;
-                    break;
-                }
-                if s.0 == k {
-                    let kept = &parts[(s.1 >> 32) as usize][(s.1 & 0xffff_ffff) as usize];
-                    if better(r, kept) {
-                        s.1 = ((si as u64) << 32) | pi as u64;
-                    }
-                    break;
-                }
-                i = (i + 1) & mask;
+        // RW3: slots of B rows are prefetched before any of them is probed
+        let mut base = 0usize;
+        while base < part.len() {
+            let m = (part.len() - base).min(B);
+            for t in 0..m {
+                let k = key(&part[base + t]);
+                let i = packed::fmix(k) as usize & mask;
+                keys::prefetch_read(slots.as_ptr().wrapping_add(i) as *const u8);
+                pend[t] = (k, i, ((si as u64) << 32) | (base + t) as u64);
             }
+            for &(k, i0, loc) in &pend[..m] {
+                let r = &part[(loc & 0xffff_ffff) as usize];
+                let mut i = i0;
+                loop {
+                    let s = &mut slots[i];
+                    if s.0 == keys::EMPTY {
+                        *s = (k, loc);
+                        used += 1;
+                        break;
+                    }
+                    if s.0 == k {
+                        let kept = &parts[(s.1 >> 32) as usize][(s.1 & 0xffff_ffff) as usize];
+                        if better(r, kept) {
+                            s.1 = loc;
+                        }
+                        break;
+                    }
+                    i = (i + 1) & mask;
+                }
+            }
+            base += m;
         }
     }
     let mut out = Vec::with_capacity(used);
