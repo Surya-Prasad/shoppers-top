@@ -227,27 +227,32 @@ fn main() {
     let day0 = ws.div_euclid(DAY) as i32;
     let ndays = ((we - 1).div_euclid(DAY) as i32 - day0 + 1).max(1) as usize;
     let dense_len = (ncamp + 1) * ndays;
-    let folded: Vec<(Vec<Vec<output::UserRow>>, Vec<[u64; 4]>)> = (0..NB)
+    // RW17: credited counters ([sessions, purchasing, revenue]) and assists (u32) live in
+    // separate per-fold arrays: ~104M assist increments at 60M hit a ~112 KB array that
+    // stays in L2 instead of a ~900 KB array of 32-byte cells.
+    type Acc = (Vec<[u64; 3]>, Vec<u32>);
+    let folded: Vec<(Vec<Vec<output::UserRow>>, Acc)> = (0..NB)
         .into_par_iter()
         .fold(
-            || (Vec::new(), Vec::new()),
-            |(mut rows, mut acc): (Vec<Vec<output::UserRow>>, Vec<[u64; 4]>), b| {
-                if acc.is_empty() {
-                    acc = vec![[0u64; 4]; dense_len];
+            || (Vec::new(), (Vec::new(), Vec::new())),
+            |(mut rows, mut acc): (Vec<Vec<output::UserRow>>, Acc), b| {
+                if acc.0.is_empty() {
+                    acc = (vec![[0u64; 3]; dense_len], vec![0u32; dense_len]);
                 }
-                rows.push(sessionize(b, &events_by_person, &clicks_by_person, ncamp, day0, ndays, &mut acc, &stats));
+                rows.push(sessionize(b, &events_by_person, &clicks_by_person, ncamp, day0, ndays, &mut acc.0, &mut acc.1, &stats));
                 (rows, acc)
             },
         )
         .collect();
     let mut dense = vec![[0u64; 4]; dense_len];
     let mut user_parts = Vec::with_capacity(NB);
-    for (rows, acc) in folded {
+    for (rows, (cred, assist)) in folded {
         user_parts.extend(rows);
-        for (d, a) in dense.iter_mut().zip(acc.iter()) {
-            for i in 0..4 {
-                d[i] += a[i];
-            }
+        for ((d, c), a) in dense.iter_mut().zip(cred.iter()).zip(assist.iter()) {
+            d[0] += c[0];
+            d[1] += c[1];
+            d[2] += c[2];
+            d[3] += *a as u64;
         }
     }
     let mut camp_agg: Map<(u32, i32), [u64; 4]> = new_map(1 << 14);
@@ -1142,7 +1147,8 @@ fn sessionize(
     ncamp: usize,
     day0: i32,
     ndays: usize,
-    camp: &mut [[u64; 4]],
+    camp: &mut [[u64; 3]],
+    assist: &mut [u32],
     stats: &Stats,
 ) -> Vec<output::UserRow> {
     // RW6: events and clicks are grouped by bucket (bits of fmix(person) below the
@@ -1243,7 +1249,7 @@ fn sessionize(
             a[1] += has_p as u64;
             a[2] += rev;
             for &c in &active {
-                camp[c as usize * ndays + doff][3] += 1;
+                assist[c as usize * ndays + doff] += 1;
             }
             sessions_total += 1;
             credited += (credit != ORGANIC) as u64;
