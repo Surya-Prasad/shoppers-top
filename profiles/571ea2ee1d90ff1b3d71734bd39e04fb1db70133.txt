@@ -1,0 +1,173 @@
+++ git rev-parse --short HEAD
+++ lscpu
+++ sed -n 's/^Model name: *//p'
+++ nproc
++ echo '# x86 profile of 571ea2e (AMD EPYC 9V74 80-Core Processor x 4), 20000000 events'
+# x86 profile of 571ea2e (AMD EPYC 9V74 80-Core Processor x 4), 20000000 events
++ echo
+
++ echo '## stage timings'
+## stage timings
++ DATA_DIR=/home/runner/work/_temp/p/d
++ OUTPUT_DIR=/home/runner/work/_temp/p/o1
++ grep -E '^\[|^    '
+++ nproc
++ NCPU=4
++ target/release/shopping-sessions
+[  0.011s] reference tables
+    links: parse                         0.014s
+    links: intern                        0.074s
+    links: union                         0.018s
+    links: names                         0.024s
+    links: out map                       0.018s
+    clicks: scan+parse+partition         0.170s
+    clicks: transpose                    0.000s
+    events: scan+parse+partition         0.994s
+    events: transpose                    0.001s
+[  1.328s] links resolved + clicks/events scanned
+    clicks: dedup+validate+repartition   0.055s
+    clicks: transpose                    0.001s
+[  1.384s] clicks
+    events: dedup+validate+repartition   0.192s
+    events: transpose                    0.001s
+[  1.577s] events
+    sessions cpu: sorts 0.999s walk 0.471s radix partitions 256
+[  1.954s] sessions
+[  2.061s] outputs written
+[  2.061s] done
++ echo
+
++ echo '## perf stat'
+## perf stat
++ DATA_DIR=/home/runner/work/_temp/p/d
++ OUTPUT_DIR=/home/runner/work/_temp/p/o2
++ grep -vE '^\[|^    |^ *$|stats|"'
+++ nproc
++ tail -15
++ NCPU=4
++ /usr/bin/perf stat -e task-clock,cycles,instructions,branches,branch-misses,cache-misses,page-faults target/release/shopping-sessions
+window [1788652800000, 1789862400000) ms, threads 4
+files: events 85 clicks 22 links 8
+}
+   <not supported>      cycles                                                                
+   <not supported>      instructions                                                          
+   <not supported>      branches                                                              
+   <not supported>      branch-misses                                                         
+   <not supported>      cache-misses                                                          
++ echo
+
++ echo '## hottest symbols (self, flat)'
+## hottest symbols (self, flat)
++ /usr/bin/perf report -i /home/runner/work/_temp/p/perf.data --sort symbol --stdio
++ grep -E '^ +[0-9]'
++ cut -c1-160
++ head -40
+    19.93%  [.] rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::slice::IterProducer<([usize; 7], &[u8])>, rayon::iter::map::MapConsumer<rayon::
+    10.92%  [.] rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::range::IterProducer<usize>, rayon::iter::fold::FoldConsumer<rayon::iter::extend
+    10.25%  [.] shopping_sessions::timefmt::parse                                                                                                               
+     8.87%  [.] <shopping_sessions::EvScan>::flush                                                                                                              
+     7.83%  [.] rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::vec::DrainProducer<alloc::vec::Vec<alloc::vec::Vec<shopping_sessions::EvRec>>>,
+     3.76%  [.] rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::slice::IterProducer<([usize; 4], &[u8])>, rayon::iter::map::MapConsumer<rayon::
+     2.99%  [k] do_user_addr_fault                                                                                                                              
+     2.52%  [.] shopping_sessions::sort_radix::{closure#0}                                                                                                      
+     2.01%  [k] kernel_init_pages                                                                                                                               
+     1.81%  [.] core::slice::sort::unstable::quicksort::quicksort::<u64, <u64 as core::cmp::PartialOrd>::lt>                                                    
+     1.67%  [.] <&shopping_sessions::resolve_links::{closure#3} as core::ops::function::FnMut<(usize,)>>::call_mut                                              
+     1.55%  [.] shopping_sessions::clicks_scan_items::{closure#0}::{closure#1}                                                                                  
+     1.26%  [k] _raw_spin_unlock_irqrestore                                                                                                                     
+     1.18%  [.] shopping_sessions::dedup_exact::<shopping_sessions::EvRec, shopping_sessions::events_dedup::{closure#0}::{closure#2}, shopping_sessions::events_
+     1.15%  [.] rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::vec::DrainProducer<alloc::vec::Vec<alloc::vec::Vec<shopping_sessions::ClRec>>>,
+     0.81%  [.] <parquet::column::writer::GenericColumnWriter<parquet::column::writer::encoder::ColumnValueEncoderImpl<parquet::data_type::Int64Type>>>::write_m
+     0.71%  [k] do_anonymous_page                                                                                                                               
+     0.59%  [.] rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::slice::IterProducer<&[u8]>, rayon::iter::map::MapConsumer<rayon::iter::collect:
+     0.57%  [k] __rmqueue_pcplist                                                                                                                               
+     0.53%  [k] __handle_mm_fault                                                                                                                               
+     0.49%  [.] core::slice::sort::shared::smallsort::small_sort_general::<(u64, u64, u32), <[(u64, u64, u32)]>::sort_unstable_by<shopping_sessions::sort_radix:
+     0.48%  [.] memchr::arch::x86_64::memchr::memchr_raw::find_avx2                                                                                             
+     0.45%  [.] rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::iter::enumerate::EnumerateProducer<rayon::slice::IterProducer<&[&shopping_sessi
+     0.41%  [.] <core::str::lossy::Utf8Chunks as core::iter::traits::iterator::Iterator>::next                                                                  
+     0.36%  [.] 0x00000000000ba595                                                                                                                              
+     0.35%  [.] 0x00000000000bb711                                                                                                                              
+     0.33%  [k] do_syscall_64                                                                                                                                   
+     0.33%  [.] shopping_sessions::dialect::split::<7>                                                                                                          
+     0.31%  [.] <parquet::util::interner::Interner<parquet::arrow::arrow_writer::byte_array::ByteArrayStorage>>::intern                                         
+     0.31%  [.] shopping_sessions::main                                                                                                                         
+     0.30%  [k] mas_walk                                                                                                                                        
+     0.28%  [.] rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::slice::IterProducer<([usize; 2], &[u8])>, rayon::iter::map::MapConsumer<rayon::
+     0.28%  [k] do_mprotect_pkey                                                                                                                                
+     0.28%  [k] get_mem_cgroup_from_mm                                                                                                                          
+     0.27%  [.] <parquet::column::writer::GenericColumnWriter<parquet::column::writer::encoder::ColumnValueEncoderImpl<parquet::data_type::Int32Type>>>::write_m
+     0.27%  [.] rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::iter::enumerate::EnumerateProducer<rayon::slice::IterProducer<alloc::vec::Vec<(
+     0.24%  [.] shopping_sessions::sort_radix::{closure#1}                                                                                                      
+     0.23%  [k] handle_mm_fault                                                                                                                                 
+     0.23%  [.] core::slice::sort::unstable::quicksort::quicksort::<(u64, u64, u32), <[(u64, u64, u32)]>::sort_unstable_by<shopping_sessions::sort_radix::{closu
+     0.22%  [.] <arrow_array::builder::generic_bytes_builder::GenericByteBuilder<arrow_array::types::GenericStringType<i32>>>::append_value::<alloc::borrow::Cow
+cut: write error: Broken pipe
++ echo
+
++ echo '## hottest source lines (self, flat)'
+## hottest source lines (self, flat)
++ /usr/bin/perf report -i /home/runner/work/_temp/p/perf.data --sort srcline --stdio
++ grep -E '^ +[0-9]'
++ head -60
+     6.10%  mod.rs:1966
+     3.72%  packed.rs:20
+     3.12%  main.rs:1303
+     2.93%  fast.rs:0
+     2.73%  do_user_addr_fault+200
+     2.67%  keys.rs:194
+     2.19%  timefmt.rs:0
+     1.95%  kernel_init_pages+58
+     1.67%  non_null.rs:1663
+     1.63%  main.rs:912
+     1.54%  result.rs:1720
+     1.42%  fast.rs:93
+     1.35%  fast.rs:95
+     1.32%  timefmt.rs:43
+     1.27%  mod.rs:999
+     1.26%  _raw_spin_unlock_irqrestore+33
+     1.18%  mod.rs:1006
+     1.18%  main.rs:902
+     1.17%  fast.rs:94
+     1.13%  packed.rs:22
+     1.09%  main.rs:1511
+     1.03%  index.rs:238
+     0.94%  fast.rs:85
+     0.94%  mod.rs:574
+     0.93%  main.rs:1777
+     0.90%  timefmt.rs:87
+     0.88%  fast.rs:128
+     0.84%  fast.rs:127
+     0.84%  main.rs:0
+     0.80%  fast.rs:122
+     0.78%  timefmt.rs:113
+     0.78%  main.rs:1583
+     0.73%  packed.rs:24
+     0.72%  mod.rs:635
+     0.72%  mod.rs:665
+     0.70%  fast.rs:126
+     0.66%  timefmt.rs:166
+     0.58%  index.rs:0
+     0.57%  main.rs:1036
+     0.56%  fast.rs:117
+     0.54%  index.rs:245
+     0.54%  main.rs:1541
+     0.50%  keys.rs:193
+     0.49%  timefmt.rs:163
+     0.48%  maybe_uninit.rs:575
+     0.48%  main.rs:1715
+     0.47%  __rmqueue_pcplist+97
+     0.47%  main.rs:1419
+     0.47%  timefmt.rs:146
+     0.46%  main.rs:1737
+     0.44%  main.rs:1582
+     0.42%  uint_macros.rs:2682
+     0.41%  keys.rs:197
+     0.40%  keys.rs:153
+     0.38%  mut_ptr.rs:971
+     0.38%  smallsort.rs:566
+     0.38%  timefmt.rs:153
+     0.37%  timefmt.rs:107
+     0.36%  main.rs:1552
+     0.36%  libc.so.6[ba595]
+grep: write error: Broken pipe
