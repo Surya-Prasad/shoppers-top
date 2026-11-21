@@ -211,6 +211,38 @@ and the plan says a clear 60M regression blocks a change even when 20M improves.
 3. Bigger chunks (16 MiB) were never worse at fixed NB in stage 1, but their effect alone (512/16:
    −1.3%) is within noise. Not worth a change on its own.
 
+## A4: `MADV_WILLNEED` prefetch (Tier A/B): **REVERT**
+
+Change tried (`src/dialect.rs`, `Source::open`): after the existing `madvise(SEQUENTIAL)`, also
+`madvise(WILLNEED)` over each whole input mapping, so the kernel starts reading every file at open time.
+
+**Correctness gate (all passed):** unit 5/5; fixtures 36/36; dev MATCH; invariants 15/15; fuzz
+strict 500 (seed 51) and adversarial 500 (seed 52), 0 failures; Parquet equality vs A2 in container at
+20M s9, 20M s11 and 60M s11: MATCH ×3; 1 vs 8 threads at 20M and 60M: MATCH; forced failure exits 101.
+
+**Performance (A = `a2`, B = `a4`).** Host-cold: 4 pairs per dataset, caches dropped before **every**
+run, order alternating (A,B / B,A). Warm: 5 interleaved pairs. The host was quieter in this session
+(load average 1.7 at the start), so absolute times are lower than in A1–A3; only the pairs are compared.
+
+| Data | Kind | A2 median (min–max) | A4 median (min–max) | Δ | A4 faster |
+|---|---|---:|---:|---:|---:|
+| 20M s9 | host-cold | 3.291 (3.15–4.70) | 3.400 (3.18–3.67) | +3.3% | 1/4 |
+| 20M s9 | warm | 2.476 (2.46–2.50) | 2.507 (2.49–2.57) | +1.3% | 1/5 |
+| 20M s11 | host-cold | 3.133 (3.01–3.34) | 3.273 (3.26–3.29) | +4.5% | 1/4 |
+| 20M s11 | warm | 2.439 (2.42–2.46) | 2.458 (2.43–2.49) | +0.8% | 1/5 |
+| 60M s11 | host-cold | 11.091 (10.38–11.93) | 11.508 (10.92–11.81) | +3.8% | 2/4 |
+| 60M s11 | warm | 8.417 (8.29–10.10) | 8.317 (8.20–8.81) | −1.2% | 4/5 |
+
+Memory (60M): anon 7.24 vs 7.27 GB; `memory.peak` 7.37 vs 7.39 GB. Unchanged.
+
+**Decision: revert.** The plan keeps A4 only if it helps cold without hurting warm; here it *hurt*
+host-cold at every size (+3–4.5%) and was neutral at best when warm.
+
+**Caveat, to re-check on the x86 VM:** "host-cold" drops only the *guest* page cache. The colima
+VM's disk image almost certainly stays in macOS's file cache, so a guest-cold read is served at near-memory
+speed through virtio, and read-ahead has no slow I/O to overlap with. The hint can only add up-front
+work at open time, which is what we see. On a real disk the result may differ.
+
 ## Register
 
 | ID | Change | Tier | Commit | Correctness | 20M warm (s9 / s11) | 20M cold | 60M warm | 60M cold | anon peak 60M | Decision |
@@ -220,4 +252,5 @@ and the plan says a clear 60M regression blocks a change even when 20M improves.
 | A1 | Single-probe dedup | A | see git log | all gates | 2.795 / 2.730 | 3.87 / 3.67 | 13.092 vs 13.317 (paired) | 17.93 | 8.2 GB | **Keep** |
 | A2 | Drop `line_fields` (EvRaw 80→64 B) | A | see git log | all gates + equal-ingest proof | 2.713 / 2.740 vs A1 2.760 / 2.885 (paired) | 3.52 / 3.43 | 12.601 vs 12.715 (paired) | 14.98 | **7.3 GB** (−12%) | **Keep** |
 | A3 | NB/CHUNK → 128 / 16 MiB | A | not merged | all gates | 2.466 / 2.447 vs A2 2.584 / 2.555 (paired) | 3.88 / 3.16 | 12.405 vs 12.144 (11 pairs, **+2.2%**, A3 faster 2/11) | 13.08 | 6.96 GB | **Revert** (60M regression) |
-| A4 | WILLNEED prefetch | A/B | | | | | | | | next |
+| A4 | `MADV_WILLNEED` whole-file | A/B | not merged | all gates | 2.507 / 2.458 vs A2 2.476 / 2.439 (paired) | 3.400 / 3.273 vs 3.291 / 3.133 (4 cold pairs each) | 8.317 vs 8.417 (paired) | 11.508 vs 11.091 | 7.27 GB | **Revert** (cold slower) |
+| B1 | Contiguous partitioning + fused emit | B | | | | | | | | next (profile first) |
