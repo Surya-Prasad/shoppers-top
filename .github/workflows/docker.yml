@@ -1,0 +1,54 @@
+# Submission check: build the real Docker image natively on x86 and run it the way the
+# scorer does (starter docker_run.sh flags: no network, read-only root, uid 1000, 64 MB /tmp)
+# on the 36 fixtures and the official 1M dev set. Result -> bench-results/docker/<sha>.txt.
+name: docker
+on:
+  push:
+    branches: ['docker/**']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run the image
+        run: |
+          set -u
+          OUT=$RUNNER_TEMP/docker.txt; W=$RUNNER_TEMP/w; mkdir -p $W
+          {
+            echo "# docker check of $(git rev-parse HEAD) on $(lscpu | sed -n 's/^Model name: *//p')"
+            start=$(date +%s)
+            if docker build -t shopping-sessions:latest . > $W/build.log 2>&1; then
+              echo "- image build: OK in $(( $(date +%s) - start ))s, size $(docker image inspect shopping-sessions:latest --format '{{.Size}}') bytes, user $(docker image inspect shopping-sessions:latest --format '{{.Config.User}}')"
+            else
+              echo "- image build: FAILED"; tail -40 $W/build.log; exit 0
+            fi
+            python3 -m venv $W/venv && $W/venv/bin/pip install -q polars pyarrow
+            export IMAGE=shopping-sessions:latest PLATFORM=linux/amd64 CPUS=$(nproc) MEM=14g TMPDIR=$W
+            echo "- fixtures in container: $($W/venv/bin/python scripts/run_fixtures.py fixtures -- scripts/docker_run.sh 2>&1 | tail -1)"
+            B=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+            (cd $W && curl -fsSL -o gen.zip $B/generator.zip && curl -fsSL -o ans.zip $B/dev-answer.zip && unzip -qo gen.zip -d gen && unzip -qo ans.zip -d ans)
+            GD=$(dirname "$(find $W/gen -name Cargo.toml | head -1)"); (cd $GD && cargo build --release -q)
+            ANS=$(dirname "$(find $W/ans -name user_daily.csv | head -1)")
+            $GD/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output $W/dev >/dev/null
+            s=$(date +%s%N); scripts/docker_run.sh $W/dev $W/devout > $W/run.log 2>&1; rc=$?; e=$(date +%s%N)
+            echo "- dev set in container: exit $rc, $(awk -v a=$s -v b=$e 'BEGIN{printf "%.2f", (b-a)/1e9}') s, compare: $($W/venv/bin/python scripts/compare.py $W/devout $ANS 2>&1 | tail -1)"
+            echo "- output files: $(ls $W/devout/user_daily | wc -l) user_daily, $(ls $W/devout/campaign_daily | wc -l) campaign_daily"
+          } > $OUT 2>&1
+          cat $OUT
+      - name: Publish
+        if: always()
+        run: |
+          set -eu
+          [ -f "$RUNNER_TEMP/docker.txt" ] || exit 0
+          cat "$RUNNER_TEMP/docker.txt" >> "$GITHUB_STEP_SUMMARY"
+          sha=$(git rev-parse HEAD)
+          git clone -q --depth 1 --branch bench-results "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" "$RUNNER_TEMP/pub"
+          mkdir -p "$RUNNER_TEMP/pub/docker"; cp "$RUNNER_TEMP/docker.txt" "$RUNNER_TEMP/pub/docker/$sha.txt"
+          cd "$RUNNER_TEMP/pub"
+          git -c user.name=bench-bot -c user.email=bench-bot@users.noreply.github.com add -A
+          git -c user.name=bench-bot -c user.email=bench-bot@users.noreply.github.com commit -q -m "docker check ${sha:0:7} (${{ github.ref_name }})"
+          for i in 1 2 3; do git push -q origin HEAD:bench-results && break; git pull -q --rebase origin bench-results || true; done
