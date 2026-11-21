@@ -196,7 +196,7 @@ fn main() {
     // ---------------------------------------------------------------- identity
     let names = resolve_links(lk_src, &stats);
     lap("links resolved");
-    let person_of = |user: S| -> Person { names.get(user).copied().unwrap_or_else(|| Person::new(user)) };
+    let person_of = |user: S| -> Person { names.person(user) };
     let part_state = RandomState(PART_SEED);
 
     // ---------------------------------------------------------------- clicks
@@ -348,10 +348,25 @@ pub struct Names {
     parts: Vec<PMap<Person>>,
 }
 impl Names {
+    /// Night-14: the person of user ID `s`, packing `s` once and hashing once.
     #[inline]
-    pub fn get(&self, s: S) -> Option<&Person> {
-        let p = (packed::id_hash(&self.state, s) >> 40) as usize & (LP - 1);
-        self.parts[p].get(s)
+    pub fn person(&self, s: S) -> Person {
+        match pack9(s) {
+            Some(k) => {
+                let m = packed::fmix(k);
+                match self.parts[(m >> 40) as usize & (LP - 1)].get_mixed(m) {
+                    Some(p) => *p,
+                    None => Person { name: s, key: k },
+                }
+            }
+            None => {
+                let p = (self.state.hash_one(s) >> 40) as usize & (LP - 1);
+                match self.parts[p].get_other(s) {
+                    Some(p) => *p,
+                    None => Person { name: s, key: NOPK },
+                }
+            }
+        }
     }
 }
 
