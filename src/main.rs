@@ -658,7 +658,7 @@ fn transpose<T>(v: Vec<Vec<Vec<T>>>) -> ByPerson<T> {
 
 /// Dedup table over the copies of one partition: key -> location (source, position) of
 /// the kept copy. `better(new, kept)` decides replacement; first copy wins on ties.
-fn dedup<T: Copy>(parts: &[Vec<T>], key: impl Fn(&T) -> u64, better: impl Fn(&T, &T) -> bool) -> Vec<T> {
+fn dedup<T: Copy>(parts: &[Vec<T>], key: impl Fn(&T) -> u64, better: impl Fn(&T, &T) -> bool, mut sink: impl FnMut(&T)) -> usize {
     let n: usize = parts.iter().map(Vec::len).sum();
     let cap = (n * 2).next_power_of_two().max(16);
     let mask = cap - 1;
@@ -700,13 +700,13 @@ fn dedup<T: Copy>(parts: &[Vec<T>], key: impl Fn(&T) -> u64, better: impl Fn(&T,
             base += m;
         }
     }
-    let mut out = Vec::with_capacity(used);
+    // RW5: kept copies go straight to the caller (no intermediate vector)
     for s in &slots {
         if s.0 != keys::EMPTY {
-            out.push(parts[(s.1 >> 32) as usize][(s.1 & 0xffff_ffff) as usize]);
+            sink(&parts[(s.1 >> 32) as usize][(s.1 & 0xffff_ffff) as usize]);
         }
     }
-    out
+    used
 }
 
 fn clicks(src: &[&'static Source], campaigns: &PMap<u32>, lo: i64, hi: i64, names: &Names, stats: &Stats) -> ByPerson<ClickV> {
@@ -773,17 +773,16 @@ fn clicks(src: &[&'static Source], campaigns: &PMap<u32>, lo: i64, hi: i64, name
         .into_par_iter()
         .map(|parts| {
             let n: usize = parts.iter().map(Vec::len).sum();
-            let kept = dedup(&parts, |r: &ClRec| r.cid, |_, _| false);
-            stats.add(K::ClDupCopies, (n - kept.len()) as u64);
-            let mut dst: Vec<Vec<ClickV>> = (0..NB).map(|_| Vec::with_capacity(kept.len() / NB + 8)).collect();
+            let mut dst: Vec<Vec<ClickV>> = (0..NB).map(|_| Vec::with_capacity(n / NB + 8)).collect();
             let mut why = [0u64; 4];
-            for r in &kept {
+            let kept = dedup(&parts, |r: &ClRec| r.cid, |_, _| false, |r| {
                 if r.person == keys::EMPTY {
                     why[r.why as usize] += 1;
                 } else {
                     dst[keys::part(r.person, LOG_NB)].push(ClickV { person: r.person, ts: r.ts, cid: r.cid, camp: r.camp });
                 }
-            }
+            });
+            stats.add(K::ClDupCopies, (n - kept) as u64);
             stats.add(K::ClBadUser, why[1]);
             stats.add(K::ClBadTs, why[2]);
             stats.add(K::ClBadCampaign, why[3]);
@@ -939,20 +938,19 @@ fn events(src: &[&'static Source], products: &PMap<u32>, unknown_cat: u32, lo: i
             let n: usize = parts.iter().map(Vec::len).sum();
             // rules.md, Events step 2: keep the copy with the smallest ingest_ts; A2: on a
             // tie the first copy stays (equal-ingest copies are promised identical)
-            let kept = dedup(&parts, |r: &EvRec| r.eid, |a, b| a.rank < b.rank);
-            stats.add(K::EvDupCopies, (n - kept.len()) as u64);
-            let mut dst: Vec<Vec<EvV>> = (0..NB).map(|_| Vec::with_capacity(kept.len() / NB + 8)).collect();
+            let mut dst: Vec<Vec<EvV>> = (0..NB).map(|_| Vec::with_capacity(n / NB + 8)).collect();
             let mut c = [0u64; 8];
-            for r in &kept {
+            let kept = dedup(&parts, |r: &EvRec| r.eid, |a, b| a.rank < b.rank, |r| {
                 if r.person == keys::EMPTY {
                     c[r.price as usize] += 1;
-                    continue;
+                    return;
                 }
                 if r.cat == unknown_cat {
                     c[6] += 1;
                 }
                 dst[keys::part(r.person, LOG_NB)].push(EvV { person: r.person, ts: r.ts, cat: r.cat, price: r.price });
-            }
+            });
+            stats.add(K::EvDupCopies, (n - kept) as u64);
             for (k, i) in [(K::EvBadUser, 0), (K::EvBadTs, 1), (K::EvBadType, 2), (K::EvBadProduct, 3), (K::EvBadPrice, 4), (K::EvLate, 5), (K::EvUnknownProduct, 6)] {
                 stats.add(k, c[i]);
             }
@@ -974,6 +972,36 @@ const T_BAD: u8 = 3;
 
 // ====================================================================== sessions
 
+/// RW6: counting sort of the rows of all `parts` into `nbk` buckets, then sort each bucket
+/// with `cmp`. The result is ordered by (bucket, cmp).
+fn bucket_sort<T: Copy>(parts: &[Vec<T>], n: usize, nbk: usize, bucket: impl Fn(&T) -> usize, cmp: impl Fn(&T, &T) -> std::cmp::Ordering) -> Vec<T> {
+    let mut cnt = vec![0u32; nbk + 1];
+    for part in parts {
+        for r in part {
+            cnt[bucket(r) + 1] += 1;
+        }
+    }
+    for i in 1..=nbk {
+        cnt[i] += cnt[i - 1];
+    }
+    let starts = cnt.clone();
+    let mut out: Vec<T> = Vec::with_capacity(n);
+    let spare = out.spare_capacity_mut();
+    for part in parts {
+        for r in part {
+            let k = bucket(r);
+            spare[cnt[k] as usize].write(*r);
+            cnt[k] += 1;
+        }
+    }
+    // SAFETY: the counting pass wrote every one of the n slots exactly once
+    unsafe { out.set_len(n) };
+    for k in 0..nbk {
+        out[starts[k] as usize..starts[k + 1] as usize].sort_unstable_by(&cmp);
+    }
+    out
+}
+
 fn sessionize(
     b: usize,
     evs: &ByPerson<EvV>,
@@ -984,21 +1012,22 @@ fn sessionize(
     camp: &mut [[u64; 4]],
     stats: &Stats,
 ) -> Vec<output::UserRow> {
-    // RW1: persons are u64 keys; sort events by (person, ts) directly
+    // RW6: events and clicks are grouped by bucket (bits of fmix(person) below the
+    // partition bits) with one counting-sort pass, then each small bucket is sorted by
+    // (person, ts). The walk only needs every person's rows together and time-ordered,
+    // and buckets come in the same order for events and clicks, so the per-person merge
+    // below still lines up (within a bucket, persons are in key order on both sides).
     let n: usize = evs[b].iter().map(Vec::len).sum();
-    let mut ev: Vec<EvV> = Vec::with_capacity(n);
-    for part in &evs[b] {
-        ev.extend_from_slice(part);
-    }
-    ev.sort_unstable_by_key(|e| (e.person, e.ts));
-    // clicks sorted by (person, ts asc, click_id desc in byte order), so the last click
-    // of a window is the latest one with the byte-wise smallest click_id
     let nc: usize = cls[b].iter().map(Vec::len).sum();
-    let mut cl: Vec<ClickV> = Vec::with_capacity(nc);
-    for part in &cls[b] {
-        cl.extend_from_slice(part);
-    }
-    cl.sort_unstable_by(|x, y| (x.person, x.ts).cmp(&(y.person, y.ts)).then_with(|| keys::cmp_bytes(y.cid, x.cid)));
+    let nbk: usize = (n / 64).next_power_of_two().clamp(1, 1 << 14);
+    let bshift = 64 - LOG_NB - nbk.trailing_zeros();
+    let bucket = |person: u64| -> usize { ((packed::fmix(person) >> bshift) as usize) & (nbk - 1) };
+    let ev: Vec<EvV> = bucket_sort(&evs[b], n, nbk, |e: &EvV| bucket(e.person), |x, y| (x.person, x.ts).cmp(&(y.person, y.ts)));
+    // clicks: (person, ts asc, click_id desc in byte order), so the last click of a
+    // window is the latest one with the byte-wise smallest click_id
+    let cl: Vec<ClickV> = bucket_sort(&cls[b], nc, nbk, |c: &ClickV| bucket(c.person), |x, y| {
+        (x.person, x.ts).cmp(&(y.person, y.ts)).then_with(|| keys::cmp_bytes(y.cid, x.cid))
+    });
 
     let mut rows: Vec<output::UserRow> = Vec::with_capacity(n / 8 + 16);
     // sliding-window distinct-campaign set: count per campaign + list of active ones
@@ -1017,7 +1046,9 @@ fn sessionize(
         while pe < ev.len() && ev[pe].person == p {
             pe += 1;
         }
-        while j < cl.len() && cl[j].person < p {
+        // advance clicks to this person: order is (bucket, person) on both sides
+        let pk = (bucket(p), p);
+        while j < cl.len() && (bucket(cl[j].person), cl[j].person) < pk {
             j += 1;
         }
         let mut pc = j;
