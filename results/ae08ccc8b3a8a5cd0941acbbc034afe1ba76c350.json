@@ -1,0 +1,59 @@
+{
+ "base": "02c37c7901056b99549f80dbfb907289de0485d5",
+ "cand": "ae08ccc8b3a8a5cd0941acbbc034afe1ba76c350",
+ "gate": "pass",
+ "cpu": "INTEL(R) XEON(R) PLATINUM 8573C x 4",
+ "notes": "",
+ "sizes": {
+  "d20": {
+   "base": [
+    3.6726,
+    3.7155,
+    3.7216,
+    3.666,
+    3.7784,
+    3.6663,
+    3.686
+   ],
+   "cand": [
+    3.3244,
+    3.2771,
+    3.2765,
+    3.3357,
+    3.2644,
+    3.2874,
+    3.3564
+   ],
+   "base_median": 3.686,
+   "cand_median": 3.2874,
+   "delta_pct": -10.81,
+   "cand_wins": 7,
+   "pairs": 7,
+   "base_rss_gb": 3.45,
+   "cand_rss_gb": 3.44
+  },
+  "d60": {
+   "base": [
+    11.4652,
+    11.4936,
+    11.5399,
+    11.5121,
+    11.5296
+   ],
+   "cand": [
+    10.2204,
+    10.4094,
+    10.399,
+    10.138,
+    10.5438
+   ],
+   "base_median": 11.5121,
+   "cand_median": 10.399,
+   "delta_pct": -9.67,
+   "cand_wins": 5,
+   "pairs": 5,
+   "base_rss_gb": 10.16,
+   "cand_rss_gb": 10.17
+  }
+ }
+}
