@@ -14,6 +14,7 @@ mod hashing;
 mod output;
 mod timefmt;
 
+use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
@@ -645,13 +646,15 @@ fn events(
             let mut best: Map<S, EvRaw> = new_map(n);
             for part in &parts {
                 for r in part {
-                    match best.get_mut(r.eid) {
-                        None => {
-                            best.insert(r.eid, *r);
+                    // A1: one hash probe per copy (entry) instead of get_mut + insert.
+                    // Same rule: keep the copy that `earlier` prefers (smallest ingest_ts).
+                    match best.entry(r.eid) {
+                        Entry::Vacant(slot) => {
+                            slot.insert(*r);
                         }
-                        Some(cur) => {
-                            if earlier(r, cur) {
-                                *cur = *r;
+                        Entry::Occupied(mut slot) => {
+                            if earlier(r, slot.get()) {
+                                slot.insert(*r);
                             }
                         }
                     }
