@@ -12,6 +12,7 @@
 mod dialect;
 mod hashing;
 mod output;
+mod packed;
 mod timefmt;
 
 use std::collections::hash_map::Entry;
@@ -25,6 +26,7 @@ use hashing::Seeded as RandomState;
 use rayon::prelude::*;
 
 use dialect::{Source, chunks, csv_files, data_region, for_each_line, header_order, split};
+use packed::PMap;
 use timefmt::{BAD, DAY};
 
 pub type Map<K, V> = std::collections::HashMap<K, V, RandomState>;
@@ -261,7 +263,7 @@ fn main() {
 
 /// products(product_id PK, category). First occurrence wins if a key repeats.
 /// Categories are numbered in byte order, so "smallest index" == "byte-wise smallest name".
-fn load_products(src: &'static Source) -> (Map<S, u32>, Vec<S>) {
+fn load_products(src: &'static Source) -> (PMap<u32>, Vec<S>) {
     let bytes: S = src.bytes();
     let order = header_order::<2>(bytes, ["product_id", "category"]);
     let mut rows: Vec<(S, S)> = Vec::new();
@@ -281,24 +283,24 @@ fn load_products(src: &'static Source) -> (Map<S, u32>, Vec<S>) {
     for (i, c) in cats.iter().enumerate() {
         idx.insert(*c, i as u32);
     }
-    let mut products: Map<S, u32> = new_map(rows.len());
+    let mut products: PMap<u32> = PMap::with_capacity(rows.len());
     for (p, c) in rows {
-        products.entry(p).or_insert(idx[c]);
+        products.insert_first(p, idx[c]);
     }
     (products, cats)
 }
 
 /// campaigns(campaign_id PK, channel). Returns id -> dense index, channel per index, id per index.
-fn load_campaigns(src: &'static Source) -> (Map<S, u32>, Vec<S>, Vec<S>) {
+fn load_campaigns(src: &'static Source) -> (PMap<u32>, Vec<S>, Vec<S>) {
     let bytes: S = src.bytes();
     let order = header_order::<2>(bytes, ["campaign_id", "channel"]);
-    let mut m: Map<S, u32> = new_map(4096);
+    let mut m: PMap<u32> = PMap::with_capacity(4096);
     let (mut ch, mut ids) = (Vec::new(), Vec::new());
     for_each_line(data_region(bytes), |line| {
         if let Some(f) = split::<2>(line) {
             let f = reorder(f, &order);
             if !f[0].is_empty() && !m.contains_key(f[0]) {
-                m.insert(f[0], ids.len() as u32);
+                m.insert_first(f[0], ids.len() as u32);
                 ids.push(f[0]);
                 ch.push(f[1]);
             }
@@ -439,7 +441,7 @@ fn transpose<T>(v: Vec<Vec<Vec<T>>>) -> ByPerson<T> {
 
 fn clicks(
     src: &[&'static Source],
-    campaigns: &Map<S, u32>,
+    campaigns: &PMap<u32>,
     lo: i64,
     hi: i64,
     person_of: &(dyn Fn(S) -> S + Sync),
@@ -582,7 +584,7 @@ fn parse_ingest(b: &[u8]) -> Option<i64> {
 #[allow(clippy::too_many_arguments)]
 fn events(
     src: &[&'static Source],
-    products: &Map<S, u32>,
+    products: &PMap<u32>,
     unknown_cat: u32,
     lo: i64,
     hi: i64,
