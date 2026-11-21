@@ -222,19 +222,28 @@ fn main() {
     lap("reference tables");
 
     // ---------------------------------------------------------------- identity
-    let names = resolve_links(lk_src, &stats);
-    lap("links resolved");
+    // RW31: links resolve while clicks and events are scanned (the scans carry user keys;
+    // persons are resolved in the dedup steps below)
+    let (names, (click_copies, event_copies)) = rayon::join(
+        || resolve_links(lk_src, &stats),
+        || {
+            let c = clicks_scan(cl_src, &campaigns, ws - WEEK, we, &stats);
+            let e = events_scan(ev_src, &products, unknown_cat, ws, we, &stats);
+            (c, e)
+        },
+    );
+    lap("links resolved + clicks/events scanned");
     if std::env::var("SS_EXP").is_ok() {
         experiment(ev_src, &products, ws, we, &names);
         return;
     }
 
     // ---------------------------------------------------------------- clicks
-    let clicks_by_person = clicks(cl_src, &campaigns, ws - WEEK, we, &names, &stats);
+    let clicks_by_person = clicks_dedup(click_copies, &names, &stats);
     lap("clicks");
 
     // ---------------------------------------------------------------- events
-    let events_by_person = events(ev_src, &products, unknown_cat, ws, we, &names, &stats);
+    let events_by_person = events_dedup(event_copies, unknown_cat, &names, &stats);
     lap("events");
 
     // ---------------------------------------------------------------- sessions
@@ -504,6 +513,32 @@ const LINK_SEED: u64 = 0x1319_8A2E_0370_7344;
 pub struct Names {
     parts: Vec<KeyMap>,
 }
+/// RW31: person resolution in dedup sinks, batched with prefetch: rows carry the user key
+/// in `person` until here; `emit(row, person)` gets the resolved person.
+struct PersonBatch<T> {
+    rows: Vec<(T, u64, u64)>, // (row, user key, mix)
+}
+impl<T: Copy> PersonBatch<T> {
+    fn new() -> Self {
+        PersonBatch { rows: Vec::with_capacity(PBATCH) }
+    }
+    #[inline]
+    fn push(&mut self, names: &Names, row: T, user: u64, emit: &mut impl FnMut(T, u64)) {
+        let m = packed::fmix(user);
+        names.prefetch(m);
+        self.rows.push((row, user, m));
+        if self.rows.len() == PBATCH {
+            self.flush(names, emit);
+        }
+    }
+    fn flush(&mut self, names: &Names, emit: &mut impl FnMut(T, u64)) {
+        for &(row, user, m) in &self.rows {
+            emit(row, names.person_mixed(m, user));
+        }
+        self.rows.clear();
+    }
+}
+
 /// RW2: rows waiting for their person lookup; the table slots of a whole batch are
 /// prefetched before any lookup runs, so the cache misses overlap.
 const PBATCH: usize = 32;
@@ -904,7 +939,9 @@ fn dedup_exact<T: Copy>(parts: &[Vec<T>], key: impl Fn(&T) -> u64, better: impl 
     }
 }
 
-fn clicks(src: &[&'static Source], campaigns: &IdMap, lo: i64, hi: i64, names: &Names, stats: &Stats) -> ByPerson<ClickV> {
+/// RW31: click scan. Valid copies carry their *user* key in `person`; persons are resolved
+/// in `clicks_dedup`, so this can run while links are still being resolved.
+fn clicks_scan(src: &[&'static Source], campaigns: &IdMap, lo: i64, hi: i64, stats: &Stats) -> ByPerson<ClRec> {
     let mut st = Stage::start();
     let items = work_items::<4>(src, ["click_id", "user_id", "campaign_id", "ts"]);
     // scan + validate each copy + partition on click_id
@@ -913,9 +950,8 @@ fn clicks(src: &[&'static Source], campaigns: &IdMap, lo: i64, hi: i64, names: &
         .map(|(order, chunk)| {
             let mut parts: Vec<Vec<ClRec>> = (0..NB).map(|_| Vec::with_capacity(chunk.len() / 48 / NB + 8)).collect();
             let (mut lines, mut bad, mut noid) = (0u64, 0u64, 0u64);
-            let mut pend: Pending<ClRec> = Pending::new();
-            let mut put = |mut r: ClRec, person: u64| {
-                r.person = person;
+            let mut put = |mut r: ClRec, user: u64| {
+                r.person = user;
                 parts[keys::part(r.cid, LOG_NB)].push(r);
             };
             for_each_record_bq::<4>(chunk, |rec| {
@@ -943,7 +979,7 @@ fn clicks(src: &[&'static Source], campaigns: &IdMap, lo: i64, hi: i64, names: &
                             Some(c) => {
                                 r.ts = ts;
                                 r.camp = c;
-                                pend.push(names, r, key_of(f[1]), &mut put);
+                                put(r, key_of(f[1]));
                                 return;
                             }
                         }
@@ -951,7 +987,6 @@ fn clicks(src: &[&'static Source], campaigns: &IdMap, lo: i64, hi: i64, names: &
                 }
                 put(r, keys::EMPTY);
             });
-            pend.flush(names, &mut put);
             drop(put);
             stats.add(K::ClLines, lines);
             stats.add(K::ClMalformed, bad);
@@ -962,6 +997,12 @@ fn clicks(src: &[&'static Source], campaigns: &IdMap, lo: i64, hi: i64, names: &
     st.mark("clicks: scan+parse+partition");
     let by_cid = transpose(scattered);
     st.mark("clicks: transpose");
+    by_cid
+}
+
+/// RW31: click dedup + person resolution (batched) + repartition by person.
+fn clicks_dedup(by_cid: ByPerson<ClRec>, names: &Names, stats: &Stats) -> ByPerson<ClickV> {
+    let mut st = Stage::start();
     // rules.md, Clicks step 2: copies are identical, keep any one (the first in scan
     // order: transpose keeps file-then-chunk order, so this is thread-count independent)
     let out: Vec<Vec<Vec<ClickV>>> = by_cid
@@ -970,13 +1011,19 @@ fn clicks(src: &[&'static Source], campaigns: &IdMap, lo: i64, hi: i64, names: &
             let n: usize = parts.iter().map(Vec::len).sum();
             let mut dst: Vec<Vec<ClickV>> = (0..NB).map(|_| Vec::with_capacity(n / NB + 8)).collect();
             let mut why = [0u64; 4];
+            let mut pb: PersonBatch<ClRec> = PersonBatch::new();
+            let mut emit = |r: ClRec, person: u64| {
+                dst[keys::part(person, LOG_NB)].push(ClickV { person, ts: r.ts, cid: r.cid, camp: r.camp });
+            };
             let kept = dedup(&parts, |r: &ClRec| r.cid, |_, _| false, |r| {
                 if r.person == keys::EMPTY {
                     why[r.why as usize] += 1;
                 } else {
-                    dst[keys::part(r.person, LOG_NB)].push(ClickV { person: r.person, ts: r.ts, cid: r.cid, camp: r.camp });
+                    pb.push(names, *r, r.person, &mut emit);
                 }
             });
+            pb.flush(names, &mut emit);
+            drop(emit);
             stats.add(K::ClDupCopies, (n - kept) as u64);
             stats.add(K::ClBadUser, why[1]);
             stats.add(K::ClBadTs, why[2]);
@@ -1052,7 +1099,9 @@ fn rank_of(ingest: Option<i64>) -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn events(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: i64, hi: i64, names: &Names, stats: &Stats) -> ByPerson<EvV> {
+/// RW31: event scan. Valid copies carry their *user* key in `person`; persons are resolved
+/// in `events_dedup`, so this can run while links are still being resolved.
+fn events_scan(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: i64, hi: i64, stats: &Stats) -> ByPerson<EvRec> {
     const NAMES: [&str; 7] = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"];
     let mut st = Stage::start();
     let items = work_items::<7>(src, NAMES);
@@ -1073,7 +1122,8 @@ fn events(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: i64, 
                     if pk != 0 {
                         r.cat = products.get_packed(pm, pk).unwrap_or(unknown_cat);
                     }
-                    put(r, names.person_mixed(um, user));
+                    let _ = um;
+                    put(r, user);
                 }
                 pend.clear();
             };
@@ -1128,9 +1178,7 @@ fn events(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: i64, 
                                     }
                                 };
                                 let user = key_of(f[1]);
-                                let um = packed::fmix(user);
-                                names.prefetch(um);
-                                pend.push((r, user, um, pk, pm));
+                                pend.push((r, user, 0, pk, pm));
                                 if pend.len() == PBATCH {
                                     flush(&mut pend, &mut put);
                                 }
@@ -1153,6 +1201,12 @@ fn events(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: i64, 
     st.mark("events: scan+parse+partition");
     let by_eid = transpose(scattered);
     st.mark("events: transpose");
+    by_eid
+}
+
+/// RW31: event dedup + person resolution (batched) + repartition by person.
+fn events_dedup(by_eid: ByPerson<EvRec>, unknown_cat: u32, names: &Names, stats: &Stats) -> ByPerson<EvV> {
+    let mut st = Stage::start();
     let out: Vec<Vec<Vec<EvV>>> = by_eid
         .into_par_iter()
         .map(|parts| {
@@ -1161,6 +1215,10 @@ fn events(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: i64, 
             // tie the first copy stays (equal-ingest copies are promised identical)
             let mut dst: Vec<Vec<EvV>> = (0..NB).map(|_| Vec::with_capacity(n / NB + 8)).collect();
             let mut c = [0u64; 8];
+            let mut pb: PersonBatch<EvRec> = PersonBatch::new();
+            let mut emit = |r: EvRec, person: u64| {
+                dst[keys::part(person, LOG_NB)].push(EvV { person, ts: r.ts, cat: r.cat, price: r.price });
+            };
             let kept = dedup(&parts, |r: &EvRec| r.eid, |a, b| a.rank < b.rank, |r| {
                 if r.person == keys::EMPTY {
                     c[r.price as usize] += 1;
@@ -1169,8 +1227,10 @@ fn events(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: i64, 
                 if r.cat == unknown_cat {
                     c[6] += 1;
                 }
-                dst[keys::part(r.person, LOG_NB)].push(EvV { person: r.person, ts: r.ts, cat: r.cat, price: r.price });
+                pb.push(names, *r, r.person, &mut emit);
             });
+            pb.flush(names, &mut emit);
+            drop(emit);
             stats.add(K::EvDupCopies, (n - kept) as u64);
             for (k, i) in [(K::EvBadUser, 0), (K::EvBadTs, 1), (K::EvBadType, 2), (K::EvBadProduct, 3), (K::EvBadPrice, 4), (K::EvLate, 5), (K::EvUnknownProduct, 6)] {
                 stats.add(k, c[i]);
