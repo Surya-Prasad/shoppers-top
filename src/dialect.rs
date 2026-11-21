@@ -242,10 +242,12 @@ fn masks16(p: &[u8; 16]) -> (u32, u32, u32) {
     }
 }
 
-/// Night-04 scanner, kept as a test reference for the RW4 structural-index scanner.
-#[cfg(test)]
+/// One pass over a chunk: for every line (same lines as `for_each_line`), call `f` with
+/// the line's N fields under the dialect (`split::<N>`), or None if it is malformed.
+/// Lines up to 128 bytes take a mask-based fast path; longer ones fall back to `split`.
+/// (Night-04 scanner; RW9 restored it after RW4's structural index measured slower on x86.)
 #[inline]
-pub fn for_each_record_v1<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(Option<[&'a [u8]; N]>)) {
+pub fn for_each_record<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(Option<[&'a [u8]; N]>)) {
     let len = chunk.len();
     let mut start = 0usize;
     #[allow(unused_assignments)]
@@ -408,12 +410,12 @@ fn bits_in(m: &[u64], b: usize, lo: usize, hi: usize) -> u64 {
     x
 }
 
-/// One pass over a chunk: for every line (the same lines as `for_each_line`), call `f`
-/// with the line's N fields under the dialect (`split::<N>`), or None if it is malformed.
-/// RW4: newline/comma/quote masks are computed once per window with SIMD; lines are then
-/// cut by bit scans. A line containing any quote takes the exact `split` path.
+/// RW4 structural-index scanner: masks per 64 KiB window, bit-scan line cutting. Same
+/// results as `for_each_record` (tested), but measured ~9% slower end to end on x86, so it
+/// is kept only for `SS_EXP` comparisons.
+#[allow(dead_code)]
 #[inline]
-pub fn for_each_record<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(Option<[&'a [u8]; N]>)) {
+pub fn for_each_record_idx<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(Option<[&'a [u8]; N]>)) {
     let len = chunk.len();
     let mut nlm = [0u64; MB];
     let mut cmm = [0u64; MB];
@@ -485,6 +487,84 @@ pub fn for_each_record<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(Op
     }
 }
 
+
+// ====================================================================== RW9: SWAR line splitter
+
+const LO7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+
+/// Exact per-byte equality mask: the high bit of byte i is set iff byte i of `w` == `c`.
+/// (No false positives: ((t & 0x7f..) + 0x7f..) sets the high bit for every non-zero low
+/// 7 bits, and `| t` covers bytes whose own high bit is set.)
+#[inline(always)]
+fn eq_mask(w: u64, c: u8) -> u64 {
+    let t = w ^ (0x0101_0101_0101_0101u64 * c as u64);
+    !(((t & LO7).wrapping_add(LO7)) | t | LO7)
+}
+
+/// Split one line (without its '\n') into N fields: commas found 8 bytes at a time.
+/// A line containing any quote is re-split by the exact `split`.
+#[inline(always)]
+pub fn split_swar<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
+    let n = line.len();
+    if n == 0 {
+        return None;
+    }
+    let mut out: [&[u8]; N] = [&[]; N];
+    let (mut k, mut fs, mut i) = (0usize, 0usize, 0usize);
+    let mut quotes = 0u64;
+    while i + 8 <= n {
+        let w = u64::from_le_bytes(line[i..i + 8].try_into().unwrap());
+        quotes |= eq_mask(w, b'"');
+        let mut m = eq_mask(w, b',');
+        while m != 0 {
+            let p = i + (m.trailing_zeros() / 8) as usize;
+            if k == N - 1 {
+                return None; // too many fields (every comma separates, quoted or not)
+            }
+            out[k] = &line[fs..p];
+            k += 1;
+            fs = p + 1;
+            m &= m - 1;
+        }
+        i += 8;
+    }
+    while i < n {
+        let b = line[i];
+        if b == b',' {
+            if k == N - 1 {
+                return None;
+            }
+            out[k] = &line[fs..i];
+            k += 1;
+            fs = i + 1;
+        } else if b == b'"' {
+            quotes = 1;
+        }
+        i += 1;
+    }
+    if k != N - 1 {
+        return None;
+    }
+    if quotes != 0 {
+        return split::<N>(line);
+    }
+    out[N - 1] = &line[fs..];
+    Some(out)
+}
+
+/// RW9 scanner: lines by memchr, fields by `split_swar`. Same results as `split` per line.
+#[inline]
+pub fn for_each_record_swar<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(Option<[&'a [u8]; N]>)) {
+    let mut start = 0;
+    for nl in memchr::memchr_iter(b'\n', chunk) {
+        f(split_swar::<N>(&chunk[start..nl]));
+        start = nl + 1;
+    }
+    if start < chunk.len() {
+        f(split_swar::<N>(&chunk[start..]));
+    }
+}
+
 #[cfg(test)]
 mod fused_tests {
     use super::*;
@@ -502,7 +582,29 @@ mod fused_tests {
     fn fused<const N: usize>(chunk: &[u8]) -> Vec<Option<Vec<Vec<u8>>>> {
         let mut v = Vec::new();
         for_each_record::<N>(chunk, |r| v.push(r.map(|a| a.iter().map(|x| x.to_vec()).collect())));
+        let mut w = Vec::new();
+        for_each_record_idx::<N>(chunk, |r| w.push(r.map(|a| a.iter().map(|x| x.to_vec()).collect())));
+        assert_eq!(v, w, "night-04 and RW4 scanners disagree");
+        let mut z = Vec::new();
+        for_each_record_swar::<N>(chunk, |r| z.push(r.map(|a| a.iter().map(|x| x.to_vec()).collect())));
+        assert_eq!(v, z, "night-04 and RW9 SWAR scanners disagree");
         v
+    }
+
+    #[test]
+    fn eq_mask_exact() {
+        let mut x = 3u64;
+        for _ in 0..200_000 {
+            let w = lcg(&mut x) << 32 | lcg(&mut x);
+            let w = w ^ (lcg(&mut x) << 40); // mix in high bytes
+            for c in [b',', b'"', b'\n', 0u8, 0x80, 0xff] {
+                let m = eq_mask(w, c);
+                for i in 0..8 {
+                    assert_eq!((m >> (8 * i + 7)) & 1 == 1, (w >> (8 * i)) as u8 == c);
+                    assert_eq!((m >> (8 * i)) & 0x7f, 0);
+                }
+            }
+        }
     }
 
     /// The fused scanner equals for_each_line + split on random dialect-noise chunks,

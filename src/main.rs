@@ -31,7 +31,7 @@ use hashing::Seeded as RandomState;
 static GLOBAL: alloc::HugeAlloc = alloc::HugeAlloc;
 use rayon::prelude::*;
 
-use dialect::{Source, chunks, csv_files, data_region, for_each_line, for_each_record, header_order, split};
+use dialect::{Source, chunks, for_each_record_idx, for_each_record_swar, csv_files, data_region, for_each_line, for_each_record, header_order, split};
 use keys::{KeyMap, key_of};
 use packed::{PMap, pack9};
 use timefmt::{BAD, DAY};
@@ -306,6 +306,41 @@ fn experiment(src: &[&'static Source], products: &PMap<u32>, lo: i64, hi: i64, n
     }
     eprintln!("{:<28} {:>6.3}s  ({lines} lines, {:.2} GB)", "lines only (memchr)", t.elapsed().as_secs_f64(), bytes as f64 / 1e9);
     run("records (fused scanner)", &|f| f[0].len() as u64);
+    {
+        let t = Instant::now();
+        let mut acc = 0u64;
+        for (_, c) in &items {
+            for_each_record_idx::<7>(c, |rec| {
+                if let Some(r) = rec {
+                    acc = acc.wrapping_add(r[0].len() as u64);
+                }
+            });
+        }
+        let secs = t.elapsed().as_secs_f64();
+        eprintln!("{:<28} {secs:>6.3}s  {:>6.1} ns/line  (acc {acc})", "records (RW4 struct index)", secs * 1e9 / lines as f64);
+        let t = Instant::now();
+        let mut acc = 0u64;
+        for (_, c) in &items {
+            for_each_record::<7>(c, |rec| {
+                if let Some(r) = rec {
+                    acc = acc.wrapping_add(r[0].len() as u64);
+                }
+            });
+        }
+        let secs = t.elapsed().as_secs_f64();
+        eprintln!("{:<28} {secs:>6.3}s  {:>6.1} ns/line  (acc {acc})", "records (night-04, direct)", secs * 1e9 / lines as f64);
+        let t = Instant::now();
+        let mut acc = 0u64;
+        for (_, c) in &items {
+            for_each_record_swar::<7>(c, |rec| {
+                if let Some(r) = rec {
+                    acc = acc.wrapping_add(r[0].len() as u64);
+                }
+            });
+        }
+        let secs = t.elapsed().as_secs_f64();
+        eprintln!("{:<28} {secs:>6.3}s  {:>6.1} ns/line  (acc {acc})", "records (RW9 memchr+SWAR)", secs * 1e9 / lines as f64);
+    }
     run("+ key_of(eid)", &|f| key_of(f[0]));
     run("+ key_of(user)", &|f| key_of(f[0]) ^ key_of(f[1]));
     run("+ ts parse_in", &|f| key_of(f[0]) ^ key_of(f[1]) ^ timefmt::parse_in(f[2], lo, hi) as u64);
