@@ -254,3 +254,25 @@ work at open time, which is what we see. On a real disk the result may differ.
 | A3 | NB/CHUNK → 128 / 16 MiB | A | not merged | all gates | 2.466 / 2.447 vs A2 2.584 / 2.555 (paired) | 3.88 / 3.16 | 12.405 vs 12.144 (11 pairs, **+2.2%**, A3 faster 2/11) | 13.08 | 6.96 GB | **Revert** (60M regression) |
 | A4 | `MADV_WILLNEED` whole-file | A/B | not merged | all gates | 2.507 / 2.458 vs A2 2.476 / 2.439 (paired) | 3.400 / 3.273 vs 3.291 / 3.133 (4 cold pairs each) | 8.317 vs 8.417 (paired) | 11.508 vs 11.091 | 7.27 GB | **Revert** (cold slower) |
 | B1 | Contiguous partitioning + fused emit | B | | | | | | | | next (profile first) |
+| N01 | Dense campaign/day accumulators | B | `2ff8e5f` | CI gate PASS | CI 9.086 vs 9.279 (−2.1%, 5/7) | – | CI 30.937 vs 31.206 (−0.9%, 4/5) | – | 11.9 GB RSS | **Keep** |
+
+## Overnight loop (2026-11-21, CI x86 timing)
+
+All timings below are from `.github/workflows/bench.yml` (GitHub-hosted x86, 4 vCPU, interleaved warm pairs:
+7 at 20M seed 11, 5 at 60M seed 11), raw results on the `bench-results` branch (`results/<sha>.md`).
+Local checks before every push (4-vCPU cloud container): `cargo test --release`, fixtures 36/36, dev answer
+MATCH, `tests/fuzz.py` strict 500 + default 500 with 0 failures, and Parquet equality vs BEST at 20M seed 11.
+Keep rule: gate PASS, 20M median −2% or better with ≥ 5/7 pair wins, 60M median ≤ +0.5%.
+Note: GitHub keeps only **one pending run** per concurrency group, so a second queued push cancels the first
+pending one (night-02's first run was cancelled this way); at most one run is queued at a time from now on.
+
+### Night-01: dense campaign/day accumulators: **KEEP**
+
+`sessionize` writes campaign/day counters into a dense `[(ncamp + 1) × ndays]` array (campaign index, `organic`
+last; day offset from the first window day, from the manifest) owned by each rayon `fold` accumulator,
+instead of a hash map updated once per credit and once per assist. Arrays are summed and turned back into
+the sparse `(campaign, day)` rows (a row exists iff credited sessions or assists are non-zero, exactly as before).
+Session starts are in-window event timestamps, so the day offset is always in range (indexing is bounds-checked).
+
+CI (`2ff8e5f` vs `b85649a`, EPYC 7763): gate PASS; **20M 9.279 → 9.086 s (−2.1%, 5/7)**; 60M 31.206 → 30.937 s
+(−0.9%, 4/5); RSS 12.21 → 11.91 GB at 60M. Meets the rule (narrowly). BEST → `2ff8e5f`.
