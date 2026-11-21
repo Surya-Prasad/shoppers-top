@@ -1,0 +1,59 @@
+{
+ "base": "ae08ccc8b3a8a5cd0941acbbc034afe1ba76c350",
+ "cand": "c784060441cca95bb1e5ba0a06dbaad76004ee6e",
+ "gate": "pass",
+ "cpu": "Intel(R) Xeon(R) 6975P-C x 4",
+ "notes": "",
+ "sizes": {
+  "d20": {
+   "base": [
+    2.7662,
+    2.7731,
+    2.7853,
+    2.7994,
+    2.7465,
+    2.8593,
+    2.775
+   ],
+   "cand": [
+    2.8513,
+    2.833,
+    2.8301,
+    2.7828,
+    2.814,
+    2.8429,
+    2.8327
+   ],
+   "base_median": 2.775,
+   "cand_median": 2.8327,
+   "delta_pct": 2.08,
+   "cand_wins": 2,
+   "pairs": 7,
+   "base_rss_gb": 3.44,
+   "cand_rss_gb": 3.36
+  },
+  "d60": {
+   "base": [
+    8.7019,
+    8.9449,
+    8.9405,
+    8.7634,
+    8.755
+   ],
+   "cand": [
+    9.0251,
+    8.9781,
+    8.7995,
+    8.8551,
+    8.7723
+   ],
+   "base_median": 8.7634,
+   "cand_median": 8.8551,
+   "delta_pct": 1.05,
+   "cand_wins": 1,
+   "pairs": 5,
+   "base_rss_gb": 10.14,
+   "cand_rss_gb": 9.96
+  }
+ }
+}
