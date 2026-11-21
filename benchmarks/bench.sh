@@ -11,6 +11,7 @@
 #       one warm run, sampling cgroup memory.peak and peak `anon` (every 20 ms); kept
 #       separate so the sampling never affects timed runs.
 #
+# EXTRA_ARGS (env) is appended to `docker run`, e.g. EXTRA_ARGS="-e SWEEP_NB=256" for sweeps.
 # Output volumes are fresh for every run; the phase log of the last run is in /tmp/bench-LABEL.log.
 set -u
 MODE=$1 IMG=$2 VOL=$3 LABEL=$4 N=${5:-5}
@@ -33,7 +34,7 @@ if [ "$MODE" = time ] || [ "$MODE" = warm ]; then
     o="o-$LABEL"; fresh "$o"
     kind=warm; [ $i -eq 0 ] && { drop; kind=cold; }
     t0=$(now)
-    docker run --rm $FLAGS -v "$VOL":/data:ro -v "$o":/output -v scr:/scratch "$IMG" \
+    docker run --rm $FLAGS ${EXTRA_ARGS:-} -v "$VOL":/data:ro -v "$o":/output -v scr:/scratch "$IMG" \
       >/dev/null 2>"/tmp/bench-$LABEL.log"
     rc=$?; t1=$(now)
     echo "$LABEL $kind run$i exit=$rc wall=$(echo "$t1 - $t0" | bc)"
@@ -42,7 +43,7 @@ if [ "$MODE" = time ] || [ "$MODE" = warm ]; then
   docker volume rm -f "o-$LABEL" scr >/dev/null 2>&1
 elif [ "$MODE" = mem ]; then
   o="o-$LABEL"; fresh "$o"
-  docker run --rm $FLAGS -v "$VOL":/data:ro -v "$o":/output -v scr:/scratch --entrypoint sh "$IMG" -c '
+  docker run --rm $FLAGS ${EXTRA_ARGS:-} -v "$VOL":/data:ro -v "$o":/output -v scr:/scratch --entrypoint sh "$IMG" -c '
     /app/shopping-sessions >/dev/null 2>&1 & p=$!; amax=0
     while kill -0 $p 2>/dev/null; do
       a=$(sed -n "s/^anon //p" /sys/fs/cgroup/memory.stat); [ "$a" -gt "$amax" ] && amax=$a

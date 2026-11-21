@@ -1,0 +1,117 @@
+diff --git a/src/main.rs b/src/main.rs
+index b36c77b..77199a9 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -41,8 +41,20 @@ pub fn new_map<K, V>(cap: usize) -> Map<K, V> {
+     Map::with_capacity_and_hasher(cap, table_state())
+ }
+ 
+-const NB: usize = 512; // number of hash partitions (power of two)
+-const CHUNK: usize = 4 << 20; // scan granule, bytes
++// EXPERIMENT ONLY (A3 sweep): NB / CHUNK read from SWEEP_NB / SWEEP_CHUNK_MIB. Never merged.
++static NB_V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++static CHUNK_V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++#[inline]
++fn nb() -> usize {
++    *NB_V.get_or_init(|| {
++        let v: usize = std::env::var("SWEEP_NB").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
++        assert!(v.is_power_of_two());
++        v
++    })
++}
++fn chunk() -> usize {
++    *CHUNK_V.get_or_init(|| std::env::var("SWEEP_CHUNK_MIB").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize) << 20)
++}
+ const WEEK: i64 = 7 * DAY;
+ const GAP: i64 = 30 * 60 * 1000;
+ pub const ORGANIC: u32 = u32::MAX;
+@@ -50,7 +62,7 @@ pub const NO_CAT: u32 = u32::MAX;
+ 
+ #[inline]
+ fn part_of(state: &RandomState, key: &[u8]) -> usize {
+-    (state.hash_one(key) >> 20) as usize & (NB - 1)
++    (state.hash_one(key) >> 20) as usize & (nb() - 1)
+ }
+ 
+ type S = &'static [u8];
+@@ -128,7 +140,7 @@ fn work_items<const N: usize>(sources: &[&'static Source], names: [&str; N]) ->
+     for s in sources {
+         let bytes: S = s.bytes();
+         let order = header_order::<N>(bytes, names);
+-        for c in chunks(data_region(bytes), CHUNK) {
++        for c in chunks(data_region(bytes), chunk()) {
+             out.push((order, c));
+         }
+     }
+@@ -164,7 +176,7 @@ fn main() {
+         timefmt::parse(s.as_bytes()).unwrap_or_else(|| panic!("manifest: {k}={s:?} is not a valid timestamp"))
+     };
+     let (ws, we) = (wget("window_start"), wget("window_end"));
+-    eprintln!("window [{ws}, {we}) ms, threads {ncpu}");
++    eprintln!("window [{ws}, {we}) ms, threads {ncpu}, NB {} CHUNK {} MiB", nb(), chunk() >> 20);
+ 
+     // ---------------------------------------------------------------- reference tables
+     let mut files: Vec<PathBuf> = vec![data.join("products.csv"), data.join("campaigns.csv")];
+@@ -202,7 +214,7 @@ fn main() {
+ 
+     // ---------------------------------------------------------------- sessions
+     let ncamp = camp_ids.len();
+-    let timed: Vec<((Vec<output::UserRow>, Map<(u32, i32), [u64; 4]>), (f64, usize, usize))> = (0..NB)
++    let timed: Vec<((Vec<output::UserRow>, Map<(u32, i32), [u64; 4]>), (f64, usize, usize))> = (0..nb())
+         .into_par_iter()
+         .map(|b| {
+             let t = Instant::now();
+@@ -222,7 +234,7 @@ fn main() {
+     lap("sessions");
+ 
+     let mut camp_agg: Map<(u32, i32), [u64; 4]> = new_map(1 << 14);
+-    let mut user_parts = Vec::with_capacity(NB);
++    let mut user_parts = Vec::with_capacity(nb());
+     for (u, c) in results {
+         user_parts.push(u);
+         for (k, v) in c {
+@@ -420,7 +432,7 @@ type ByPerson<T> = Vec<Vec<Vec<T>>>;
+ 
+ fn transpose<T>(v: Vec<Vec<Vec<T>>>) -> ByPerson<T> {
+     // v[src][dst] -> out[dst][src]
+-    let mut out: ByPerson<T> = (0..NB).map(|_| Vec::with_capacity(v.len())).collect();
++    let mut out: ByPerson<T> = (0..nb()).map(|_| Vec::with_capacity(v.len())).collect();
+     for row in v {
+         for (dst, part) in row.into_iter().enumerate() {
+             out[dst].push(part);
+@@ -444,7 +456,7 @@ fn clicks(
+     let scattered: Vec<Vec<Vec<ClickRaw>>> = items
+         .par_iter()
+         .map(|(order, chunk)| {
+-            let mut parts: Vec<Vec<ClickRaw>> = (0..NB).map(|_| Vec::new()).collect();
++            let mut parts: Vec<Vec<ClickRaw>> = (0..nb()).map(|_| Vec::new()).collect();
+             let (mut lines, mut bad, mut noid) = (0u64, 0u64, 0u64);
+             for_each_line(chunk, |line| {
+                 lines += 1;
+@@ -487,7 +499,7 @@ fn clicks(
+                 }
+             }
+             stats.add(K::ClDupCopies, (n - best.len()) as u64);
+-            let mut dst: Vec<Vec<ClickV>> = (0..NB).map(|_| Vec::new()).collect();
++            let mut dst: Vec<Vec<ClickV>> = (0..nb()).map(|_| Vec::new()).collect();
+             let (mut bu, mut bt, mut bc) = (0u64, 0u64, 0u64);
+             for r in best.values() {
+                 if r.user.is_empty() {
+@@ -588,7 +600,7 @@ fn events(
+     let scattered: Vec<Vec<Vec<EvRaw>>> = items
+         .par_iter()
+         .map(|(order, chunk)| {
+-            let mut parts: Vec<Vec<EvRaw>> = (0..NB).map(|_| Vec::with_capacity(chunk.len() / 80 / NB + 8)).collect();
++            let mut parts: Vec<Vec<EvRaw>> = (0..nb()).map(|_| Vec::with_capacity(chunk.len() / 80 / nb() + 8)).collect();
+             let (mut lines, mut bad, mut noid) = (0u64, 0u64, 0u64);
+             for_each_line(chunk, |line| {
+                 lines += 1;
+@@ -659,7 +671,7 @@ fn events(
+                 }
+             }
+             stats.add(K::EvDupCopies, (n - best.len()) as u64);
+-            let mut dst: Vec<Vec<EvV>> = (0..NB).map(|_| Vec::with_capacity(n / NB + 8)).collect();
++            let mut dst: Vec<Vec<EvV>> = (0..nb()).map(|_| Vec::with_capacity(n / nb() + 8)).collect();
+             let mut c = [0u64; 8];
+             for r in best.values() {
+                 // validation of the kept copy, in the order of rules.md

@@ -149,6 +149,68 @@ Memory (anon peak): 20M **2.70 → 2.49 GB** (−8%); 60M **8.21 → 7.26 GB** (
 neutral everywhere (60M is within noise). Host load average was about 7 during the runs; the A/B
 interleaving controls for it. `a2` is the new A/B reference.
 
+## A3: `NB` / `CHUNK` sweep (Tier A): **REVERT**, keep 512 / 4 MiB
+
+**Method.** A throwaway build read `NB`/`CHUNK` from env vars (patch kept as
+[experiments/a3-sweep-knobs.patch](experiments/a3-sweep-knobs.patch); never merged). Each configuration was
+checked against the dev answer first. The harness gained `EXTRA_ARGS` to pass env vars into the container.
+
+**Stage 1: 12 configurations at 20M** (NB ∈ {128, 256, 512, 1024} × CHUNK ∈ {1, 4, 16} MiB), 3 warm
+rounds × 2 seeds, interleaved per round. Sum of the two seeds' medians, relative to 512/4:
+
+| NB | CHUNK | 20M s9 median | 20M s11 median | vs 512/4 |
+|---:|---:|---:|---:|---:|
+| 256 | 16 MiB | 2.747 | 2.602 | −10.5% |
+| 128 | 16 MiB | 2.862 | 2.612 | −8.4% |
+| 128 | 4 MiB | 2.918 | 2.669 | −6.5% |
+| 256 | 4 MiB | 2.943 | 2.748 | −4.7% |
+| 512 | 16 MiB | 2.976 | 2.918 | −1.3% |
+| **512** | **4 MiB** | 3.101 | 2.873 | 0 (current) |
+| 128 | 1 MiB | 2.760 | 3.249 | +0.6% |
+| 256 | 1 MiB | 3.265 | 2.822 | +1.9% |
+| 512 | 1 MiB | 3.099 | 3.025 | +2.5% |
+| 1024 | 16 MiB | 3.205 | 3.176 | +6.8% |
+| 1024 | 4 MiB | 3.460 | 3.336 | +13.8% |
+| 1024 | 1 MiB | 4.285 | 3.917 | +37.3% |
+
+Robust signals: NB=1024 and 1 MiB chunks are always worse. Host load average swung 1.3–6.4 during
+the sweep, so single-cell differences under about 5% aren't reliable.
+
+**Stage 2: top 3 + current at 60M** (env build; one cold run each + 4 interleaved warm rounds):
+128/16 −6.6% (anon 6.95 GB), 128/4 −5.5%, 256/16 −3.9%, against 512/4 (7.26 GB).
+
+**Stage 3: confirmation with constants** (`NB=128`, `CHUNK=16 MiB` as plain `const`, on a clean
+branch from A2). Full correctness gate **passed** (unit 5/5, fixtures 36/36, dev MATCH, invariants 15/15,
+fuzz 2,000 cases with 0 failures, oracle seeds 4 and 15, Parquet equality vs A2 at 20M ×2 and 60M, 1 vs 8
+threads at 20M and 60M, error path 101). Performance vs A2, interleaved:
+
+| Data | A2 cold | A3 cold | A2 warm median | A3 warm median | Δ | A3 faster |
+|---|---:|---:|---:|---:|---:|---:|
+| 20M s9 | 10.30 s* | 3.88 s | 2.584 | **2.466** | −4.6% | 5/5 |
+| 20M s11 | 3.24 s | 3.16 s | 2.555 | **2.447** | −4.2% | 4/5 |
+| 60M s11 (11 pairs) | 13.18 s | 13.08 s | **12.144** | 12.405 | **+2.2%** | **2/11** (mean paired +0.37 s) |
+
+\* A host stall; not used.
+
+Memory (anon): 20M 2.49 → 2.69 GB (+8%); 60M 7.26 → 6.96 GB (−4%).
+
+**Decision: revert.** At 60M (the final-score metric) the constant build was slower in 9 of 11 pairs,
+and the plan says a clear 60M regression blocks a change even when 20M improves. Code stays at
+**A2: NB=512, CHUNK=4 MiB**.
+
+**What we learned (hypotheses, not yet tested):**
+1. *The best partition count depends on data size.* With 128 partitions, each per-partition dedup table at
+   60M holds about 490k copies × 64 B ≈ 31 MB, far beyond per-core cache; at 512 it's about 8 MB. At 20M,
+   128 partitions mean about 10 MB per table, which is why fewer partitions win there. This suggests an
+   **adaptive NB chosen from total input bytes** (Tier B: workload-dependent; it needs both sizes, and
+   it isn't an A-tier constant).
+2. The stage-2 60M ranking (env-knob build) didn't reproduce with constants: runtime `NB` changes code
+   generation (no constant mask or loop bounds), and the host was drifting (A2 warm went 9.8 → 15.0 s over
+   the session). Sweeps on this host only rank configurations roughly; decisions need constant builds and
+   interleaved pairs.
+3. Bigger chunks (16 MiB) were never worse at fixed NB in stage 1, but their effect alone (512/16:
+   −1.3%) is within noise. Not worth a change on its own.
+
 ## Register
 
 | ID | Change | Tier | Commit | Correctness | 20M warm (s9 / s11) | 20M cold | 60M warm | 60M cold | anon peak 60M | Decision |
@@ -157,4 +219,5 @@ interleaving controls for it. `a2` is the new A/B reference.
 | P0i | + stage timers | — | `5d40e99` | all gates | 2.796 / 2.751 | 3.60 / 3.67 | 11.468 | 14.95 | 8.2 GB | Reference |
 | A1 | Single-probe dedup | A | see git log | all gates | 2.795 / 2.730 | 3.87 / 3.67 | 13.092 vs 13.317 (paired) | 17.93 | 8.2 GB | **Keep** |
 | A2 | Drop `line_fields` (EvRaw 80→64 B) | A | see git log | all gates + equal-ingest proof | 2.713 / 2.740 vs A1 2.760 / 2.885 (paired) | 3.52 / 3.43 | 12.601 vs 12.715 (paired) | 14.98 | **7.3 GB** (−12%) | **Keep** |
-| A3 | NB/CHUNK sweep | A | | | | | | | | next |
+| A3 | NB/CHUNK → 128 / 16 MiB | A | not merged | all gates | 2.466 / 2.447 vs A2 2.584 / 2.555 (paired) | 3.88 / 3.16 | 12.405 vs 12.144 (11 pairs, **+2.2%**, A3 faster 2/11) | 13.08 | 6.96 GB | **Revert** (60M regression) |
+| A4 | WILLNEED prefetch | A/B | | | | | | | | next |
