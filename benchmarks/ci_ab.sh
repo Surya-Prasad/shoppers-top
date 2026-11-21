@@ -84,7 +84,12 @@ if [ "$GATE" = pass ]; then
     done
   done
 fi
-grep -h '^\[' "$W/o-t.log" 2>/dev/null | tail -12 > "$W/phases.txt" || true
+grep -hE '^\[|^    ' "$W/o-t.log" 2>/dev/null | tail -30 > "$W/phases.txt" || true
+# x86 per-layer scan cost of the candidate (single thread, 20M), if it supports SS_EXP
+if [ "$GATE" = pass ]; then
+  { echo; echo "x86 single-thread scan layers (candidate, SS_EXP=1, d20):"
+    SS_EXP=1 DATA_DIR="$W/d20" OUTPUT_DIR="$W/o-exp" NCPU=1 timeout 300 "$BB" 2>&1 | grep -E 'ns/line|lines only' || true; } >> "$W/phases.txt"
+fi
 "$PY" benchmarks/ab_summary.py "$W/times.tsv" "$BASE" "$CAND" "$GATE" "$W/phases.txt" \
   "$(lscpu | sed -n 's/^Model name: *//p') x $NPROC" "${NOTES[*]:-}" "$T/result.md" "$T/result.json"
 cat "$T/result.md"

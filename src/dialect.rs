@@ -242,11 +242,10 @@ fn masks16(p: &[u8; 16]) -> (u32, u32, u32) {
     }
 }
 
-/// One pass over a chunk: for every line (same lines as `for_each_line`), call `f` with
-/// the line's N fields under the dialect (`split::<N>`), or None if it is malformed.
-/// Lines up to 128 bytes take a mask-based fast path; longer ones fall back to `split`.
+/// Night-04 scanner, kept as a test reference for the RW4 structural-index scanner.
+#[cfg(test)]
 #[inline]
-pub fn for_each_record<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(Option<[&'a [u8]; N]>)) {
+pub fn for_each_record_v1<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(Option<[&'a [u8]; N]>)) {
     let len = chunk.len();
     let mut start = 0usize;
     #[allow(unused_assignments)]
@@ -318,6 +317,174 @@ pub fn for_each_record<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(Op
     }
 }
 
+
+// ====================================================================== RW4: structural index
+
+/// Lines starting in a window of `WIN` bytes are parsed from masks computed once for the
+/// window plus `OV` bytes of slack (a line longer than the slack takes the exact slow path).
+const WIN: usize = 64 * 1024;
+const OV: usize = 4096;
+const MB: usize = (WIN + OV) / 64;
+
+/// Bitmasks of `\n`, `,` and `"` for 64 bytes (bit i = byte i).
+#[inline(always)]
+fn masks64(p: &[u8; 64]) -> (u64, u64, u64) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        // SSE2 is in the x86_64 baseline: no runtime detection needed.
+        let (n, c, q) = (_mm_set1_epi8(b'\n' as i8), _mm_set1_epi8(b',' as i8), _mm_set1_epi8(b'"' as i8));
+        let (mut nl, mut cm, mut qm) = (0u64, 0u64, 0u64);
+        for k in 0..4 {
+            let v = _mm_loadu_si128(p.as_ptr().add(16 * k) as *const __m128i);
+            nl |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, n)) as u16 as u64) << (16 * k);
+            cm |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, c)) as u16 as u64) << (16 * k);
+            qm |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, q)) as u16 as u64) << (16 * k);
+        }
+        (nl, cm, qm)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        const W: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let w = vld1q_u8(W.as_ptr());
+        let v = [vld1q_u8(p.as_ptr()), vld1q_u8(p.as_ptr().add(16)), vld1q_u8(p.as_ptr().add(32)), vld1q_u8(p.as_ptr().add(48))];
+        // 64 compare lanes -> 64-bit mask (pairwise-add reduction of bit-weighted lanes)
+        let mm = |ch: u8| -> u64 {
+            let d = vdupq_n_u8(ch);
+            let t0 = vandq_u8(vceqq_u8(v[0], d), w);
+            let t1 = vandq_u8(vceqq_u8(v[1], d), w);
+            let t2 = vandq_u8(vceqq_u8(v[2], d), w);
+            let t3 = vandq_u8(vceqq_u8(v[3], d), w);
+            let s0 = vpaddq_u8(t0, t1);
+            let s1 = vpaddq_u8(t2, t3);
+            let s0 = vpaddq_u8(s0, s1);
+            let s0 = vpaddq_u8(s0, s0);
+            vgetq_lane_u64(vreinterpretq_u64_u8(s0), 0)
+        };
+        (mm(b'\n'), mm(b','), mm(b'"'))
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let (mut nl, mut c, mut q) = (0u64, 0u64, 0u64);
+        for (i, &b) in p.iter().enumerate() {
+            nl |= ((b == b'\n') as u64) << i;
+            c |= ((b == b',') as u64) << i;
+            q |= ((b == b'"') as u64) << i;
+        }
+        (nl, c, q)
+    }
+}
+
+/// First set bit in `[from, to)` of a mask array, if any.
+#[inline(always)]
+fn next_bit(m: &[u64], from: usize, to: usize) -> Option<usize> {
+    let mut b = from / 64;
+    let mut x = m[b] & (!0u64 << (from % 64));
+    loop {
+        if x != 0 {
+            let p = b * 64 + x.trailing_zeros() as usize;
+            return if p < to { Some(p) } else { None };
+        }
+        b += 1;
+        if b * 64 >= to {
+            return None;
+        }
+        x = m[b];
+    }
+}
+
+/// Bits of block `b` restricted to `[lo, hi)`.
+#[inline(always)]
+fn bits_in(m: &[u64], b: usize, lo: usize, hi: usize) -> u64 {
+    let mut x = m[b];
+    if b == lo / 64 {
+        x &= !0u64 << (lo % 64);
+    }
+    let end = hi - b * 64;
+    if end < 64 {
+        x &= (1u64 << end) - 1;
+    }
+    x
+}
+
+/// One pass over a chunk: for every line (the same lines as `for_each_line`), call `f`
+/// with the line's N fields under the dialect (`split::<N>`), or None if it is malformed.
+/// RW4: newline/comma/quote masks are computed once per window with SIMD; lines are then
+/// cut by bit scans. A line containing any quote takes the exact `split` path.
+#[inline]
+pub fn for_each_record<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(Option<[&'a [u8]; N]>)) {
+    let len = chunk.len();
+    let mut nlm = [0u64; MB];
+    let mut cmm = [0u64; MB];
+    let mut qmm = [0u64; MB];
+    let mut s = 0usize; // next line start
+    while s < len {
+        let w = s;
+        let wend = (w + WIN + OV).min(len);
+        let nblk = (wend - w).div_ceil(64);
+        for b in 0..nblk {
+            let p = w + 64 * b;
+            let (a, c, q) = if p + 64 <= len {
+                masks64(chunk[p..p + 64].try_into().unwrap())
+            } else {
+                let mut pad = [0u8; 64];
+                pad[..len - p].copy_from_slice(&chunk[p..len]);
+                masks64(&pad)
+            };
+            nlm[b] = a;
+            cmm[b] = c;
+            qmm[b] = q;
+        }
+        let limit = (w + WIN).min(len);
+        while s < limit {
+            let rs = s - w;
+            let re = match next_bit(&nlm, rs, wend - w) {
+                Some(re) => re,
+                None if wend == len => len - w, // final line without '\n'
+                None => {
+                    // longer than the window slack: exact slow path, then a fresh window
+                    let e = memchr::memchr(b'\n', &chunk[s..]).map_or(len, |i| s + i);
+                    f(if e == s { None } else { split::<N>(&chunk[s..e]) });
+                    s = e + 1;
+                    break;
+                }
+            };
+            let e = w + re;
+            if re == rs {
+                f(None); // empty line
+            } else if (rs / 64..=(re - 1) / 64).any(|b| bits_in(&qmm, b, rs, re) != 0) {
+                f(split::<N>(&chunk[s..e]));
+            } else {
+                let mut out: [&'a [u8]; N] = [&[]; N];
+                let (mut k, mut fs) = (0usize, s);
+                let mut ok = true;
+                'blocks: for b in rs / 64..=(re - 1) / 64 {
+                    let mut x = bits_in(&cmm, b, rs, re);
+                    while x != 0 {
+                        let p = w + b * 64 + x.trailing_zeros() as usize;
+                        if k == N - 1 {
+                            ok = false; // too many fields
+                            break 'blocks;
+                        }
+                        out[k] = &chunk[fs..p];
+                        k += 1;
+                        fs = p + 1;
+                        x &= x - 1;
+                    }
+                }
+                if ok && k == N - 1 {
+                    out[N - 1] = &chunk[fs..e];
+                    f(Some(out));
+                } else {
+                    f(None);
+                }
+            }
+            s = e + 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod fused_tests {
     use super::*;
@@ -366,6 +533,23 @@ mod fused_tests {
             assert_eq!(fused::<2>(&c), reference::<2>(&c), "{:?}", String::from_utf8_lossy(&c));
             assert_eq!(fused::<4>(&c), reference::<4>(&c), "{:?}", String::from_utf8_lossy(&c));
             assert_eq!(fused::<7>(&c), reference::<7>(&c), "{:?}", String::from_utf8_lossy(&c));
+        }
+        // RW4: window edges (64 KiB) and lines longer than the 4 KiB slack
+        let mut big: Vec<u8> = Vec::new();
+        let mut y = 99u64;
+        while big.len() < 300_000 {
+            match lcg(&mut y) % 50 {
+                0 => { big.extend(std::iter::repeat_n(b'a', (lcg(&mut y) % 9000) as usize)); big.push(b','); big.push(b'b'); big.push(b'\n'); }
+                1 => big.extend_from_slice(b"\"q\",x\n"),
+                2 => big.push(b'\n'),
+                _ => { for i in 0..(1 + lcg(&mut y) % 7) { if i > 0 { big.push(b','); } for _ in 0..(lcg(&mut y) % 12) { big.push(b'a' + (lcg(&mut y) % 26) as u8); } } big.push(b'\n'); }
+            }
+        }
+        for cut in [big.len(), big.len() - 1, 65_535, 65_536, 65_537, 69_631, 69_632, 69_633, 131_072, 140_000] {
+            let c = &big[..cut.min(big.len())];
+            assert_eq!(fused::<2>(c), reference::<2>(c), "cut={cut}");
+            assert_eq!(fused::<4>(c), reference::<4>(c), "cut={cut}");
+            assert_eq!(fused::<7>(c), reference::<7>(c), "cut={cut}");
         }
         // exact block edges
         for n in [15usize, 16, 17, 31, 32, 33, 126, 127, 128, 129, 130, 200] {
