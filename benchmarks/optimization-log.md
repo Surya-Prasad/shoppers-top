@@ -511,3 +511,26 @@ with Rust 1.95 (the Dockerfile's toolchain), and the Linux x86-64 target type-ch
 **x86 perf profile (RW19 tip, 20M, EPYC 9V45 × 4):** events scan ~31%, sessions ~13%, events dedup 11%,
 clicks ~9%, `timefmt::parse` 8% (outlined), page faults ~4%, `fmix` 4.2%, `pack9` 3.4% (outlined, hence RW20).
 The VM hides hardware counters, so this is sample-based only.
+
+### Rewrite track, part 2 (after the 2.20 s practice score of `25a7278`, Sat 13:15 EST)
+
+| Step | Change | 20M Δ (wins) | 60M Δ (wins) | Decision |
+|---|---|---:|---:|---|
+| RW20 | SWAR pack9 | −3.2% (7/7) | −4.0% (5/5) | keep |
+| RW21 | experiment: RW10 scanner instead of RW16 | −1.1% (6/7) | +2.2% (3/5) | tie, keep RW16 |
+| RW22 | force-inline timestamp parsers | −0.5% (4/7) | +0.8% (1/5) | drop |
+| RW23 | plain (no dictionary) Parquet | local: no gain, 4× bigger files | – | drop |
+| RW24 | skip field reorder for identity headers | −1.4% (3/7) | +0.3% (2/5) | keep (neutral) |
+| RW25 | build for x86-64-v3 (also in the Docker image) | −1.1% (6/7) | −3.6% (5/5) | keep |
+| RW26 | singleton-bitmap prefilter before exact dedup (idea from Vishi99/builders2026) | −2.3% (7/7) | −5.0% (3/5) | keep |
+| RW27 | sessions walk per bucket, hash once, u128 sort key | 0.0% (3/7) | +0.1% (2/5) | keep (neutral, simpler) |
+| RW28 | AVX2 separator masks | −0.4% (5/7) | +0.2% (3/5) | drop |
+| **RW29** | **RW24–RW27 + RW25 combined, vs `25a7278` (2.20 s)** | **−9.1% (7/7)** | **−8.7% (5/5)** | measured on EPYC 7763 |
+| RW30 | free big vectors on a background thread during output | pending | pending | local: output 0.095 → 0.047 s |
+| RW31 | links resolved concurrently with the scans | pending | pending | local −2% |
+| RW32 | fixed-size product batch (no Vec push per row) | pending | pending | local neutral |
+
+Rejected locally: date cache (rows are shuffled, never hits), 16/32-event session buckets (no change).
+
+**Docker submission check** (new `docker` workflow: native x86 `docker build` + starter scorer flags):
+RW30 tip `3342d0d` image builds (100 s, 30 MB, uid 1000), fixtures 36/36 in container, dev set MATCH.
