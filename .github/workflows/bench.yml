@@ -18,7 +18,7 @@ on:
 permissions:
   contents: write
 concurrency:
-  group: bench
+  group: bench-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   ab:
