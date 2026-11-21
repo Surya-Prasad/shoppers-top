@@ -1,0 +1,11 @@
+target/
+.venv/
+dev/
+dev-answer/
+out/
+out-ref/
+fuzz-failures/
+err.log
+__pycache__/
+tools/generate
+.tmp/
