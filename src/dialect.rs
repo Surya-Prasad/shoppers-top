@@ -331,7 +331,17 @@ const MB: usize = (WIN + OV) / 64;
 /// Bitmasks of `\n`, `,` and `"` for 64 bytes (bit i = byte i).
 #[inline(always)]
 fn masks64(p: &[u8; 64]) -> (u64, u64, u64) {
-    #[cfg(target_arch = "x86_64")]
+    // RW28: AVX2 when the build targets it (x86-64-v3, see .cargo/config.toml)
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let (n, c, q) = (_mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'"' as i8));
+        let lo = _mm256_loadu_si256(p.as_ptr() as *const __m256i);
+        let hi = _mm256_loadu_si256(p.as_ptr().add(32) as *const __m256i);
+        let m = |v: __m256i, d: __m256i| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, d)) as u32 as u64;
+        return (m(lo, n) | m(hi, n) << 32, m(lo, c) | m(hi, c) << 32, m(lo, q) | m(hi, q) << 32);
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
     unsafe {
         use std::arch::x86_64::*;
         // SSE2 is in the x86_64 baseline: no runtime detection needed.
