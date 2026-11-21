@@ -31,7 +31,7 @@ use hashing::Seeded as RandomState;
 static GLOBAL: alloc::HugeAlloc = alloc::HugeAlloc;
 use rayon::prelude::*;
 
-use dialect::{Source, chunks, for_each_record_idx, for_each_record_swar, csv_files, data_region, for_each_line, for_each_record, header_order, split};
+use dialect::{Source, chunks, for_each_record_idx, for_each_record_ix, for_each_record_swar, csv_files, data_region, for_each_line, for_each_record, header_order, split};
 use keys::{KeyMap, key_of};
 use packed::{PMap, pack9};
 use timefmt::{BAD, DAY};
@@ -286,6 +286,32 @@ fn experiment(src: &[&'static Source], products: &PMap<u32>, lo: i64, hi: i64, n
     for (_, c) in &items {
         for_each_line(c, |_| lines += 1);
     }
+    if let Ok(which) = std::env::var("SS_ONLY") {
+        // one scanner, 5 passes, nothing else (for instruction/cycle counts)
+        let t = Instant::now();
+        let mut acc = 0u64;
+        for _ in 0..5 {
+            for (_, c) in &items {
+                let mut g = |rec: Option<[S; 7]>| {
+                    if let Some(r) = rec {
+                        acc = acc.wrapping_add(r[0].len() as u64 + r[6].len() as u64);
+                    }
+                };
+                match which.as_str() {
+                    "v1" => for_each_record::<7>(c, &mut g),
+                    "swar" => for_each_record_swar::<7>(c, &mut g),
+                    "ix" => for_each_record_ix::<7>(c, &mut g),
+                    "lines" => for_each_line(c, |l| acc = acc.wrapping_add(l.len() as u64)),
+                    "ix1" => acc = acc.wrapping_add(dialect::ix_stage1(c) as u64),
+                    "masks" => acc = acc.wrapping_add(dialect::masks_only(c)),
+                    _ => for_each_record_idx::<7>(c, &mut g),
+                }
+            }
+        }
+        let secs = t.elapsed().as_secs_f64();
+        eprintln!("SS_ONLY={which}: {:.1} ns/line ({acc})", secs * 1e9 / (5.0 * lines as f64));
+        return;
+    }
     let run = |name: &str, f: &dyn Fn(&[S; 7]) -> u64| {
         let t = Instant::now();
         let mut acc = 0u64;
@@ -340,6 +366,17 @@ fn experiment(src: &[&'static Source], products: &PMap<u32>, lo: i64, hi: i64, n
         }
         let secs = t.elapsed().as_secs_f64();
         eprintln!("{:<28} {secs:>6.3}s  {:>6.1} ns/line  (acc {acc})", "records (RW9 memchr+SWAR)", secs * 1e9 / lines as f64);
+        let t = Instant::now();
+        let mut acc = 0u64;
+        for (_, c) in &items {
+            for_each_record_ix::<7>(c, |rec| {
+                if let Some(r) = rec {
+                    acc = acc.wrapping_add(r[0].len() as u64);
+                }
+            });
+        }
+        let secs = t.elapsed().as_secs_f64();
+        eprintln!("{:<28} {secs:>6.3}s  {:>6.1} ns/line  (acc {acc})", "records (RW10 two-stage)", secs * 1e9 / lines as f64);
     }
     run("+ key_of(eid)", &|f| key_of(f[0]));
     run("+ key_of(user)", &|f| key_of(f[0]) ^ key_of(f[1]));
@@ -502,7 +539,7 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
             let mut v = Vec::new();
             let (mut lines, mut bad, mut empty) = (0u64, 0u64, 0u64);
             // night-04: fused one-pass line + field scanner (same dialect as split)
-            for_each_record::<2>(chunk, |rec| {
+            for_each_record_ix::<2>(chunk, |rec| {
                 lines += 1;
                 match rec {
                     None => bad += 1,
@@ -769,7 +806,7 @@ fn clicks(src: &[&'static Source], campaigns: &PMap<u32>, lo: i64, hi: i64, name
                 r.person = person;
                 parts[keys::part(r.cid, LOG_NB)].push(r);
             };
-            for_each_record::<4>(chunk, |rec| {
+            for_each_record_ix::<4>(chunk, |rec| {
                 lines += 1;
                 let Some(f) = rec else {
                     bad += 1;
@@ -917,7 +954,7 @@ fn events(src: &[&'static Source], products: &PMap<u32>, unknown_cat: u32, lo: i
                 r.person = person;
                 parts[keys::part(r.eid, LOG_NB)].push(r);
             };
-            for_each_record::<7>(chunk, |rec| {
+            for_each_record_ix::<7>(chunk, |rec| {
                 lines += 1;
                 let Some(f) = rec else {
                     bad += 1;

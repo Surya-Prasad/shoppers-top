@@ -565,6 +565,193 @@ pub fn for_each_record_swar<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnM
     }
 }
 
+
+// ====================================================================== RW10: two-stage index scanner
+
+/// Profiling only: stage 1 of RW10 alone (masks + position list), returns positions found.
+#[allow(dead_code)]
+pub fn ix_stage1(chunk: &[u8]) -> usize {
+    let len = chunk.len();
+    let mut buf: Vec<u32> = vec![0u32; WIN + OV + 64 + 16];
+    let (mut total, mut w) = (0usize, 0usize);
+    while w < len {
+        let wend = (w + WIN).min(len);
+        let mut n = 0usize;
+        let nblk = (wend - w).div_ceil(64);
+        for b in 0..nblk {
+            let p = w + 64 * b;
+            let (a, c, q) = if p + 64 <= len {
+                masks64(chunk[p..p + 64].try_into().unwrap())
+            } else {
+                let mut pad = [0u8; 64];
+                pad[..len - p].copy_from_slice(&chunk[p..len]);
+                masks64(&pad)
+            };
+            push_bits(&mut buf, &mut n, (64 * b) as u32, a | c | q);
+        }
+        total += n;
+        w = wend;
+    }
+    total
+}
+
+/// Profiling only: masks alone.
+#[allow(dead_code)]
+pub fn masks_only(chunk: &[u8]) -> u64 {
+    let mut acc = 0u64;
+    let mut p = 0;
+    while p + 64 <= chunk.len() {
+        let (a, c, q) = masks64(chunk[p..p + 64].try_into().unwrap());
+        acc = acc.wrapping_add(a ^ c ^ q);
+        p += 64;
+    }
+    acc
+}
+
+/// Append the positions (base + bit index) of the set bits of `m` to `buf` at `*n`. The
+/// first 8 are written unconditionally (branch-free; extra writes land past `*n` and are
+/// overwritten later), so a block with up to 8 separators costs no data-dependent branch.
+#[inline(always)]
+fn push_bits(buf: &mut [u32], n: &mut usize, base: u32, mut m: u64) {
+    let cnt = m.count_ones() as usize;
+    let at = *n;
+    let dst = &mut buf[at..at + 8];
+    for d in dst.iter_mut() {
+        *d = base + m.trailing_zeros();
+        m &= m.wrapping_sub(1);
+    }
+    if cnt > 8 {
+        for j in 8..cnt {
+            buf[at + j] = base + m.trailing_zeros();
+            m &= m.wrapping_sub(1);
+        }
+    }
+    *n = at + cnt;
+}
+
+/// RW10 scanner: stage 1 lists every `,` `\n` `"` position of a window (SIMD masks,
+/// branch-free bit extraction); stage 2 takes the next N positions per line and, when they
+/// are N-1 commas then a newline, slices the fields directly. Any other pattern (quotes,
+/// wrong field count, empty line) re-splits the line with the exact `split`.
+#[inline]
+pub fn for_each_record_ix<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(Option<[&'a [u8]; N]>)) {
+    let len = chunk.len();
+    let mut buf: Vec<u32> = vec![0u32; WIN + OV + 64 + 16];
+    let byte = |p: usize| -> u8 { if p < len { chunk[p] } else { b'\n' } };
+    let mut s = 0usize;
+    while s < len {
+        let w = s;
+        let wend = (w + WIN + OV).min(len);
+        // ---- stage 1: separator positions, relative to w
+        let mut n = 0usize;
+        let nblk = (wend - w).div_ceil(64);
+        for b in 0..nblk {
+            let p = w + 64 * b;
+            let (a, c, q) = if p + 64 <= len {
+                masks64(chunk[p..p + 64].try_into().unwrap())
+            } else {
+                let mut pad = [0u8; 64];
+                pad[..len - p].copy_from_slice(&chunk[p..len]);
+                masks64(&pad)
+            };
+            let valid = if p + 64 <= wend { !0u64 } else { (1u64 << (wend - p)) - 1 };
+            push_bits(&mut buf, &mut n, (64 * b) as u32, (a | c | q) & valid);
+        }
+        if wend == len && chunk[len - 1] != b'\n' {
+            buf[n] = (len - w) as u32; // virtual newline ending the final line
+            n += 1;
+        }
+        // ---- stage 2: lines starting in [w, w + WIN). Each field is either unquoted (the
+        // next listed position is its separator) or quoted: an opening quote at the field
+        // start, the next listed position is the closing quote, and the position right after
+        // it is the separator. Anything else is malformed, exactly as `split` decides.
+        let limit = (w + WIN).min(len);
+        let mut t = 0usize;
+        enum V {
+            Line(bool), // the line's newline was consumed; fields ok?
+            Bad,        // malformed before its newline; positions from `u` on are unconsumed
+            Out,        // ran out of listed positions (line crosses the window slack)
+        }
+        while s < limit {
+            let mut out: [&'a [u8]; N] = [&[]; N];
+            let (mut k, mut fs, mut u) = (0usize, s, t);
+            let verdict = loop {
+                if u >= n {
+                    break V::Out;
+                }
+                let p = w + buf[u] as usize;
+                let (field, sep, nu): (&'a [u8], usize, usize);
+                if byte(p) == b'"' {
+                    if p != fs {
+                        break V::Bad; // a quote not at the start of the field
+                    }
+                    if u + 1 >= n {
+                        break V::Out;
+                    }
+                    let p2 = w + buf[u + 1] as usize;
+                    if byte(p2) != b'"' {
+                        break V::Bad; // opened but not closed before a separator
+                    }
+                    if u + 2 >= n {
+                        break V::Out;
+                    }
+                    let p3 = w + buf[u + 2] as usize;
+                    let c3 = byte(p3);
+                    if p3 != p2 + 1 || (c3 != b',' && c3 != b'\n') {
+                        break V::Bad; // closing quote not at the end of the field
+                    }
+                    field = &chunk[p + 1..p2];
+                    sep = p3;
+                    nu = u + 3;
+                } else {
+                    field = &chunk[fs..p];
+                    sep = p;
+                    nu = u + 1;
+                }
+                if k == N {
+                    break V::Bad; // too many fields (u still points at this field)
+                }
+                out[k] = field;
+                k += 1;
+                fs = sep + 1;
+                u = nu;
+                if byte(sep) == b'\n' {
+                    break V::Line(k == N);
+                }
+            };
+            match verdict {
+                V::Line(ok) => {
+                    f(if ok { Some(out) } else { None });
+                    s = fs;
+                    t = u;
+                }
+                V::Bad => {
+                    let mut v = u;
+                    while v < n && byte(w + buf[v] as usize) != b'\n' {
+                        v += 1;
+                    }
+                    if v < n {
+                        f(None);
+                        s = w + buf[v] as usize + 1;
+                        t = v + 1;
+                    } else {
+                        let e = memchr::memchr(b'\n', &chunk[s..]).map_or(len, |i| s + i);
+                        f(if e == s { None } else { split::<N>(&chunk[s..e]) });
+                        s = e + 1;
+                        break;
+                    }
+                }
+                V::Out => {
+                    let e = memchr::memchr(b'\n', &chunk[s..]).map_or(len, |i| s + i);
+                    f(if e == s { None } else { split::<N>(&chunk[s..e]) });
+                    s = e + 1;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod fused_tests {
     use super::*;
@@ -588,6 +775,9 @@ mod fused_tests {
         let mut z = Vec::new();
         for_each_record_swar::<N>(chunk, |r| z.push(r.map(|a| a.iter().map(|x| x.to_vec()).collect())));
         assert_eq!(v, z, "night-04 and RW9 SWAR scanners disagree");
+        let mut y = Vec::new();
+        for_each_record_ix::<N>(chunk, |r| y.push(r.map(|a| a.iter().map(|x| x.to_vec()).collect())));
+        assert_eq!(v, y, "night-04 and RW10 index scanners disagree");
         v
     }
 
