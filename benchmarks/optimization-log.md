@@ -257,6 +257,7 @@ work at open time, which is what we see. On a real disk the result may differ.
 | N01 | Dense campaign/day accumulators | B | `2ff8e5f` | CI gate PASS | CI 9.086 vs 9.279 (−2.1%, 5/7) | – | CI 30.937 vs 31.206 (−0.9%, 4/5) | – | 11.9 GB RSS | **Keep** |
 | N03 | Packed u64 event_id dedup keys, EvRaw 64→48 B | B | `e3219ff` | CI gate PASS | CI 8.298 vs 9.297 (−10.7%, 7/7) | – | CI 28.837 vs 32.394 (−11.0%, 5/5) | – | 11.7 GB RSS | **Keep** |
 | N02 | Parallel link resolution | B | `77b6ec0` | CI gate PASS | CI 7.163 vs 7.530 (−4.9%, 7/7) | – | CI 24.272 vs 25.778 (−5.8%, 5/5) | – | 11.9 GB RSS | **Keep** |
+| N04 | Fused SSE2 line+field scanner | B | `45bdcbd` | CI gate PASS | CI 7.239 vs 7.610 (−4.9%, 7/7) | – | CI 24.865 vs 26.080 (−4.7%, 5/5) | – | 11.4 GB RSS | **Keep** |
 
 ## Overnight loop (2026-11-21, CI x86 timing)
 
@@ -306,3 +307,18 @@ conflict only; local checks all green, 20M Parquet equal). BEST → this merge (
 
 Runner CPUs vary between runs (EPYC 7763, EPYC 9V74, Xeon 8573C), so absolute times differ across results;
 only the paired comparison inside one result is used.
+
+### Night-04: fused one-pass SSE2 line + field scanner: **KEEP**
+
+`dialect::for_each_record::<N>` replaces `for_each_line` + `split::<N>` in the events, clicks and links scans. It walks
+each line in 16-byte blocks, building `\n`, `,` and `"` bitmasks with SSE2 (x86_64 baseline, no `target-cpu`, no
+runtime detection needed; a scalar mask builder on other targets), then cuts fields at the comma bits and checks
+quotes per field by mask: none, or exactly one at each end of a field of length ≥ 2; anything else is malformed,
+as is a wrong comma count or an empty line. Lines over 128 bytes use the old `split`. Near the chunk end the
+block is copied into a `\n`-padded buffer, so a final line without `\n` ends correctly and nothing is read past
+the mapping. Unit test `fused_matches_split`: 30,000 random dialect-noise chunks × N ∈ {2, 4, 7} plus exact
+16/128-byte block edges, identical to `for_each_line` + `split`.
+
+CI (`45bdcbd` = night-04 merged with BEST `4270e61`, vs `4270e61`; Xeon 8370C): gate PASS; **20M 7.610 → 7.239 s
+(−4.9%, 7/7)**; **60M 26.080 → 24.865 s (−4.7%, 5/5)**. Merged on top of night-01/02/03 (local checks green,
+20M Parquet equal). BEST → this merge (night-01 + 02 + 03 + 04).
