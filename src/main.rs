@@ -43,7 +43,7 @@ pub fn new_map<K, V>(cap: usize) -> Map<K, V> {
     Map::with_capacity_and_hasher(cap, table_state())
 }
 
-const NB: usize = 512; // number of hash partitions (power of two)
+const NB: usize = 256; // number of hash partitions (power of two); night-11: 512 -> 256 (A3 retried after the packed keys shrank every table)
 const CHUNK: usize = 4 << 20; // scan granule, bytes
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 30 * 60 * 1000;
@@ -1034,7 +1034,8 @@ mod packed_keys {
             b[part_of_u64(&st, pack9(format!("e{i:x}").as_bytes()).unwrap())] += 1;
         }
         let (mn, mx) = (*b.iter().min().unwrap(), *b.iter().max().unwrap());
-        assert!(mn > 800 && mx < 1200, "{mn} {mx}");
+        let avg = 512_000 / NB as u32;
+        assert!(mn > avg * 8 / 10 && mx < avg * 12 / 10, "{mn} {mx}");
     }
 }
 
