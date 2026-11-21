@@ -255,6 +255,8 @@ work at open time, which is what we see. On a real disk the result may differ.
 | A4 | `MADV_WILLNEED` whole-file | A/B | not merged | all gates | 2.507 / 2.458 vs A2 2.476 / 2.439 (paired) | 3.400 / 3.273 vs 3.291 / 3.133 (4 cold pairs each) | 8.317 vs 8.417 (paired) | 11.508 vs 11.091 | 7.27 GB | **Revert** (cold slower) |
 | B1 | Contiguous partitioning + fused emit | B | | | | | | | | next (profile first) |
 | N01 | Dense campaign/day accumulators | B | `2ff8e5f` | CI gate PASS | CI 9.086 vs 9.279 (−2.1%, 5/7) | – | CI 30.937 vs 31.206 (−0.9%, 4/5) | – | 11.9 GB RSS | **Keep** |
+| N03 | Packed u64 event_id dedup keys, EvRaw 64→48 B | B | `e3219ff` | CI gate PASS | CI 8.298 vs 9.297 (−10.7%, 7/7) | – | CI 28.837 vs 32.394 (−11.0%, 5/5) | – | 11.7 GB RSS | **Keep** |
+| N02 | Parallel link resolution | B | `77b6ec0` | CI gate PASS | CI 7.163 vs 7.530 (−4.9%, 7/7) | – | CI 24.272 vs 25.778 (−5.8%, 5/5) | – | 11.9 GB RSS | **Keep** |
 
 ## Overnight loop (2026-11-21, CI x86 timing)
 
@@ -276,3 +278,31 @@ Session starts are in-window event timestamps, so the day offset is always in ra
 
 CI (`2ff8e5f` vs `b85649a`, EPYC 7763): gate PASS; **20M 9.279 → 9.086 s (−2.1%, 5/7)**; 60M 31.206 → 30.937 s
 (−0.9%, 4/5); RSS 12.21 → 11.91 GB at 60M. Meets the rule (narrowly). BEST → `2ff8e5f`.
+
+### Night-03: packed u64 `event_id` dedup keys + smaller `EvRaw`: **KEEP**
+
+An `event_id` of at most 9 bytes in 1..=127 packs left-aligned at 7 bits/byte into a u64 (`pack9`, injective and
+order-preserving; unit test `packed::order_and_domain`). Dedup partitions and tables are keyed by that integer, so a
+probe no longer dereferences a slice in the input mapping. Unpackable IDs (none in generated data; allowed by the
+rules) go through a separate exact `Map<&[u8], EvRaw>` in the same partition; a packable and an unpackable ID are
+never equal, so the two sets dedup independently with the same `earlier()` rule. `EvRaw` drops the 16-byte
+`eid` slice (64 → 48 B; 56 B with the key). Partition-spread test for packed keys added.
+
+CI (`e3219ff` vs `b85649a`, EPYC 7763): gate PASS; **20M 9.297 → 8.298 s (−10.7%, 7/7)**; **60M 32.394 → 28.837 s
+(−11.0%, 5/5)**. Merged on top of night-01 (merge `4270e61`, local checks all green, 20M Parquet equal to
+`b85649a`'s); BEST → `4270e61` (night-01 + night-03; the combination is timed by the next candidates).
+
+### Night-02: parallel link resolution: **KEEP**
+
+Link IDs are scattered by a separate hash (`LINK_SEED`, 64 partitions) and interned in parallel, one table per
+partition; the union-find then runs sequentially on dense integer edge ends (no hashing), and the name map is
+built in parallel as 64 per-partition tables (`Names`, looked up by partition hash + table). A person's name is
+still the byte-wise smallest member ID, so the result is independent of partitioning and union order. Spread
+test for the link partitions added. Local 20M: links 0.81 → 0.26 s.
+
+CI (`77b6ec0` = night-02 merged with night-01, vs `2ff8e5f`; Xeon Platinum 8573C): gate PASS; **20M 7.530 → 7.163 s
+(−4.9%, 7/7)**; **60M 25.778 → 24.272 s (−5.8%, 5/5)**. Merged on top of night-01 + night-03 (test-module
+conflict only; local checks all green, 20M Parquet equal). BEST → this merge (night-01 + 02 + 03).
+
+Runner CPUs vary between runs (EPYC 7763, EPYC 9V74, Xeon 8573C), so absolute times differ across results;
+only the paired comparison inside one result is used.
