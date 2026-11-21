@@ -266,6 +266,7 @@ work at open time, which is what we see. On a real disk the result may differ.
 | N10 | Packed person key carried with rows | B | `70531fc` | CI gate PASS | CI 3.360 vs 4.401 (**−23.6%**, 7/7) | – | CI 11.433 vs 15.276 (**−25.2%**, 5/5) | – | 12.1 GB RSS | **Keep** |
 | N13 | Flat open-addressing name table | B | not pushed | local only | local 20M scan 2.40 vs 2.18 s | – | – | – | – | **Revert** (slower) |
 | N11 | NB 512 → 256 | A | `ca17f21` | CI gate PASS | CI 6.365 vs 6.561 (−3.0%, 6/7) | – | CI 22.402 vs 23.129 (−3.1%, 4/5) | – | 11.4 GB RSS | **Keep** |
+| N14 | Single-pack person lookup, fmix-keyed tables | B | `a649871` | CI gate PASS | CI 4.550 vs 4.706 (−3.3%, 6/7) | – | CI 14.415 vs 15.090 (−4.5%, 5/5) | – | 12.2 GB RSS | **Keep** |
 
 ## Overnight loop (2026-11-21, CI x86 timing)
 
@@ -404,3 +405,15 @@ CI (`ca17f21` vs `68c57c0`, i.e. measured before night-10 was merged; EPYC 7763)
 (−3.0%, 6/7)**; **60M 23.129 → 22.402 s (−3.1%, 4/5)**. Merged on top of night-10; the combination was checked
 locally (all gates; 20M Parquet equal; 4 local pairs, combined build faster in 4/4, about −7%) and is timed by every
 later candidate and by the final comparison runs. BEST → this merge (night-01…07, 10, 11).
+
+### Night-14: person lookup packs once and hashes once: **KEEP**
+
+Packed tables (`PMap`) are keyed by `fmix(pack9(id))` (murmur3's 64-bit finalizer, a bijection, so keys stay exact)
+with an identity hasher; link partitions take bits 40.. of the same value. `Names::person(id)` packs the ID once,
+mixes once, probes one partition table, and on a miss returns `Person { name: id, key }` without packing again
+(before: up to three packs and two hashes per lookup). Tests: `fmix` collision-free on a sample, and spread of
+partition bits, low bits and hashbrown's top-7 tag bits.
+
+CI (`a649871` vs `a768775`, before night-11 was merged; Xeon 6973P-C): gate PASS; **20M 4.706 → 4.550 s (−3.3%, 6/7)**;
+**60M 15.090 → 14.415 s (−4.5%, 5/5)**. Merged on top of night-11 (local checks green, 20M Parquet equal).
+BEST → this merge (night-01…07, 10, 11, 14).
