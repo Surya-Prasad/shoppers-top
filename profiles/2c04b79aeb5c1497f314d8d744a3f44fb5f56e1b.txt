@@ -1,0 +1,151 @@
+++ git rev-parse --short HEAD
+++ lscpu
+++ sed -n 's/^Model name: *//p'
+++ nproc
++ echo '# x86 profile of 2c04b79 (AMD EPYC 9V45 96-Core Processor x 4), 20000000 events'
+# x86 profile of 2c04b79 (AMD EPYC 9V45 96-Core Processor x 4), 20000000 events
++ echo
+
++ echo '## stage timings'
+## stage timings
++ DATA_DIR=/home/runner/work/_temp/p/d
++ OUTPUT_DIR=/home/runner/work/_temp/p/o1
++ grep -E '^\[|^    '
+++ nproc
++ NCPU=4
++ target/release/shopping-sessions
+[  0.008s] reference tables
+    links: parse                         0.010s
+    links: intern                        0.065s
+    links: union                         0.012s
+    links: names                         0.034s
+    links: out map                       0.015s
+[  0.152s] links resolved
+    clicks: scan+parse+partition         0.175s
+    clicks: transpose                    0.000s
+    clicks: dedup+validate+repartition   0.048s
+    clicks: transpose                    0.001s
+[  0.376s] clicks
+    events: scan+parse+partition         0.991s
+    events: transpose                    0.001s
+    events: dedup+validate+repartition   0.247s
+    events: transpose                    0.001s
+[  1.615s] events
+[  1.907s] sessions
+[  1.995s] outputs written
+[  1.995s] done
++ echo
+
++ echo '## perf stat'
+## perf stat
++ DATA_DIR=/home/runner/work/_temp/p/d
++ OUTPUT_DIR=/home/runner/work/_temp/p/o2
++ grep -vE '^\[|^    |^ *$|stats|"'
++ tail -15
+++ nproc
++ NCPU=4
++ /usr/bin/perf stat -e task-clock,cycles,instructions,branches,branch-misses,cache-misses,page-faults target/release/shopping-sessions
+window [1788652800000, 1789862400000) ms, threads 4
+files: events 85 clicks 22 links 8
+}
+   <not supported>      cycles                                                                
+   <not supported>      instructions                                                          
+   <not supported>      branches                                                              
+   <not supported>      branch-misses                                                         
+   <not supported>      cache-misses                                                          
++ echo
+
++ echo '## hottest symbols (self)'
+## hottest symbols (self)
++ /usr/bin/perf report -i /home/runner/work/_temp/p/perf.data --no-children --sort symbol --stdio
++ grep -E '^ +[0-9]'
++ head -40
+    12.76%  [.] rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::slice::IterProducer<([usize; 7], &[u8])>, rayon::iter::map::MapConsumer<rayon::iter::collect::consumer::CollectConsumer<alloc::vec::Vec<alloc::vec::Vec<shopping_sessions::EvRec>>>, shopping_sessions::events::{closure#0}>>                                                    -      -            
+    12.05%  [.] shopping_sessions::events::{closure#0}::{closure#3}                                                                                                                                                                                                                                                                                               -      -            
+    10.89%  [.] rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::vec::DrainProducer<alloc::vec::Vec<alloc::vec::Vec<shopping_sessions::EvRec>>>, rayon::iter::map::MapConsumer<rayon::iter::collect::consumer::CollectConsumer<alloc::vec::Vec<alloc::vec::Vec<shopping_sessions::EvV>>>, shopping_sessions::events::{closure#1}>>                -      -            
+     8.02%  [.] shopping_sessions::timefmt::parse                                                                                                                                                                                                                                                                                                                 -      -            
+     7.44%  [.] rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::range::IterProducer<usize>, rayon::iter::fold::FoldConsumer<rayon::iter::extend::ListVecConsumer, shopping_sessions::main::{closure#4}, shopping_sessions::main::{closure#5}>>                                                                                                   -      -            
+     6.44%  [.] shopping_sessions::events::{closure#0}::{closure#2}                                                                                                                                                                                                                                                                                               -      -            
+     3.42%  [.] shopping_sessions::clicks::{closure#0}::{closure#2}                                                                                                                                                                                                                                                                                               -      -            
+                       0x57ecd541bbd0
+     3.37%  [.] shopping_sessions::packed::pack9                                                                                                                                                                                                                                                                                                                  -      -            
+     2.89%  [.] core::slice::sort::shared::smallsort::small_sort_general::<shopping_sessions::EvV, <[shopping_sessions::EvV]>::sort_unstable_by<&shopping_sessions::sessionize::{closure#2}>::{closure#0}>                                                                                                                                                        -      -            
+     2.08%  [.] rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::vec::DrainProducer<alloc::vec::Vec<alloc::vec::Vec<shopping_sessions::ClRec>>>, rayon::iter::map::MapConsumer<rayon::iter::collect::consumer::CollectConsumer<alloc::vec::Vec<alloc::vec::Vec<shopping_sessions::ClickV>>>, shopping_sessions::clicks::{closure#1}>>             -      -            
+     1.92%  [.] rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::slice::IterProducer<([usize; 4], &[u8])>, rayon::iter::map::MapConsumer<rayon::iter::collect::consumer::CollectConsumer<alloc::vec::Vec<alloc::vec::Vec<shopping_sessions::ClRec>>>, shopping_sessions::clicks::{closure#0}>>                                                    -      -            
+                       0xc7f640000000e384
+     1.73%  [.] core::slice::sort::unstable::quicksort::quicksort::<shopping_sessions::EvV, <[shopping_sessions::EvV]>::sort_unstable_by<&shopping_sessions::sessionize::{closure#2}>::{closure#0}>                                                                                                                                                               -      -            
+     1.60%  [k] do_user_addr_fault                                                                                                                                                                                                                                                                                                                                -      -            
+     1.56%  [.] <&shopping_sessions::resolve_links::{closure#3} as core::ops::function::FnMut<(usize,)>>::call_mut                                                                                                                                                                                                                                                -      -            
+     1.38%  [.] <shopping_sessions::Pending<shopping_sessions::ClRec>>::flush::<shopping_sessions::clicks::{closure#0}::{closure#1}>                                                                                                                                                                                                                              -      -            
+     1.23%  [k] _raw_spin_unlock_irqrestore                                                                                                                                                                                                                                                                                                                       -      -            
+     1.07%  [.] rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::slice::IterProducer<&[u8]>, rayon::iter::map::MapConsumer<rayon::iter::collect::consumer::CollectConsumer<u64>, shopping_sessions::resolve_links::{closure#6}>>                                                                                                                  -      -            
+     0.83%  [.] core::slice::sort::shared::smallsort::small_sort_general::<shopping_sessions::ClickV, <[shopping_sessions::ClickV]>::sort_unstable_by<&shopping_sessions::sessionize::{closure#4}>::{closure#0}>                                                                                                                                                  -      -            
+     0.75%  [k] do_anonymous_page                                                                                                                                                                                                                                                                                                                                 -      -            
+     0.67%  [.] <parquet::column::writer::GenericColumnWriter<parquet::column::writer::encoder::ColumnValueEncoderImpl<parquet::data_type::Int64Type>>>::write_mini_batch                                                                                                                                                                                         -      -            
+     0.61%  [k] __rmqueue_pcplist                                                                                                                                                                                                                                                                                                                                 -      -            
+     0.56%  [k] __handle_mm_fault                                                                                                                                                                                                                                                                                                                                 -      -            
+     0.38%  [.] shopping_sessions::main                                                                                                                                                                                                                                                                                                                           -      -            
+     0.37%  [.] 0x00000000000bafc8                                                                                                                                                                                                                                                                                                                                -      -            
+     0.32%  [.] rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::iter::enumerate::EnumerateProducer<rayon::slice::IterProducer<&[&shopping_sessions::output::UserRow]>>, rayon::iter::for_each::ForEachConsumer<shopping_sessions::output::write_all::{closure#0}>>                                                                               -      -            
+     0.31%  [k] kernel_init_pages                                                                                                                                                                                                                                                                                                                                 -      -            
+     0.30%  [.] core::slice::sort::shared::smallsort::insertion_sort_shift_left::<shopping_sessions::ClickV, <[shopping_sessions::ClickV]>::sort_unstable_by<&shopping_sessions::sessionize::{closure#4}>::{closure#0}>                                                                                                                                           -      -            
+     0.30%  [.] core::slice::sort::unstable::quicksort::quicksort::<shopping_sessions::ClickV, <[shopping_sessions::ClickV]>::sort_unstable_by<&shopping_sessions::sessionize::{closure#4}>::{closure#0}>                                                                                                                                                         -      -            
+     0.28%  [.] rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::iter::enumerate::EnumerateProducer<rayon::slice::IterProducer<alloc::vec::Vec<(&[u8], &[u8])>>>, rayon::iter::map::MapConsumer<rayon::iter::collect::consumer::CollectConsumer<alloc::vec::Vec<alloc::vec::Vec<(&[u8], u32)>>>, shopping_sessions::resolve_links::{closure#2}>>  -      -            
+     0.28%  [.] core::slice::sort::shared::smallsort::insertion_sort_shift_left::<shopping_sessions::EvV, <[shopping_sessions::EvV]>::sort_unstable_by<&shopping_sessions::sessionize::{closure#2}>::{closure#0}>                                                                                                                                                 -      -            
+     0.26%  [k] handle_mm_fault                                                                                                                                                                                                                                                                                                                                   -      -            
+     0.26%  [.] <parquet::util::interner::Interner<parquet::arrow::arrow_writer::byte_array::ByteArrayStorage>>::intern                                                                                                                                                                                                                                           -      -            
+     0.25%  [.] rayon::iter::plumbing::bridge_producer_consumer::helper::<rayon::slice::IterProducer<([usize; 2], &[u8])>, rayon::iter::map::MapConsumer<rayon::iter::collect::consumer::CollectConsumer<alloc::vec::Vec<(&[u8], &[u8])>>, shopping_sessions::resolve_links::{closure#1}>>                                                                        -      -            
+     0.23%  [k] mas_walk                                                                                                                                                                                                                                                                                                                                          -      -            
+     0.23%  [.] 0x00000000000ba595                                                                                                                                                                                                                                                                                                                                -      -            
+     0.21%  [k] do_mprotect_pkey                                                                                                                                                                                                                                                                                                                                  -      -            
+     0.21%  [k] __alloc_frozen_pages_noprof                                                                                                                                                                                                                                                                                                                       -      -            
+     0.21%  [.] <core::str::lossy::Utf8Chunks as core::iter::traits::iterator::Iterator>::next                                                                                                                                                                                                                                                                    -      -            
+grep: write error: Broken pipe
++ echo
+
++ echo '## hottest source lines (self)'
+## hottest source lines (self)
++ /usr/bin/perf report -i /home/runner/work/_temp/p/perf.data --no-children --sort srcline --stdio
++ grep -E '^ +[0-9]'
++ head -40
+     4.19%  packed.rs:20
+                       0x57ec9984cd94
+                       0x57ec9984cd94
+                       0x57ec9984cd94
+                       0x57ec9984cd94
+                       0x57ec9984cd94
+                       0x57ec9984cd94
+                       0x57ec9984cd94
+                       0x57ec9984cd94
+                       0x57ec9984cd94
+                       0x57ec9984cd94
+                       0x57ec9984cd94
+                       0x57ec9984cd94
+                       0x57ec9984cd94
+                       0x57ec9984cd94
+     4.07%  mod.rs:1966
+                       0x57ec9984ac03
+                       0x57ec9984ac03
+                       0x57ec9984ac03
+                       0x57ec9984ac03
+                       0x57ec9984ac03
+                       0x57ec9984ac03
+                       0x57ec9984ac03
+                       0x57ec9984ac03
+                       0x57ec9984ac03
+                       0x57ec9984ac03
+                       0x57ec9984ac03
+                       0x57ec9984ac03
+                       0x57ec9984ac03
+     3.45%  packed.rs:64
+                       0x57ec998ac5e8
+                       0x57ec998ac5e8
+                       0x57ec998ac5e8
+     3.39%  main.rs:1070
+     2.27%  maybe_uninit.rs:575
+     2.26%  packed.rs:65
+     2.09%  timefmt.rs:0
+     2.01%  dialect.rs:0
+     1.86%  keys.rs:192
+                       0x57ec99863ddb
+grep: write error: Broken pipe
