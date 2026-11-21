@@ -12,6 +12,7 @@
 #[allow(dead_code)]
 mod alloc;
 mod dialect;
+mod fast;
 mod hashing;
 mod keys;
 mod output;
@@ -944,17 +945,26 @@ fn dedup_exact<T: Copy>(parts: &[Vec<T>], key: impl Fn(&T) -> u64, better: impl 
 fn clicks_scan(src: &[&'static Source], campaigns: &IdMap, lo: i64, hi: i64, stats: &Stats) -> ByPerson<ClRec> {
     let mut st = Stage::start();
     let items = work_items::<4>(src, ["click_id", "user_id", "campaign_id", "ts"]);
-    // scan + validate each copy + partition on click_id
-    let scattered: Vec<Vec<Vec<ClRec>>> = items
+    let scattered = clicks_scan_items(&items, campaigns, lo, hi, stats, fast_enabled());
+    st.mark("clicks: scan+parse+partition");
+    let by_cid = transpose(scattered);
+    st.mark("clicks: transpose");
+    by_cid
+}
+
+/// The per-chunk clicks scan: scan + validate each copy + partition on click_id (exact path,
+/// or v2 P1 fast path with exact fallback).
+fn clicks_scan_items(items: &[([usize; 4], S)], campaigns: &IdMap, lo: i64, hi: i64, stats: &Stats, fast_ok: bool) -> Vec<Vec<Vec<ClRec>>> {
+    items
         .par_iter()
         .map(|(order, chunk)| {
-            let mut parts: Vec<Vec<ClRec>> = (0..NB).map(|_| Vec::with_capacity(chunk.len() / 48 / NB + 8)).collect();
+            let mut parts: Vec<Vec<ClRec>> = (0..NB).map(|_| Vec::with_capacity(chunk.len() / 24 / NB + 32)).collect(); // v2: clicks lines ~26 B
             let (mut lines, mut bad, mut noid) = (0u64, 0u64, 0u64);
             let mut put = |mut r: ClRec, user: u64| {
                 r.person = user;
                 parts[keys::part(r.cid, LOG_NB)].push(r);
             };
-            for_each_record_bq::<4>(chunk, |rec| {
+            let mut exact = |rec: Option<[S; 4]>, put: &mut dyn FnMut(ClRec, u64)| {
                 lines += 1;
                 let Some(f) = rec else {
                     bad += 1;
@@ -986,18 +996,40 @@ fn clicks_scan(src: &[&'static Source], campaigns: &IdMap, lo: i64, hi: i64, sta
                     }
                 }
                 put(r, keys::EMPTY);
-            });
+            };
+            if fast_ok && is_identity(order) {
+                let mut nfast = 0u64;
+                let st = std::cell::RefCell::new((&mut put, &mut exact));
+                fast::for_each_line_fast(
+                    chunk,
+                    |p| {
+                        // SAFETY: for_each_line_fast guarantees SLACK readable bytes at p
+                        let (l, c) = unsafe { fast::click(p, lo, hi) }?;
+                        let camp = campaigns.get_packed(packed::fmix(c.camp), c.camp)?;
+                        nfast += 1;
+                        let mut g = st.borrow_mut();
+                        (g.0)(ClRec { cid: c.cid, person: keys::EMPTY, ts: c.ts, camp, why: 0 }, c.user);
+                        Some(l)
+                    },
+                    |line| {
+                        let mut g = st.borrow_mut();
+                        let (put, exact) = &mut *g;
+                        exact(split::<4>(line), &mut **put);
+                    },
+                );
+                drop(st);
+                stats.add(K::ClLines, nfast);
+            } else {
+                for_each_record_bq::<4>(chunk, |rec| exact(rec, &mut put));
+            }
+            drop(exact);
             drop(put);
             stats.add(K::ClLines, lines);
             stats.add(K::ClMalformed, bad);
             stats.add(K::ClNoId, noid);
             parts
         })
-        .collect();
-    st.mark("clicks: scan+parse+partition");
-    let by_cid = transpose(scattered);
-    st.mark("clicks: transpose");
-    by_cid
+        .collect()
 }
 
 /// RW31: click dedup + person resolution (batched) + repartition by person.
@@ -1009,7 +1041,7 @@ fn clicks_dedup(by_cid: ByPerson<ClRec>, names: &Names, stats: &Stats) -> ByPers
         .into_par_iter()
         .map(|parts| {
             let n: usize = parts.iter().map(Vec::len).sum();
-            let mut dst: Vec<Vec<ClickV>> = (0..NB).map(|_| Vec::with_capacity(n / NB + 8)).collect();
+            let mut dst: Vec<Vec<ClickV>> = (0..NB).map(|_| Vec::with_capacity(n / NB + n / NB / 8 + 32)).collect(); // v2: room for the spread (no regrowth)
             let mut why = [0u64; 4];
             let mut pb: PersonBatch<ClRec> = PersonBatch::new();
             let mut emit = |r: ClRec, person: u64| {
@@ -1105,10 +1137,20 @@ fn events_scan(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: 
     const NAMES: [&str; 7] = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"];
     let mut st = Stage::start();
     let items = work_items::<7>(src, NAMES);
-    let scattered: Vec<Vec<Vec<EvRec>>> = items
+    let scattered = events_scan_items(&items, products, unknown_cat, lo, hi, stats, fast_enabled());
+    st.mark("events: scan+parse+partition");
+    let by_eid = transpose(scattered);
+    st.mark("events: transpose");
+    by_eid
+}
+
+/// The per-chunk events scan (exact path, or v2 P1 fast path with exact fallback).
+#[allow(clippy::too_many_arguments)]
+fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u32, lo: i64, hi: i64, stats: &Stats, fast_ok: bool) -> Vec<Vec<Vec<EvRec>>> {
+    items
         .par_iter()
         .map(|(order, chunk)| {
-            let mut parts: Vec<Vec<EvRec>> = (0..NB).map(|_| Vec::with_capacity(chunk.len() / 80 / NB + 8)).collect();
+            let mut parts: Vec<Vec<EvRec>> = (0..NB).map(|_| Vec::with_capacity(chunk.len() / 60 / NB + 32)).collect(); // v2: event lines ~67 B
             let (mut lines, mut bad, mut noid) = (0u64, 0u64, 0u64);
             // RW15: (row, user key, user mix, product key or 0, product mix); person and
             // product slots of a whole batch are prefetched before any lookup runs
@@ -1127,7 +1169,7 @@ fn events_scan(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: 
                     put(r);
                 }
             };
-            for_each_record_bq::<7>(chunk, |rec| {
+            let mut exact = |rec: Option<[S; 7]>, pend: &mut [(EvRec, u64, u64); PBATCH], np: &mut usize, put: &mut dyn FnMut(EvRec)| {
                 lines += 1;
                 let Some(f) = rec else {
                     bad += 1;
@@ -1178,11 +1220,11 @@ fn events_scan(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: 
                                     }
                                 };
                                 r.person = key_of(f[1]);
-                                pend[np] = (r, pk, pm);
-                                np += 1;
-                                if np == PBATCH {
-                                    flush(&mut pend[..], &mut put);
-                                    np = 0;
+                                pend[*np] = (r, pk, pm);
+                                *np += 1;
+                                if *np == PBATCH {
+                                    flush(&mut pend[..], put);
+                                    *np = 0;
                                 }
                                 return;
                             }
@@ -1191,7 +1233,40 @@ fn events_scan(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: 
                     }
                 }
                 put(r); // invalid copy: person stays EMPTY
-            });
+            };
+            if fast_ok && is_identity(order) {
+                // v2 P1: shape-specialized fast path; every line it declines takes `exact`
+                let lines_c = std::cell::Cell::new(0u64);
+                let st = std::cell::RefCell::new((&mut pend, &mut np, &mut put, &mut exact));
+                fast::for_each_line_fast(
+                    chunk,
+                    |p| {
+                        // SAFETY: for_each_line_fast guarantees SLACK readable bytes at p
+                        let (l, ev) = unsafe { fast::event(p, lo, hi) }?;
+                        lines_c.set(lines_c.get() + 1);
+                        let mut g = st.borrow_mut();
+                        let (pend, np, put, _) = &mut *g;
+                        let m = packed::fmix(ev.product);
+                        products.prefetch_packed(m);
+                        let r = EvRec { eid: ev.eid, rank: rank_of(Some(ev.ingest)), person: ev.user, ts: ev.ts, price: ev.price, cat: 0 };
+                        pend[**np] = (r, ev.product, m);
+                        **np += 1;
+                        if **np == PBATCH {
+                            flush(&mut pend[..], &mut **put);
+                            **np = 0;
+                        }
+                        Some(l)
+                    },
+                    |line| {
+                        let mut g = st.borrow_mut();
+                        let (pend, np, put, exact) = &mut *g;
+                        exact(split::<7>(line), pend, np, &mut **put);
+                    },
+                );
+                lines += lines_c.get();
+            } else {
+                for_each_record_bq::<7>(chunk, |rec| exact(rec, &mut pend, &mut np, &mut put));
+            }
             flush(&mut pend[..np], &mut put);
             drop(put);
             stats.add(K::EvLines, lines);
@@ -1199,11 +1274,12 @@ fn events_scan(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: 
             stats.add(K::EvNoId, noid);
             parts
         })
-        .collect();
-    st.mark("events: scan+parse+partition");
-    let by_eid = transpose(scattered);
-    st.mark("events: transpose");
-    by_eid
+        .collect()
+}
+
+/// v2: the fast paths are on unless SS_NOFAST is set (A/B and debugging only).
+fn fast_enabled() -> bool {
+    std::env::var_os("SS_NOFAST").is_none()
 }
 
 /// RW31: event dedup + person resolution (batched) + repartition by person.
@@ -1215,7 +1291,7 @@ fn events_dedup(by_eid: ByPerson<EvRec>, unknown_cat: u32, names: &Names, stats:
             let n: usize = parts.iter().map(Vec::len).sum();
             // rules.md, Events step 2: keep the copy with the smallest ingest_ts; A2: on a
             // tie the first copy stays (equal-ingest copies are promised identical)
-            let mut dst: Vec<Vec<EvV>> = (0..NB).map(|_| Vec::with_capacity(n / NB + 8)).collect();
+            let mut dst: Vec<Vec<EvV>> = (0..NB).map(|_| Vec::with_capacity(n / NB + n / NB / 8 + 32)).collect(); // v2: room for the spread (no regrowth)
             let mut c = [0u64; 8];
             let mut pb: PersonBatch<EvRec> = PersonBatch::new();
             let mut emit = |r: EvRec, person: u64| {
@@ -1537,6 +1613,129 @@ mod dedup_tests {
             w.sort();
             assert_eq!(kept, w.len(), "case {case}");
             assert_eq!(got, w, "case {case}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod fast_scan_tests {
+    use super::*;
+
+    fn flat(v: Vec<Vec<Vec<EvRec>>>) -> Vec<Vec<(u64, u64, u64, i64, u32, u32)>> {
+        v.into_iter().map(|c| c.into_iter().flatten().map(|r| (r.eid, r.rank, r.person, r.ts, r.price, r.cat)).collect()).collect()
+    }
+
+    /// v2 P1: the events scan with the fast path gives exactly the records (same order, same
+    /// partitions) and stats as the exact path, on random dirty chunks.
+    #[test]
+    fn events_fast_equals_exact() {
+        let lo = timefmt::parse(b"2026-10-01T00:00:00Z").unwrap();
+        let hi = lo + 14 * DAY;
+        let mut products = IdMap::with_capacity(100);
+        for i in 0..50_000u32 {
+            let s: S = Box::leak(format!("p{i}").into_bytes().into_boxed_slice());
+            products.insert_first(s, i % 21);
+        }
+        let mut x = 77u64;
+        let mut lcg = || {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x >> 33
+        };
+        let mut y = 5u64;
+        for case in 0..40 {
+            let mut buf: Vec<u8> = Vec::new();
+            let nl = 1 + lcg() % 3000;
+            for _ in 0..nl {
+                match lcg() % 100 {
+                    0 => buf.extend(std::iter::repeat_n(b'a', 100 + (lcg() % 100) as usize)),
+                    1 => {}
+                    2 => buf.extend_from_slice(b"e1,u1,2026-10-02T00:00:00Z,2026-10-02T00:00:00Z,view,p1,"),
+                    _ => buf.extend(fast::tests_support::random_event_line(&mut y, lo)),
+                }
+                buf.push(b'\n');
+            }
+            if case % 3 == 0 {
+                buf.pop(); // no final newline
+            }
+            let chunk: S = Box::leak(buf.into_boxed_slice());
+            let items = vec![([0, 1, 2, 3, 4, 5, 6], chunk)];
+            let (s1, s2) = (Stats::default(), Stats::default());
+            let a = flat(events_scan_items(&items, &products, 20, lo, hi, &s1, true));
+            let b = flat(events_scan_items(&items, &products, 20, lo, hi, &s2, false));
+            assert_eq!(a, b, "case {case}");
+            assert_eq!(s1.json(), s2.json(), "case {case}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod fast_click_tests {
+    use super::*;
+
+    /// v2 P1: the clicks scan with the fast path equals the exact path (records, order, stats).
+    #[test]
+    fn clicks_fast_equals_exact() {
+        let lo = timefmt::parse(b"2026-10-01T00:00:00Z").unwrap();
+        let hi = lo + 14 * DAY;
+        let mut camps = IdMap::with_capacity(100);
+        for i in 1..=2000u32 {
+            let s: S = Box::leak(format!("c_{i}").into_bytes().into_boxed_slice());
+            camps.insert_first(s, i - 1);
+        }
+        let mut x = 99u64;
+        let mut lcg = || {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x >> 33
+        };
+        let pick = |r: u64, v: &[&str]| v[(r as usize) % v.len()].to_string();
+        for case in 0..40 {
+            let mut buf = String::new();
+            for _ in 0..(1 + lcg() % 3000) {
+                let cid = if lcg() % 40 == 0 { pick(lcg(), &["", "k1234567890", "K1", "é"]) } else { format!("k{:x}", lcg() % 100_000_000) };
+                let uid = if lcg() % 40 == 0 { pick(lcg(), &["", "U1", " u1", "u123456789x"]) } else { format!("u{:x}", lcg() % 1_000_000) };
+                let camp = if lcg() % 30 == 0 { pick(lcg(), &["", "C_1", "c_2001", "c_01", "c_9999"]) } else { format!("c_{}", 1 + lcg() % 2000) };
+                let ms = lo - 9 * DAY + (lcg() as i64 * 7919) % (25 * DAY);
+                let ts = match lcg() % 6 {
+                    0 => format!("{ms}"),
+                    1 => pick(lcg(), &["", "2026-10-03T23:58:10z", "1.5", "2026-09-30T00:00:00Z\r"]),
+                    _ => {
+                        let d = ms.div_euclid(DAY);
+                        let base = timefmt::days_from_civil(2026, 9, 1);
+                        // a valid F1 near the window (day arithmetic via the parser's inverse is overkill)
+                        let dd = (d - base).clamp(0, 60);
+                        let (m, day) = if dd < 30 { (9, dd + 1) } else if dd < 61 { (10, dd - 29) } else { (11, 1) };
+                        format!("2026-{m:02}-{day:02}T{:02}:{:02}:{:02}Z", lcg() % 24, lcg() % 60, lcg() % 60)
+                    }
+                };
+                let fields = [cid, uid, camp, ts];
+                for (i, f) in fields.iter().enumerate() {
+                    if i > 0 {
+                        buf.push(',');
+                    }
+                    match lcg() % 10 {
+                        0 | 1 => buf.push_str(&format!("\"{f}\"")),
+                        2 if lcg() % 10 == 0 => buf.push_str(&format!("{f}\"")),
+                        _ => buf.push_str(f),
+                    }
+                }
+                if lcg() % 200 == 0 {
+                    buf.push_str(",x");
+                }
+                buf.push('\n');
+            }
+            if case % 4 == 1 {
+                buf.pop();
+            }
+            let chunk: S = Box::leak(buf.into_bytes().into_boxed_slice());
+            let items = vec![([0, 1, 2, 3], chunk)];
+            let (s1, s2) = (Stats::default(), Stats::default());
+            let f = |v: Vec<Vec<Vec<ClRec>>>| -> Vec<Vec<(u64, u64, i64, u32, u32)>> {
+                v.into_iter().map(|c| c.into_iter().flatten().map(|r| (r.cid, r.person, r.ts, r.camp, r.why)).collect()).collect()
+            };
+            let a = f(clicks_scan_items(&items, &camps, lo - 7 * DAY, hi, &s1, true));
+            let b = f(clicks_scan_items(&items, &camps, lo - 7 * DAY, hi, &s2, false));
+            assert_eq!(a, b, "case {case}");
+            assert_eq!(s1.json(), s2.json(), "case {case}");
         }
     }
 }
