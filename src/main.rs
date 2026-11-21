@@ -282,12 +282,17 @@ fn main() {
     }
     lap("sessions");
 
-    drop(events_by_person);
-    drop(clicks_by_person);
+    // RW30: returning gigabytes of event/click vectors to the OS takes ~0.06 s on one
+    // thread; do it in the background while the output files are written
+    let freer = std::thread::spawn(move || {
+        drop(events_by_person);
+        drop(clicks_by_person);
+    });
 
     // ---------------------------------------------------------------- output
     output::write_all(&out, user_parts, camp_agg, &cat_names, &camp_ids, &channels, ncpu);
     lap("outputs written");
+    let _ = freer.join();
 
     let json = stats.json();
     eprint!("stats {json}");
