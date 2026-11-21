@@ -271,6 +271,7 @@ work at open time, which is what we see. On a real disk the result may differ.
 | N16 | Links naming/name map on packed keys | B | `320fbae` | CI gate PASS | CI 4.917 vs 4.968 (−1.0%, 5/7) | – | CI 18.594 vs 17.953 (**+3.6%**, 2/5) | – | 12.3 GB RSS | **Revert** |
 | N18 | Fast exit (forget tables, exit(0)) | A | not pushed | local only | no change | – | – | – | – | **Revert** (no gain) |
 | N17 | CHUNK 4 → 16 MiB | A | `341ae34` | CI gate PASS | CI 4.505 vs 4.551 (−1.0%, 3/7) | – | CI 17.143 vs 16.723 (**+2.5%**, 0/5) | – | 12.1 GB RSS | **Revert** |
+| N19 | NB 256 → 128 | A | `1672787` | CI gate PASS | CI 4.923 vs 5.006 (−1.7%, 6/7) | – | CI 18.119 vs 18.340 (−1.2%, 2/5) | – | 12.6 GB RSS | **Revert** |
 
 ## Overnight loop (2026-11-21, CI x86 timing)
 
@@ -449,3 +450,11 @@ after the outputs are renamed): exit-to-wall time unchanged (about 0.15 s, which
 
 CI (`341ae34` vs `7809b52`; Xeon 6973P-C): gate PASS; 20M 4.551 → 4.505 s (−1.0%, 3/7); **60M 16.723 → 17.143 s
 (+2.5%, 0/5)**. Fewer, larger work items hurt at 60M (worse tail balance over 4 threads). Revert; `CHUNK` stays 4 MiB.
+
+### Night-19: `NB` 256 → 128: **REVERT**
+
+CI (`1672787` vs `7809b52`; Xeon 8573C): gate PASS; 20M 5.006 → 4.923 s (−1.7%, 6/7); 60M 18.340 → 18.119 s
+(−1.2%, 2/5; one 32.7 s outlier pair). Below the −2% bar: revert; `NB` stays 256.
+
+**Final BEST: `7809b52`** (night-01…07, 10, 11, 14, 15). Final comparison runs (workflow_dispatch, same engine
+source on `opt/overnight`): see `benchmarks/OVERNIGHT_REPORT.md`.
