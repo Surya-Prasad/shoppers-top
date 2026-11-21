@@ -258,6 +258,7 @@ work at open time, which is what we see. On a real disk the result may differ.
 | N03 | Packed u64 event_id dedup keys, EvRaw 64→48 B | B | `e3219ff` | CI gate PASS | CI 8.298 vs 9.297 (−10.7%, 7/7) | – | CI 28.837 vs 32.394 (−11.0%, 5/5) | – | 11.7 GB RSS | **Keep** |
 | N02 | Parallel link resolution | B | `77b6ec0` | CI gate PASS | CI 7.163 vs 7.530 (−4.9%, 7/7) | – | CI 24.272 vs 25.778 (−5.8%, 5/5) | – | 11.9 GB RSS | **Keep** |
 | N04 | Fused SSE2 line+field scanner | B | `45bdcbd` | CI gate PASS | CI 7.239 vs 7.610 (−4.9%, 7/7) | – | CI 24.865 vs 26.080 (−4.7%, 5/5) | – | 11.4 GB RSS | **Keep** |
+| N05 | Packed product/campaign lookup keys (`PMap`) | B | `83fe1be` | CI gate PASS | CI 6.808 vs 7.001 (−2.8%, 5/7) | – | CI 22.137 vs 24.086 (−8.1%, 5/5) | – | 11.4 GB RSS | **Keep** |
 
 ## Overnight loop (2026-11-21, CI x86 timing)
 
@@ -322,3 +323,15 @@ the mapping. Unit test `fused_matches_split`: 30,000 random dialect-noise chunks
 CI (`45bdcbd` = night-04 merged with BEST `4270e61`, vs `4270e61`; Xeon 8370C): gate PASS; **20M 7.610 → 7.239 s
 (−4.9%, 7/7)**; **60M 26.080 → 24.865 s (−4.7%, 5/5)**. Merged on top of night-01/02/03 (local checks green,
 20M Parquet equal). BEST → this merge (night-01 + 02 + 03 + 04).
+
+### Night-05: packed keys for product and campaign lookups: **KEEP**
+
+New `src/packed.rs`: `pack9` (moved from night-03) and `PMap<V>`, a table keyed by the packed u64 when an ID packs and
+by the exact byte string otherwise (two tables; a packable and an unpackable ID are never equal). `products` (one
+lookup per event in the scan) and `campaigns` (one per click) use it; first occurrence still wins. Unit tests:
+order/domain of `pack9`, exact `PMap` semantics (case, spaces, `\r`, long and non-ASCII keys, first wins), table
+spread of packed keys.
+
+CI (`83fe1be` = night-05 on BEST `ae88fb7`, vs `ae88fb7`; EPYC 9V45): gate PASS; **20M 7.001 → 6.808 s (−2.8%, 5/7)**;
+**60M 24.086 → 22.137 s (−8.1%, 5/5)**. Merged on top of night-01…04 (import conflict only; local checks green,
+20M Parquet equal). BEST → this merge (night-01…05).
