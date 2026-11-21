@@ -25,7 +25,7 @@ use std::hash::BuildHasher;
 use hashing::Seeded as RandomState;
 use rayon::prelude::*;
 
-use dialect::{Source, chunks, csv_files, data_region, for_each_line, header_order, split};
+use dialect::{Source, chunks, csv_files, data_region, for_each_line, for_each_record, header_order, split};
 use packed::{PMap, pack9};
 use timefmt::{BAD, DAY};
 
@@ -350,9 +350,10 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
         .map(|(order, chunk)| {
             let mut v = Vec::new();
             let (mut lines, mut bad, mut empty) = (0u64, 0u64, 0u64);
-            for_each_line(chunk, |line| {
+            // night-04: fused one-pass line + field scanner (same dialect as split)
+            for_each_record::<2>(chunk, |rec| {
                 lines += 1;
-                match split::<2>(line) {
+                match rec {
                     None => bad += 1,
                     Some(f) => {
                         let f = reorder(f, order);
@@ -541,9 +542,9 @@ fn clicks(
         .map(|(order, chunk)| {
             let mut parts: Vec<Vec<ClickRaw>> = (0..NB).map(|_| Vec::new()).collect();
             let (mut lines, mut bad, mut noid) = (0u64, 0u64, 0u64);
-            for_each_line(chunk, |line| {
+            for_each_record::<4>(chunk, |rec| {
                 lines += 1;
-                let Some(f) = split::<4>(line) else {
+                let Some(f) = rec else {
                     bad += 1;
                     return;
                 };
@@ -689,9 +690,9 @@ fn events(
             let mut parts: Vec<Vec<(u64, EvRaw)>> = (0..NB).map(|_| Vec::with_capacity(chunk.len() / 80 / NB + 8)).collect();
             let mut fb: Vec<Vec<(S, EvRaw)>> = (0..NB).map(|_| Vec::new()).collect();
             let (mut lines, mut bad, mut noid) = (0u64, 0u64, 0u64);
-            for_each_line(chunk, |line| {
+            for_each_record::<7>(chunk, |rec| {
                 lines += 1;
-                let Some(f) = split::<7>(line) else {
+                let Some(f) = rec else {
                     bad += 1;
                     return;
                 };
