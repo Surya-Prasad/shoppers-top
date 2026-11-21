@@ -234,6 +234,10 @@ fn main() {
         },
     );
     lap("links resolved + clicks/events scanned");
+    if std::env::var("SS_EXP2").is_ok() {
+        experiment2(ev_src, &products, ws, we);
+        return;
+    }
     if std::env::var("SS_EXP").is_ok() {
         experiment(ev_src, &products, ws, we, &names);
         return;
@@ -312,6 +316,32 @@ fn main() {
     // cheap self-check from rules.md: assists >= credited non-organic sessions
     assert!(stats.get(K::AssistPairs) >= stats.get(K::CreditedSessions), "assist invariant violated");
     lap("done");
+}
+
+/// SS_EXP2=1: single-thread cost of the v2 fast-path layers (profiling only).
+fn experiment2(src: &[&'static Source], products: &IdMap, lo: i64, hi: i64) {
+    const NAMES: [&str; 7] = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"];
+    let items = work_items::<7>(src, NAMES);
+    let mut lines = 0u64;
+    for (_, c) in &items {
+        for_each_line(c, |_| lines += 1);
+    }
+    let layer = |name: &str, f: &mut dyn FnMut(*const u8) -> Option<usize>| {
+        let t = Instant::now();
+        for (_, c) in &items {
+            fast::for_each_line_fast(c, &mut *f, |_| {});
+        }
+        eprintln!("{name:<28} {:>6.1} ns/line", t.elapsed().as_secs_f64() * 1e9 / lines as f64);
+    };
+    let mut acc = 0u64;
+    layer("fields only (cold)", &mut |p| unsafe { fast::fields::<7>(p) }.map(|(l, f)| { acc ^= f[3].0 as u64; l }));
+    layer("fields only", &mut |p| unsafe { fast::fields::<7>(p) }.map(|(l, f)| { acc ^= f[3].0 as u64; l }));
+    layer("event decode", &mut |p| unsafe { fast::event(p, lo, hi) }.map(|(l, e)| { acc ^= e.eid ^ e.ts as u64; l }));
+    layer("+ product lookup", &mut |p| unsafe { fast::event(p, lo, hi) }.map(|(l, e)| { acc ^= products.get_packed(packed::fmix(e.product), e.product).unwrap_or(0) as u64; l }));
+    let mut parts: Vec<Vec<EvRec>> = (0..NB).map(|_| Vec::with_capacity(lines as usize / NB + 1024)).collect();
+    layer("+ push (preallocated)", &mut |p| unsafe { fast::event(p, lo, hi) }.map(|(l, e)| {
+        parts[keys::part(e.eid, LOG_NB)].push(EvRec { eid: e.eid, rank: e.ingest as u64, person: e.user, ts: e.ts, price: e.price, cat: 0 }); l }));
+    eprintln!("acc {acc} {}", parts.iter().map(Vec::len).sum::<usize>());
 }
 
 /// SS_EXP=1: single-thread cost of each scan layer over all event files (profiling only).
@@ -1150,131 +1180,163 @@ fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u
     items
         .par_iter()
         .map(|(order, chunk)| {
-            let mut parts: Vec<Vec<EvRec>> = (0..NB).map(|_| Vec::with_capacity(chunk.len() / 60 / NB + 32)).collect(); // v2: event lines ~67 B
-            let (mut lines, mut bad, mut noid) = (0u64, 0u64, 0u64);
-            // RW15: (row, user key, user mix, product key or 0, product mix); person and
-            // product slots of a whole batch are prefetched before any lookup runs
-            // RW32: fixed-size batch (row with its user key in `person`, product key, mix)
-            const Z: EvRec = EvRec { eid: 0, rank: 0, person: 0, ts: 0, price: 0, cat: 0 };
-            let mut pend: [(EvRec, u64, u64); PBATCH] = [(Z, 0, 0); PBATCH];
-            let mut np = 0usize;
-            let mut put = |r: EvRec| {
-                parts[keys::part(r.eid, LOG_NB)].push(r);
-            };
-            let flush = |pend: &mut [(EvRec, u64, u64)], put: &mut dyn FnMut(EvRec)| {
-                for &(mut r, pk, pm) in pend.iter() {
-                    if pk != 0 {
-                        r.cat = products.get_packed(pm, pk).unwrap_or(unknown_cat);
-                    }
-                    put(r);
-                }
-            };
-            let mut exact = |rec: Option<[S; 7]>, pend: &mut [(EvRec, u64, u64); PBATCH], np: &mut usize, put: &mut dyn FnMut(EvRec)| {
-                lines += 1;
-                let Some(f) = rec else {
-                    bad += 1;
-                    return;
-                };
-                let f = reorder(f, order);
-                if f[0].is_empty() {
-                    noid += 1;
-                    return;
-                }
-                let eid = key_of(f[0]);
-                let ingest = parse_ingest(f[3]);
-                let mut r = EvRec { eid, rank: rank_of(ingest), person: keys::EMPTY, ts: 0, price: 0, cat: 0 };
-                // validation of this copy, in the order of rules.md (reason codes for stats)
-                let typ = match f[4] {
-                    b"view" => T_VIEW,
-                    b"cart" => T_CART,
-                    b"purchase" => T_PURCHASE,
-                    _ => T_BAD,
-                };
-                let ts = if f[1].is_empty() { BAD } else { timefmt::parse_in(f[2], lo, hi) };
-                if f[1].is_empty() {
-                    r.price = 0;
-                } else if ts == BAD {
-                    r.price = 1;
-                } else if typ == T_BAD {
-                    r.price = 2;
-                } else if f[5].is_empty() {
-                    r.price = 3;
-                } else {
-                    let price = if typ == T_PURCHASE { parse_price(f[6]) } else { 0 };
-                    if typ == T_PURCHASE && price == 0 {
-                        r.price = 4;
-                    } else {
-                        match ingest {
-                            Some(ing) if ing.saturating_sub(ts) <= DAY => {
-                                r.ts = ts;
-                                r.price = price;
-                                let (pk, pm) = match pack9(f[5]) {
-                                    Some(k) => {
-                                        let m = packed::fmix(k);
-                                        products.prefetch_packed(m);
-                                        (k, m)
-                                    }
-                                    None => {
-                                        r.cat = products.get(f[5]).unwrap_or(unknown_cat);
-                                        (0, 0)
-                                    }
-                                };
-                                r.person = key_of(f[1]);
-                                pend[*np] = (r, pk, pm);
-                                *np += 1;
-                                if *np == PBATCH {
-                                    flush(&mut pend[..], put);
-                                    *np = 0;
-                                }
-                                return;
-                            }
-                            _ => r.price = 5,
-                        }
-                    }
-                }
-                put(r); // invalid copy: person stays EMPTY
-            };
+            let mut sc = EvScan::new(chunk.len(), products, unknown_cat, lo, hi);
             if fast_ok && is_identity(order) {
                 // v2 P1: shape-specialized fast path; every line it declines takes `exact`
-                let lines_c = std::cell::Cell::new(0u64);
-                let st = std::cell::RefCell::new((&mut pend, &mut np, &mut put, &mut exact));
-                fast::for_each_line_fast(
-                    chunk,
-                    |p| {
-                        // SAFETY: for_each_line_fast guarantees SLACK readable bytes at p
-                        let (l, ev) = unsafe { fast::event(p, lo, hi) }?;
-                        lines_c.set(lines_c.get() + 1);
-                        let mut g = st.borrow_mut();
-                        let (pend, np, put, _) = &mut *g;
+                let len = chunk.len();
+                let base = chunk.as_ptr();
+                let mut s = 0usize;
+                while s + fast::SLACK <= len {
+                    // SAFETY: s + SLACK <= len, so the decoder reads inside the chunk
+                    if let Some((l, ev)) = unsafe { fast::event(base.add(s), lo, hi) } {
+                        sc.lines += 1;
                         let m = packed::fmix(ev.product);
                         products.prefetch_packed(m);
-                        let r = EvRec { eid: ev.eid, rank: rank_of(Some(ev.ingest)), person: ev.user, ts: ev.ts, price: ev.price, cat: 0 };
-                        pend[**np] = (r, ev.product, m);
-                        **np += 1;
-                        if **np == PBATCH {
-                            flush(&mut pend[..], &mut **put);
-                            **np = 0;
-                        }
-                        Some(l)
-                    },
-                    |line| {
-                        let mut g = st.borrow_mut();
-                        let (pend, np, put, exact) = &mut *g;
-                        exact(split::<7>(line), pend, np, &mut **put);
-                    },
-                );
-                lines += lines_c.get();
+                        sc.valid(EvRec { eid: ev.eid, rank: rank_of(Some(ev.ingest)), person: ev.user, ts: ev.ts, price: ev.price, cat: 0 }, ev.product, m);
+                        s += l + 1;
+                        continue;
+                    }
+                    let e = memchr::memchr(b'\n', &chunk[s..]).map_or(len, |i| s + i);
+                    sc.exact(split::<7>(&chunk[s..e]), order);
+                    s = e + 1;
+                }
+                while s < len {
+                    let e = memchr::memchr(b'\n', &chunk[s..]).map_or(len, |i| s + i);
+                    sc.exact(split::<7>(&chunk[s..e]), order);
+                    s = e + 1;
+                }
             } else {
-                for_each_record_bq::<7>(chunk, |rec| exact(rec, &mut pend, &mut np, &mut put));
+                for_each_record_bq::<7>(chunk, |rec| sc.exact(rec, order));
             }
-            flush(&mut pend[..np], &mut put);
-            drop(put);
-            stats.add(K::EvLines, lines);
-            stats.add(K::EvMalformed, bad);
-            stats.add(K::EvNoId, noid);
-            parts
+            sc.finish(stats)
         })
         .collect()
+}
+
+/// One chunk's events scan state: partitions by event_id, the product-lookup batch, counters.
+struct EvScan<'a> {
+    parts: Vec<Vec<EvRec>>,
+    // RW15/RW32: (row with its user key in `person`, product key or 0, product mix); the
+    // product slots of a whole batch are prefetched before any lookup runs
+    pend: [(EvRec, u64, u64); PBATCH],
+    np: usize,
+    products: &'a IdMap,
+    unknown_cat: u32,
+    lo: i64,
+    hi: i64,
+    lines: u64,
+    bad: u64,
+    noid: u64,
+}
+
+impl<'a> EvScan<'a> {
+    fn new(bytes: usize, products: &'a IdMap, unknown_cat: u32, lo: i64, hi: i64) -> Self {
+        const Z: EvRec = EvRec { eid: 0, rank: 0, person: 0, ts: 0, price: 0, cat: 0 };
+        EvScan {
+            parts: (0..NB).map(|_| Vec::with_capacity(bytes / 60 / NB + 32)).collect(), // v2: event lines ~67 B
+            pend: [(Z, 0, 0); PBATCH],
+            np: 0,
+            products,
+            unknown_cat,
+            lo,
+            hi,
+            lines: 0,
+            bad: 0,
+            noid: 0,
+        }
+    }
+    #[inline(always)]
+    fn put(&mut self, r: EvRec) {
+        self.parts[keys::part(r.eid, LOG_NB)].push(r);
+    }
+    #[inline(always)]
+    fn valid(&mut self, r: EvRec, pk: u64, pm: u64) {
+        self.pend[self.np] = (r, pk, pm);
+        self.np += 1;
+        if self.np == PBATCH {
+            self.flush();
+        }
+    }
+    #[inline]
+    fn flush(&mut self) {
+        for i in 0..self.np {
+            let (mut r, pk, pm) = self.pend[i];
+            if pk != 0 {
+                r.cat = self.products.get_packed(pm, pk).unwrap_or(self.unknown_cat);
+            }
+            self.put(r);
+        }
+        self.np = 0;
+    }
+    fn finish(mut self, stats: &Stats) -> Vec<Vec<EvRec>> {
+        self.flush();
+        stats.add(K::EvLines, self.lines);
+        stats.add(K::EvMalformed, self.bad);
+        stats.add(K::EvNoId, self.noid);
+        self.parts
+    }
+    /// The exact path for one line's fields (None = malformed).
+    fn exact(&mut self, rec: Option<[S; 7]>, order: &[usize; 7]) {
+        let (lo, hi) = (self.lo, self.hi);
+        self.lines += 1;
+        let Some(f) = rec else {
+            self.bad += 1;
+            return;
+        };
+        let f = reorder(f, order);
+        if f[0].is_empty() {
+            self.noid += 1;
+            return;
+        }
+        let eid = key_of(f[0]);
+        let ingest = parse_ingest(f[3]);
+        let mut r = EvRec { eid, rank: rank_of(ingest), person: keys::EMPTY, ts: 0, price: 0, cat: 0 };
+        // validation of this copy, in the order of rules.md (reason codes for stats)
+        let typ = match f[4] {
+            b"view" => T_VIEW,
+            b"cart" => T_CART,
+            b"purchase" => T_PURCHASE,
+            _ => T_BAD,
+        };
+        let ts = if f[1].is_empty() { BAD } else { timefmt::parse_in(f[2], lo, hi) };
+        if f[1].is_empty() {
+            r.price = 0;
+        } else if ts == BAD {
+            r.price = 1;
+        } else if typ == T_BAD {
+            r.price = 2;
+        } else if f[5].is_empty() {
+            r.price = 3;
+        } else {
+            let price = if typ == T_PURCHASE { parse_price(f[6]) } else { 0 };
+            if typ == T_PURCHASE && price == 0 {
+                r.price = 4;
+            } else {
+                match ingest {
+                    Some(ing) if ing.saturating_sub(ts) <= DAY => {
+                        r.ts = ts;
+                        r.price = price;
+                        let (pk, pm) = match pack9(f[5]) {
+                            Some(k) => {
+                                let m = packed::fmix(k);
+                                self.products.prefetch_packed(m);
+                                (k, m)
+                            }
+                            None => {
+                                r.cat = self.products.get(f[5]).unwrap_or(self.unknown_cat);
+                                (0, 0)
+                            }
+                        };
+                        r.person = key_of(f[1]);
+                        self.valid(r, pk, pm);
+                        return;
+                    }
+                    _ => r.price = 5,
+                }
+            }
+        }
+        self.put(r); // invalid copy: person stays EMPTY
+    }
 }
 
 /// v2: the fast paths are on unless SS_NOFAST is set (A/B and debugging only).
