@@ -53,8 +53,48 @@ pub type MixedMap<V> = HashMap<u64, V, Mixed>;
 
 type S = &'static [u8];
 
-#[inline]
+/// RW20: SWAR packing. The first 8 bytes are byte-swapped (first character highest) and
+/// their eight 7-bit lanes compacted with three mask-and-shift steps; a 9th character goes
+/// in the low 7 bits. Every real byte must be in 1..=127 (exact lane masks). Same results
+/// as `pack9_ref` (tested).
+#[inline(always)]
 pub fn pack9(s: &[u8]) -> Option<u64> {
+    let n = s.len();
+    if n > 9 {
+        return None;
+    }
+    let w = if n >= 8 {
+        u64::from_le_bytes(s[..8].try_into().unwrap())
+    } else {
+        let mut b = [0u8; 8];
+        b[..n].copy_from_slice(s);
+        u64::from_le_bytes(b)
+    };
+    let lanes: u64 = if n >= 8 { !0 } else { (1u64 << (8 * n)) - 1 } & 0x8080_8080_8080_8080;
+    const LO7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    let nonzero = ((w & LO7).wrapping_add(LO7) | w) & 0x8080_8080_8080_8080;
+    // every real lane: no high bit, and non-zero
+    if w & lanes != 0 || nonzero & lanes != lanes {
+        return None;
+    }
+    let mut x = w.swap_bytes() & LO7;
+    x = (x & 0x007f_007f_007f_007f) | ((x & 0x7f00_7f00_7f00_7f00) >> 1);
+    x = (x & 0x0000_3fff_0000_3fff) | ((x & 0x3fff_0000_3fff_0000) >> 2);
+    x = (x & 0x0000_0000_0fff_ffff) | ((x & 0x0fff_ffff_0000_0000) >> 4);
+    let mut v = x << 7;
+    if n == 9 {
+        let c = s[8];
+        if c == 0 || c > 127 {
+            return None;
+        }
+        v |= c as u64;
+    }
+    Some(v)
+}
+
+/// The original byte-at-a-time packing (reference for tests).
+#[cfg(test)]
+pub fn pack9_ref(s: &[u8]) -> Option<u64> {
     if s.len() > 9 {
         return None;
     }
@@ -186,6 +226,23 @@ mod tests {
         *x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         *x >> 33
     }
+    /// RW20: the SWAR pack9 equals the reference on random bytes and lengths 0..=12.
+    #[test]
+    fn swar_matches_ref() {
+        let mut x = 9u64;
+        let alpha: [u8; 12] = [0, 1, b'0', b'a', b'z', b'Z', b' ', b'\r', 0x7e, 0x7f, 0x80, 0xff];
+        for _ in 0..500_000 {
+            let len = (lcg(&mut x) % 13) as usize;
+            let v: Vec<u8> = (0..len)
+                .map(|_| if lcg(&mut x) % 3 == 0 { alpha[(lcg(&mut x) as usize) % 12] } else { (lcg(&mut x) % 256) as u8 })
+                .collect();
+            assert_eq!(pack9(&v), pack9_ref(&v), "{v:?}");
+        }
+        for s in [&b""[..], b"a", b"abcdefgh", b"abcdefghi", b"abcdefghij", b"\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f", b"\x01"] {
+            assert_eq!(pack9(s), pack9_ref(s), "{s:?}");
+        }
+    }
+
     /// pack9 is injective and order-preserving on its domain and rejects the rest.
     #[test]
     fn order_and_domain() {
