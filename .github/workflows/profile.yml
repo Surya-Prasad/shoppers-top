@@ -2,6 +2,8 @@
 # to the bench-results branch as profiles/<sha>.txt. Never touches main; submits nothing.
 name: profile
 on:
+  push:
+    branches: ['profile/**']
   workflow_dispatch:
     inputs:
       events:
@@ -31,11 +33,11 @@ jobs:
           B=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
           (cd $W && curl -fsSL -o gen.zip $B/generator.zip && unzip -qo gen.zip -d gen)
           GD=$(dirname "$(find $W/gen -name Cargo.toml | head -1)"); (cd $GD && cargo build --release -q)
-          $GD/target/release/generate --seed 11 --events ${{ github.event.inputs.events }} --clicks $(( ${{ github.event.inputs.events }} / 4 )) --output $W/d >/dev/null
+          $GD/target/release/generate --seed 11 --events ${{ github.event.inputs.events || '20000000' }} --clicks $(( ${{ github.event.inputs.events || '20000000' }} / 4 )) --output $W/d >/dev/null
           BIN=target/release/shopping-sessions
           DATA_DIR=$W/d OUTPUT_DIR=$W/o0 NCPU=$(nproc) $BIN 2>/dev/null   # warm the page cache
           OUT=$RUNNER_TEMP/profile.txt
-          { echo "# x86 profile of $(git rev-parse --short HEAD) ($(lscpu | sed -n 's/^Model name: *//p') x $(nproc)), ${{ github.event.inputs.events }} events"
+          { echo "# x86 profile of $(git rev-parse --short HEAD) ($(lscpu | sed -n 's/^Model name: *//p') x $(nproc)), ${{ github.event.inputs.events || '20000000' }} events"
             echo; echo '## stage timings'; DATA_DIR=$W/d OUTPUT_DIR=$W/o1 NCPU=$(nproc) $BIN 2>&1 | grep -E '^\[|^    '
             echo; echo '## perf stat'; DATA_DIR=$W/d OUTPUT_DIR=$W/o2 NCPU=$(nproc) $PERF stat -e task-clock,cycles,instructions,branches,branch-misses,cache-misses,page-faults $BIN 2>&1 >/dev/null | grep -vE '^\[|^    |^ *$|stats|"' | tail -15
           } > $OUT 2>&1 || true
