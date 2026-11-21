@@ -44,7 +44,7 @@ pub fn new_map<K, V>(cap: usize) -> Map<K, V> {
 }
 
 const NB: usize = 256; // number of hash partitions (power of two); night-11: 512 -> 256 (A3 retried after the packed keys shrank every table)
-const CHUNK: usize = 4 << 20; // scan granule, bytes
+const CHUNK: usize = 16 << 20; // scan granule, bytes; night-17: 4 -> 16 MiB (fewer, larger work items)
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 30 * 60 * 1000;
 pub const ORGANIC: u32 = u32::MAX;
