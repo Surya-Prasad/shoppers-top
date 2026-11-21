@@ -263,6 +263,8 @@ work at open time, which is what we see. On a real disk the result may differ.
 | N07 | Clicks parsed at scan + packed click_id | B | `2d683c6` | CI gate PASS | CI 6.550 vs 6.706 (−2.3%, 7/7) | – | CI 22.246 vs 22.948 (−3.1%, 5/5) | – | 11.4 GB RSS | **Keep** |
 | N09 | Dedup table of row indices | B | not pushed | local only | local 20M dedup 0.774 vs 0.738 s | – | – | – | – | **Revert** (no local gain) |
 | N08 | SWAR F1/F2 timestamp parse | B | `48a91c9` | CI gate PASS | CI 5.052 vs 5.136 (−1.6%, 5/7) | – | CI 16.854 vs 16.888 (−0.2%, 3/5) | – | 11.4 GB RSS | **Revert** (below −2%) |
+| N10 | Packed person key carried with rows | B | `70531fc` | CI gate PASS | CI 3.360 vs 4.401 (**−23.6%**, 7/7) | – | CI 11.433 vs 15.276 (**−25.2%**, 5/5) | – | 12.1 GB RSS | **Keep** |
+| N13 | Flat open-addressing name table | B | not pushed | local only | local 20M scan 2.40 vs 2.18 s | – | – | – | – | **Revert** (slower) |
 
 ## Overnight loop (2026-11-21, CI x86 timing)
 
@@ -374,3 +376,19 @@ every form, every calendar day 2024–2029, leap-day edges) passed. Microbenchma
 CI (`48a91c9` vs `42fa641`; Xeon 6975P-C): gate PASS; 20M 5.136 → 5.052 s (**−1.6%**, 5/7); 60M 16.888 → 16.854 s
 (−0.2%, 3/5). Below the −2% bar: **revert** (branch `opt/night-08-swar-ts` kept). A candidate to combine with
 another parse-side change later.
+
+### Night-10: packed person key carried with every event and click: **KEEP**
+
+`Person { name, key }`: the person's name plus its packed form (`NOPK` if it doesn't pack), computed once where
+the name is at hand (the `Names` table stores `Person` values; an unlinked user packs its own, hot, ID). Events and
+clicks carry it, so the post-dedup repartition (`person_part`) and `sessionize`'s person numbering (`Map<u64, u32>`,
+exact byte-string table for unpackable names) no longer read name bytes, which were random reads into the input
+mappings. Name bytes are read only for output.
+
+CI (`70531fc` vs `68c57c0`; EPYC 9V45): gate PASS; **20M 4.401 → 3.360 s (−23.6%, 7/7)**; **60M 15.276 → 11.433 s
+(−25.2%, 5/5)**; RSS 60M 11.37 → 12.13 GB (records grew by 8 B). BEST → this merge (night-01…07 + 10).
+60M phase log: links 0.84, clicks 1.41, events 7.14, sessions 1.35, output 0.42 s.
+
+Screened out locally, not pushed: *night-13 flat open-addressing name table* (one segment per link partition,
+32-byte entries at load ≤ 1/2): 20M scan 2.18 → 2.40 s, slower (the table is larger than hashbrown's, so more misses).
+*glibc `malloc.hugetlb=1`* (env only, as a probe): no change in faults or time.
