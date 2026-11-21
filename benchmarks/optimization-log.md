@@ -270,6 +270,7 @@ work at open time, which is what we see. On a real disk the result may differ.
 | N15 | Re-test of N08 (SWAR timestamps) on the faster base | B | `36c4091` | CI gate PASS | CI 4.963 vs 5.208 (−4.7%, 7/7) | – | CI 17.510 vs 18.027 (−2.9%, 4/5) | – | 12.3 GB RSS | **Keep** |
 | N16 | Links naming/name map on packed keys | B | `320fbae` | CI gate PASS | CI 4.917 vs 4.968 (−1.0%, 5/7) | – | CI 18.594 vs 17.953 (**+3.6%**, 2/5) | – | 12.3 GB RSS | **Revert** |
 | N18 | Fast exit (forget tables, exit(0)) | A | not pushed | local only | no change | – | – | – | – | **Revert** (no gain) |
+| N17 | CHUNK 4 → 16 MiB | A | `341ae34` | CI gate PASS | CI 4.505 vs 4.551 (−1.0%, 3/7) | – | CI 17.143 vs 16.723 (**+2.5%**, 0/5) | – | 12.1 GB RSS | **Revert** |
 
 ## Overnight loop (2026-11-21, CI x86 timing)
 
@@ -443,3 +444,8 @@ CI (`320fbae` vs `fee825f`; EPYC 7763): gate PASS; 20M 4.968 → 4.917 s (−1.0
 
 Screened out locally, not pushed: *night-18 fast exit* (`mem::forget` of the partitioned tables + `process::exit(0)`
 after the outputs are renamed): exit-to-wall time unchanged (about 0.15 s, which is kernel teardown).
+
+### Night-17: `CHUNK` 4 → 16 MiB: **REVERT**
+
+CI (`341ae34` vs `7809b52`; Xeon 6973P-C): gate PASS; 20M 4.551 → 4.505 s (−1.0%, 3/7); **60M 16.723 → 17.143 s
+(+2.5%, 0/5)**. Fewer, larger work items hurt at 60M (worse tail balance over 4 threads). Revert; `CHUNK` stays 4 MiB.
