@@ -430,36 +430,41 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
         })
         .collect();
     // per partition: intern -> (distinct ids, (slot, local index) pairs)
-    let interned: Vec<(Vec<S>, Vec<(u32, u32)>)> = (0..LP)
+    // night-16: each distinct ID also keeps its packed key (NOPK if it does not pack)
+    let interned: Vec<(Vec<S>, Vec<u64>, Vec<(u32, u32)>)> = (0..LP)
         .into_par_iter()
         .map(|p| {
             let n: usize = scattered.iter().map(|v| v[p].len()).sum();
             let mut m: PMap<u32> = PMap::with_capacity(n);
             let mut ids: Vec<S> = Vec::with_capacity(n);
+            let mut keys: Vec<u64> = Vec::with_capacity(n);
             let mut slots: Vec<(u32, u32)> = Vec::with_capacity(n);
             for v in &scattered {
                 for &(s, slot) in &v[p] {
                     let l = *m.get_or_insert_with(s, || {
                         ids.push(s);
+                        keys.push(pack9(s).unwrap_or(NOPK));
                         (ids.len() - 1) as u32
                     });
                     slots.push((slot, l));
                 }
             }
-            (ids, slots)
+            (ids, keys, slots)
         })
         .collect();
     drop(scattered);
     let mut poff = Vec::with_capacity(LP + 1);
     poff.push(0usize);
-    for (ids, _) in &interned {
+    for (ids, _, _) in &interned {
         poff.push(poff.last().unwrap() + ids.len());
     }
     let n = poff[LP];
     let mut side = vec![0u32; 2 * n_edges];
     let mut ids: Vec<S> = Vec::with_capacity(n);
-    for (p, (pids, slots)) in interned.iter().enumerate() {
+    let mut keys: Vec<u64> = Vec::with_capacity(n);
+    for (p, (pids, pkeys, slots)) in interned.iter().enumerate() {
         ids.extend_from_slice(pids);
+        keys.extend_from_slice(pkeys);
         let o = poff[p] as u32;
         for &(slot, l) in slots {
             side[slot as usize] = o + l;
@@ -489,10 +494,16 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
     st.mark("links: union");
     let mut name: Vec<u32> = (0..n as u32).collect(); // per root: index of the smallest member
     let mut root = vec![0u32; n];
+    // byte-wise order of IDs i and j: packed keys preserve it, so compare those when
+    // both IDs pack and fall back to the bytes otherwise
+    let less = |i: usize, j: usize| -> bool {
+        let (a, b) = (keys[i], keys[j]);
+        if a != NOPK && b != NOPK { a < b } else { ids[i] < ids[j] }
+    };
     for i in 0..n {
         let r = find(&mut parent, i as u32);
         root[i] = r;
-        if ids[i] < ids[name[r as usize] as usize] {
+        if less(i, name[r as usize] as usize) {
             name[r as usize] = i as u32;
         }
     }
@@ -513,9 +524,15 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
         .map(|p| {
             let mut m: PMap<Person> = PMap::with_capacity(poff[p + 1] - poff[p]);
             for i in poff[p]..poff[p + 1] {
-                let nm = ids[name[root[i] as usize] as usize];
-                if nm != ids[i] {
-                    m.insert_first(ids[i], Person::new(nm));
+                // IDs are distinct, so "name differs" is "name index differs"
+                let ni = name[root[i] as usize] as usize;
+                if ni != i {
+                    let per = Person { name: ids[ni], key: keys[ni] };
+                    if keys[i] != NOPK {
+                        m.insert_first_packed(keys[i], per);
+                    } else {
+                        m.insert_first(ids[i], per);
+                    }
                 }
             }
             m

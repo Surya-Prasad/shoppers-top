@@ -115,6 +115,11 @@ impl<V> PMap<V> {
             None => self.other.entry(s).or_insert_with(f),
         }
     }
+    /// Insert under an ID's packed key `k = pack9(id)` (first occurrence wins).
+    #[inline]
+    pub fn insert_first_packed(&mut self, k: u64, v: V) {
+        self.packed.entry(fmix(k)).or_insert(v);
+    }
     /// Insert unless the key is present (first occurrence wins).
     pub fn insert_first(&mut self, s: S, v: V) {
         match pack9(s) {
