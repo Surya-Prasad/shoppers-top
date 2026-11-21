@@ -9,7 +9,7 @@ name: bench
 on:
   push:
     branches: ['opt/**']
-    paths: ['src/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/bench.yml', 'benchmarks/ci_ab.sh', 'benchmarks/ab_summary.py']
+    paths: ['src/**', '.cargo/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/bench.yml', 'benchmarks/ci_ab.sh', 'benchmarks/ab_summary.py']
   workflow_dispatch:
     inputs:
       base:
