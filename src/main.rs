@@ -26,7 +26,7 @@ use hashing::Seeded as RandomState;
 use rayon::prelude::*;
 
 use dialect::{Source, chunks, csv_files, data_region, for_each_line, header_order, split};
-use packed::PMap;
+use packed::{PMap, pack9};
 use timefmt::{BAD, DAY};
 
 pub type Map<K, V> = std::collections::HashMap<K, V, RandomState>;
@@ -623,24 +623,7 @@ const T_CART: u8 = 1;
 const T_PURCHASE: u8 = 2;
 const T_BAD: u8 = 3;
 
-/// Night-03: an ID of at most 9 bytes, each in 1..=127, packed left-aligned at 7 bits
-/// per byte. Integer order equals byte-wise order (a shorter prefix pads with 0, which
-/// sorts before every allowed byte), and packing is injective. Anything else is None
-/// and goes through an exact byte-string path.
-#[inline]
-pub fn pack9(s: &[u8]) -> Option<u64> {
-    if s.len() > 9 {
-        return None;
-    }
-    let mut v = 0u64;
-    let mut ok = true;
-    for (i, &c) in s.iter().enumerate() {
-        ok &= c.wrapping_sub(1) < 127;
-        v |= ((c & 0x7f) as u64) << (56 - 7 * i);
-    }
-    ok.then_some(v)
-}
-
+// Night-03/05: `pack9` (packed IDs) lives in `packed.rs`.
 #[derive(Clone, Copy)]
 struct EvRaw {
     person: S,      // empty if user_id was empty
@@ -1022,37 +1005,9 @@ mod layout {
 }
 
 #[cfg(test)]
-mod packed {
+mod packed_keys {
     use super::*;
-    fn lcg(x: &mut u64) -> u64 {
-        *x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        *x >> 33
-    }
-    /// Night-03: pack9 is injective and order-preserving on its domain, and rejects
-    /// everything outside it (long, NUL, non-ASCII).
-    #[test]
-    fn order_and_domain() {
-        let mut x = 1u64;
-        let alpha: &[u8] = b"\x01 !\"09AZaz_~\x7f";
-        let mut v: Vec<Vec<u8>> = vec![vec![]];
-        for _ in 0..20_000 {
-            let len = (lcg(&mut x) % 10) as usize;
-            let s: Vec<u8> = (0..len).map(|_| alpha[(lcg(&mut x) as usize) % alpha.len()]).collect();
-            v.push(s);
-        }
-        for w in v.windows(2) {
-            let (a, b) = (&w[0], &w[1]);
-            let (pa, pb) = (pack9(a).unwrap(), pack9(b).unwrap());
-            assert_eq!(pa.cmp(&pb), a.cmp(b), "{a:?} {b:?}");
-        }
-        assert_eq!(pack9(b"a"), Some(0x61u64 << 56));
-        assert!(pack9(b"a").unwrap() < pack9(b"a\x01").unwrap());
-        assert_eq!(pack9(b"abcdefghi").map(|p| p >> 63), Some(0));
-        assert_eq!(pack9(b"abcdefghij"), None);
-        assert_eq!(pack9(b"a\0"), None);
-        assert_eq!(pack9(b"a\x80"), None);
-        assert_eq!(pack9("é".as_bytes()), None);
-    }
+    // pack9 order/domain tests: packed.rs
     /// Night-03: partition bits spread for packed IDs.
     #[test]
     fn packed_partition_spread() {
