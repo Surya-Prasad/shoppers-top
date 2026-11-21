@@ -19,9 +19,10 @@ use crate::{Map, NO_CAT, ORGANIC};
 
 type S = &'static [u8];
 
-/// One row of user_daily. Key: (user_id, day).
+/// One row of user_daily. Key: (user_id, day). RW1: `user` is the person's u64 key;
+/// the name is decoded from it only when writing.
 pub struct UserRow {
-    pub user: S,
+    pub user: u64,
     pub day: i32,
     pub sessions: u64,
     pub events: u64,
@@ -32,7 +33,7 @@ pub struct UserRow {
 impl UserRow {
     /// `cat_rev` holds summed purchase price per category index; the top category is
     /// the highest sum, ties to the smallest index (= byte-wise smallest name).
-    pub fn new(user: S, day: i32, sessions: u64, events: u64, revenue: u64, cat_rev: &[(u32, u64)]) -> UserRow {
+    pub fn new(user: u64, day: i32, sessions: u64, events: u64, revenue: u64, cat_rev: &[(u32, u64)]) -> UserRow {
         let mut top = NO_CAT;
         let mut best = 0u64;
         for &(c, r) in cat_rev {
@@ -99,7 +100,8 @@ fn user_batch(rows: &[&UserRow], cats: &[S]) -> RecordBatch {
     let mut r = Int64Builder::with_capacity(n);
     let mut t = StringBuilder::with_capacity(n, n * 8);
     for row in rows {
-        u.append_value(utf8(row.user));
+        let mut buf = [0u8; 9];
+        u.append_value(utf8(crate::keys::bytes_of(row.user, &mut buf)));
         d.append_value(row.day);
         s.append_value(row.sessions as i64);
         e.append_value(row.events as i64);
