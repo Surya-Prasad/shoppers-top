@@ -322,18 +322,16 @@ const LINK_SEED: u64 = 0x1319_8A2E_0370_7344;
 
 /// Person names of linked IDs, split into `LP` hash partitions so the tables are built
 /// in parallel. Holds only the IDs whose person name differs from the ID itself.
+/// Night-06: tables keyed by packed IDs (`PMap`), partitioned by `packed::id_hash`.
 pub struct Names {
     state: RandomState,
-    parts: Vec<Map<S, S>>,
+    parts: Vec<PMap<S>>,
 }
 impl Names {
     #[inline]
-    fn part(&self, s: S) -> usize {
-        (self.state.hash_one(s) >> 40) as usize & (LP - 1)
-    }
-    #[inline]
     pub fn get(&self, s: S) -> Option<&S> {
-        self.parts[self.part(s)].get(s)
+        let p = (packed::id_hash(&self.state, s) >> 40) as usize & (LP - 1);
+        self.parts[p].get(s)
     }
 }
 
@@ -344,8 +342,8 @@ impl Names {
 fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
     let mut st = Stage::start();
     let lstate = RandomState(LINK_SEED);
-    let names_of = |parts: Vec<Map<S, S>>| Names { state: lstate, parts };
-    let part = |s: S| (lstate.hash_one(s) >> 40) as usize & (LP - 1);
+    let names_of = |parts: Vec<PMap<S>>| Names { state: lstate, parts };
+    let part = |s: S| (packed::id_hash(&lstate, s) >> 40) as usize & (LP - 1);
     let items = work_items::<2>(src, ["user_id_a", "user_id_b"]);
     let edges: Vec<Vec<(S, S)>> = items
         .par_iter()
@@ -401,12 +399,12 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
         .into_par_iter()
         .map(|p| {
             let n: usize = scattered.iter().map(|v| v[p].len()).sum();
-            let mut m: Map<S, u32> = new_map(n);
+            let mut m: PMap<u32> = PMap::with_capacity(n);
             let mut ids: Vec<S> = Vec::with_capacity(n);
             let mut slots: Vec<(u32, u32)> = Vec::with_capacity(n);
             for v in &scattered {
                 for &(s, slot) in &v[p] {
-                    let l = *m.entry(s).or_insert_with(|| {
+                    let l = *m.get_or_insert_with(s, || {
                         ids.push(s);
                         (ids.len() - 1) as u32
                     });
@@ -475,14 +473,14 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
     }
     st.mark("links: names");
     // name map, one table per partition (global ids of partition p are poff[p]..poff[p+1])
-    let parts: Vec<Map<S, S>> = (0..LP)
+    let parts: Vec<PMap<S>> = (0..LP)
         .into_par_iter()
         .map(|p| {
-            let mut m: Map<S, S> = new_map(poff[p + 1] - poff[p]);
+            let mut m: PMap<S> = PMap::with_capacity(poff[p + 1] - poff[p]);
             for i in poff[p]..poff[p + 1] {
                 let nm = ids[name[root[i] as usize] as usize];
                 if nm != ids[i] {
-                    m.insert(ids[i], nm);
+                    m.insert_first(ids[i], nm);
                 }
             }
             m
@@ -1031,7 +1029,7 @@ mod link_parts {
         let st = super::RandomState(super::LINK_SEED);
         let mut b = [0u32; super::LP];
         for i in 0..640_000u32 {
-            b[(st.hash_one(format!("u{i}").as_bytes()) >> 40) as usize & (super::LP - 1)] += 1;
+            b[(crate::packed::id_hash(&st, format!("u{i}").as_bytes()) >> 40) as usize & (super::LP - 1)] += 1;
         }
         let (mn, mx) = (*b.iter().min().unwrap(), *b.iter().max().unwrap());
         assert!(mn > 9_500 && mx < 10_500, "{mn} {mx}");
