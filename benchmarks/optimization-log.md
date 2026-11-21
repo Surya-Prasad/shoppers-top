@@ -481,3 +481,33 @@ Each step is on its own branch, stacked; CI compares each against the step befor
 
 Every step: unit tests, 36 fixtures, dev answer MATCH, 800–1,200 fuzz cases (strict + adversarial) with 0
 failures, and output identical to the previous step at 20M. x86 CI numbers are added below as they land.
+
+### Rewrite track: x86 CI results (each step vs the step before, GitHub 4-vCPU runners)
+
+| Step | Change | 20M Δ (wins) | 60M Δ (wins) | Decision |
+|---|---|---:|---:|---|
+| RW1+2 | u64 keys, compact records, prefetched person lookups | −15.7% (7/7), −21.3% (7/7) | −31.4% (5/5), −35.1% (5/5) | keep |
+| RW3 | prefetched dedup probes | +0.3% (3/7) | −2.1% (4/5) | keep (neutral) |
+| RW4 | structural-index scanner | **+9.5%** (0/7) | **+8.9%** (0/5) | revert (RW9) |
+| RW5+6 | direct dedup output; bucketed sessions sort | −3.2% (7/7) | −0.7% (2/5) | keep |
+| RW7 | link naming by keys | −3.7% (7/7) | −3.4% (5/5) | keep |
+| RW8 | huge-page allocator | +0.1% (3/7) | −2.6% (2/5) | unregistered in RW11 (no gain, unsafe) |
+| RW9 | restore night-04 scanner | −6.3% (7/7) | −8.3% (5/5) | keep |
+| RW10 | two-stage index scanner, quotes in fast path | −10.8% (7/7) | −9.7% (5/5) | keep |
+| RW11 | flat KeyMap product/campaign lookups | +2.1% (2/7) | +1.0% (1/5) | kept for RW15 (prefetch needs it) |
+| RW13 | cache-sized two-level dedup | −4.4% (7/7) | **−11.9%** (5/5) | keep |
+| RW14 | SWAR 13-digit F3 + month table | −1.5% (7/7) | −2.2% (5/5) | keep |
+| RW15 | products in the prefetched batch | +0.3% (4/7) | −6.5% (5/5) | keep |
+| RW16 | branch-free quote rule (Mac −40% scanner) | +3.4% (1/7) on EPYC 7763 | +3.7% (0/5) | **rerun pending** |
+| RW17 | assists in an L2-sized u32 array | −0.2% (4/7) | −1.0% (3/5) | keep (neutral) |
+| RW18 | parallel link roots/names | +0.7% (3/7) | −2.4% (4/5) | keep |
+| RW19 | parallel link side fill | +0.7% (2/7) | +3.8% (1/5) | revert (in RW20) |
+| RW20 | SWAR pack9 | pending | pending | |
+
+**Direct measurement, RW16 tip vs `7809b52` (scored 3.05 s), same EPYC 9V74 runner, gate PASS:**
+20M 4.036 → **2.701 s (−33.1%)**, 60M 15.365 → **8.679 s (−43.5%)**, 7/7 and 5/5. The tip builds and tests
+with Rust 1.95 (the Dockerfile's toolchain), and the Linux x86-64 target type-checks.
+
+**x86 perf profile (RW19 tip, 20M, EPYC 9V45 × 4):** events scan ~31%, sessions ~13%, events dedup 11%,
+clicks ~9%, `timefmt::parse` 8% (outlined), page faults ~4%, `fmix` 4.2%, `pack9` 3.4% (outlined, hence RW20).
+The VM hides hardware counters, so this is sample-based only.
