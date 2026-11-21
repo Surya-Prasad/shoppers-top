@@ -267,6 +267,7 @@ work at open time, which is what we see. On a real disk the result may differ.
 | N13 | Flat open-addressing name table | B | not pushed | local only | local 20M scan 2.40 vs 2.18 s | – | – | – | – | **Revert** (slower) |
 | N11 | NB 512 → 256 | A | `ca17f21` | CI gate PASS | CI 6.365 vs 6.561 (−3.0%, 6/7) | – | CI 22.402 vs 23.129 (−3.1%, 4/5) | – | 11.4 GB RSS | **Keep** |
 | N14 | Single-pack person lookup, fmix-keyed tables | B | `a649871` | CI gate PASS | CI 4.550 vs 4.706 (−3.3%, 6/7) | – | CI 14.415 vs 15.090 (−4.5%, 5/5) | – | 12.2 GB RSS | **Keep** |
+| N15 | Re-test of N08 (SWAR timestamps) on the faster base | B | `36c4091` | CI gate PASS | CI 4.963 vs 5.208 (−4.7%, 7/7) | – | CI 17.510 vs 18.027 (−2.9%, 4/5) | – | 12.3 GB RSS | **Keep** |
 
 ## Overnight loop (2026-11-21, CI x86 timing)
 
@@ -417,3 +418,13 @@ partition bits, low bits and hashbrown's top-7 tag bits.
 CI (`a649871` vs `a768775`, before night-11 was merged; Xeon 6973P-C): gate PASS; **20M 4.706 → 4.550 s (−3.3%, 6/7)**;
 **60M 15.090 → 14.415 s (−4.5%, 5/5)**. Merged on top of night-11 (local checks green, 20M Parquet equal).
 BEST → this merge (night-01…07, 10, 11, 14).
+
+### Night-15: SWAR F1/F2 timestamps, re-test of night-08 on the night-10/11 base: **KEEP**
+
+Same code as night-08 (reverted at −1.6% on the night-07 base). Re-tested because the base had become about 30%
+faster, so the unchanged absolute saving from timestamp parsing is a larger share of the run (scan ablation on the
+new base: timestamps ≈ 20% of the event scan). Flagged as a re-test, not a fresh idea.
+
+CI (`36c4091` vs `25d725a`; Xeon 8573C): gate PASS; **20M 5.208 → 4.963 s (−4.7%, 7/7)**; **60M 18.027 → 17.510 s
+(−2.9%, 4/5)**. Merged on top of night-14 (timefmt only; local checks green, 20M Parquet equal).
+BEST → this merge (night-01…07, 10, 11, 14, 15).
