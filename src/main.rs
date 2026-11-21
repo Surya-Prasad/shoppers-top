@@ -43,7 +43,7 @@ pub fn new_map<K, V>(cap: usize) -> Map<K, V> {
     Map::with_capacity_and_hasher(cap, table_state())
 }
 
-const NB: usize = 256; // number of hash partitions (power of two); night-11: 512 -> 256 (A3 retried after the packed keys shrank every table)
+const NB: usize = 128; // number of hash partitions (power of two); night-11: 512 -> 256, night-19: 256 -> 128
 const CHUNK: usize = 4 << 20; // scan granule, bytes
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 30 * 60 * 1000;
