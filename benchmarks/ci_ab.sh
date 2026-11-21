@@ -43,12 +43,15 @@ BA=$(build "$BASE"); BB=$(build "$CAND")
 "$GEN" --seed 1 --events 1000000 --clicks 250000 --output "$W/d1" >/dev/null
 "$GEN" --seed 11 --events "$EV20" --clicks $((EV20 / 4)) --output "$W/d20" >/dev/null
 "$GEN" --seed 11 --events "$EV60" --clicks $((EV60 / 4)) --output "$W/d60" >/dev/null
-log "data ready: $(du -sh "$W/d20" | cut -f1) / $(du -sh "$W/d60" | cut -f1); free disk $(df -h "$W" | awk 'NR==2{print $4}')"
+log "data ready: $(du -sh "$W/d20" | cut -f1) / $(du -sh "$W/d60" | cut -f1); free disk $(df -Ph "$W" | awk 'NR==2{print $4}')"
 
 run() { # bin data out -> prints "wall maxrss_kb rc"
   rm -rf "$3"
-  /usr/bin/time -f '%e %M' -o "$W/time.txt" env DATA_DIR="$2" OUTPUT_DIR="$3" NCPU="$NPROC" "$1" >/dev/null 2>"$3.log" && rc=0 || rc=$?
-  echo "$(cat "$W/time.txt" | tail -1) $rc"
+  local t0 t1; t0=$(date +%s%N)
+  /usr/bin/time -f '%M' -o "$W/time.txt" env DATA_DIR="$2" OUTPUT_DIR="$3" NCPU="$NPROC" "$1" >/dev/null 2>"$3.log" && rc=0 || rc=$?
+  t1=$(date +%s%N)
+  # wall in seconds with ns resolution (time(1) only gives 10 ms); max RSS (KB) from time(1)
+  echo "$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.4f", (b-a)/1e9}') $(tail -1 "$W/time.txt") $rc"
 }
 
 # ---- correctness gate ----
