@@ -201,37 +201,45 @@ fn main() {
     lap("events");
 
     // ---------------------------------------------------------------- sessions
+    // Night-01: campaign/day accumulators are a dense array per rayon fold (campaign
+    // index, ORGANIC last; day offset from the first window day) instead of a hash map.
     let ncamp = camp_ids.len();
-    let timed: Vec<((Vec<output::UserRow>, Map<(u32, i32), [u64; 4]>), (f64, usize, usize))> = (0..NB)
+    let day0 = ws.div_euclid(DAY) as i32;
+    let ndays = ((we - 1).div_euclid(DAY) as i32 - day0 + 1).max(1) as usize;
+    let dense_len = (ncamp + 1) * ndays;
+    let folded: Vec<(Vec<Vec<output::UserRow>>, Vec<[u64; 4]>)> = (0..NB)
         .into_par_iter()
-        .map(|b| {
-            let t = Instant::now();
-            let r = sessionize(b, &events_by_person, &clicks_by_person, ncamp, &stats);
-            let ne: usize = events_by_person[b].iter().map(Vec::len).sum();
-            let nc: usize = clicks_by_person[b].iter().map(Vec::len).sum();
-            (r, (t.elapsed().as_secs_f64(), ne, nc))
-        })
+        .fold(
+            || (Vec::new(), Vec::new()),
+            |(mut rows, mut acc): (Vec<Vec<output::UserRow>>, Vec<[u64; 4]>), b| {
+                if acc.is_empty() {
+                    acc = vec![[0u64; 4]; dense_len];
+                }
+                rows.push(sessionize(b, &events_by_person, &clicks_by_person, ncamp, day0, ndays, &mut acc, &stats));
+                (rows, acc)
+            },
+        )
         .collect();
-    let mut slow: Vec<(usize, (f64, usize, usize))> = timed.iter().map(|x| x.1).enumerate().collect();
-    slow.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
-    let total: f64 = slow.iter().map(|x| x.1.0).sum();
-    for (b, (secs, ne, nc)) in slow.iter().take(3) {
-        eprintln!("    slow partition {b:>3}: {secs:.3}s events {ne} clicks {nc} (sum of all partitions {total:.3}s)");
-    }
-    let results: Vec<(Vec<output::UserRow>, Map<(u32, i32), [u64; 4]>)> = timed.into_iter().map(|x| x.0).collect();
-    lap("sessions");
-
-    let mut camp_agg: Map<(u32, i32), [u64; 4]> = new_map(1 << 14);
+    let mut dense = vec![[0u64; 4]; dense_len];
     let mut user_parts = Vec::with_capacity(NB);
-    for (u, c) in results {
-        user_parts.push(u);
-        for (k, v) in c {
-            let e = camp_agg.entry(k).or_insert([0; 4]);
+    for (rows, acc) in folded {
+        user_parts.extend(rows);
+        for (d, a) in dense.iter_mut().zip(acc.iter()) {
             for i in 0..4 {
-                e[i] += v[i];
+                d[i] += a[i];
             }
         }
     }
+    let mut camp_agg: Map<(u32, i32), [u64; 4]> = new_map(1 << 14);
+    for (idx, v) in dense.iter().enumerate() {
+        if v[0] != 0 || v[3] != 0 {
+            let (c, d) = (idx / ndays, idx % ndays);
+            let c = if c == ncamp { ORGANIC } else { c as u32 };
+            camp_agg.insert((c, day0 + d as i32), *v);
+        }
+    }
+    lap("sessions");
+
     drop(events_by_person);
     drop(clicks_by_person);
 
@@ -717,8 +725,11 @@ fn sessionize(
     evs: &ByPerson<EvV>,
     cls: &ByPerson<ClickV>,
     ncamp: usize,
+    day0: i32,
+    ndays: usize,
+    camp: &mut [[u64; 4]],
     stats: &Stats,
-) -> (Vec<output::UserRow>, Map<(u32, i32), [u64; 4]>) {
+) -> Vec<output::UserRow> {
     let n: usize = evs[b].iter().map(Vec::len).sum();
     let mut pid: Map<S, u32> = new_map(n / 8 + 16);
     let mut pname: Vec<S> = Vec::new();
@@ -747,7 +758,6 @@ fn sessionize(
     cl.sort_unstable_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)).then_with(|| y.2.cmp(x.2)));
 
     let mut rows: Vec<output::UserRow> = Vec::with_capacity(pname.len() * 2);
-    let mut camp: Map<(u32, i32), [u64; 4]> = new_map(1 << 12);
     // sliding-window distinct-campaign set: count per campaign + list of active ones
     let mut cnt = vec![0u32; ncamp];
     let mut pos = vec![u32::MAX; ncamp];
@@ -811,12 +821,16 @@ fn sessionize(
                 lo += 1;
             }
             let credit = if hi > lo { cl[hi - 1].3 } else { ORGANIC };
-            let a = camp.entry((credit, day)).or_insert([0; 4]);
+            // session starts lie in [ws, we), so 0 <= day - day0 < ndays
+            let doff = (day - day0) as usize;
+            debug_assert!(doff < ndays);
+            let ci = if credit == ORGANIC { ncamp } else { credit as usize };
+            let a = &mut camp[ci * ndays + doff];
             a[0] += 1;
             a[1] += has_p as u64;
             a[2] += rev;
             for &c in &active {
-                camp.entry((c, day)).or_insert([0; 4])[3] += 1;
+                camp[c as usize * ndays + doff][3] += 1;
             }
             sessions_total += 1;
             credited += (credit != ORGANIC) as u64;
@@ -862,7 +876,7 @@ fn sessionize(
     stats.add(K::CreditedSessions, credited);
     stats.add(K::AssistPairs, assists);
     stats.add(K::Persons, pname.len() as u64);
-    (rows, camp)
+    rows
 }
 
 
