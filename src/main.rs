@@ -322,7 +322,7 @@ fn experiment(src: &[&'static Source], products: &IdMap, lo: i64, hi: i64, names
         let t = Instant::now();
         let mut acc = 0u64;
         for (order, c) in &items {
-            for_each_record::<7>(c, |rec| {
+            for_each_record_bq::<7>(c, |rec| {
                 if let Some(r) = rec {
                     acc = acc.wrapping_add(f(&reorder(r, order)));
                 }
@@ -337,7 +337,7 @@ fn experiment(src: &[&'static Source], products: &IdMap, lo: i64, hi: i64, names
         for_each_line(c, |l| n += l.len() as u64);
     }
     eprintln!("{:<28} {:>6.3}s  ({lines} lines, {:.2} GB)", "lines only (memchr)", t.elapsed().as_secs_f64(), bytes as f64 / 1e9);
-    run("records (fused scanner)", &|f| f[0].len() as u64);
+    run("records (RW16 production)", &|f| f[0].len() as u64);
     {
         let t = Instant::now();
         let mut acc = 0u64;
@@ -615,14 +615,18 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
         poff.push(poff.last().unwrap() + ids.len());
     }
     let n = poff[LP];
-    let mut side = vec![0u32; 2 * n_edges];
-    let mut ids: Vec<S> = Vec::with_capacity(n);
-    for (p, (pids, slots)) in interned.iter().enumerate() {
-        ids.extend_from_slice(pids);
+    // RW19: partitions write disjoint slots of `side`, so they fill it in parallel
+    let side_a: Vec<std::sync::atomic::AtomicU32> = (0..2 * n_edges).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
+    interned.par_iter().enumerate().for_each(|(p, (_, slots))| {
         let o = poff[p] as u32;
         for &(slot, l) in slots {
-            side[slot as usize] = o + l;
+            side_a[slot as usize].store(o + l, Relaxed);
         }
+    });
+    let side: Vec<u32> = side_a.into_iter().map(std::sync::atomic::AtomicU32::into_inner).collect();
+    let mut ids: Vec<S> = Vec::with_capacity(n);
+    for (pids, _) in &interned {
+        ids.extend_from_slice(pids);
     }
     drop(interned);
     st.mark("links: intern");
