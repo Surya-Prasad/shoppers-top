@@ -563,12 +563,18 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
     }
     drop(side);
     st.mark("links: union");
+    // RW7: compare IDs by key (packed keys are byte-ordered; interned ones by bytes)
+    let kid: Vec<u64> = ids.par_iter().map(|s| key_of(s)).collect();
+    let less = |a: usize, b: usize| -> bool {
+        let (x, y) = (kid[a], kid[b]);
+        if (x | y) & keys::INTERNED == 0 { x < y } else { ids[a] < ids[b] }
+    };
     let mut name: Vec<u32> = (0..n as u32).collect(); // per root: index of the smallest member
     let mut root = vec![0u32; n];
     for i in 0..n {
         let r = find(&mut parent, i as u32);
         root[i] = r;
-        if ids[i] < ids[name[r as usize] as usize] {
+        if less(i, name[r as usize] as usize) {
             name[r as usize] = i as u32;
         }
     }
@@ -589,9 +595,9 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
         .map(|p| {
             let mut v = Vec::new();
             for i in poff[p]..poff[p + 1] {
-                let nm = ids[name[root[i] as usize] as usize];
-                if nm != ids[i] {
-                    v.push((key_of(ids[i]), key_of(nm)));
+                let ni = name[root[i] as usize] as usize;
+                if ni != i {
+                    v.push((kid[i], kid[ni])); // distinct interned ids are distinct IDs
                 }
             }
             v
