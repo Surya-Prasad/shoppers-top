@@ -257,7 +257,7 @@ fn main() {
     };
 
     // ---------------------------------------------------------------- clicks
-    let clicks_by_person = clicks_dedup(click_copies, &stats);
+    let clicks_by_person = click_copies; // v2 P2: no click dedup (see clicks_scan_items)
     lap("clicks");
 
     // ---------------------------------------------------------------- events
@@ -999,32 +999,42 @@ fn dedup_exact<T: Copy>(parts: &[Vec<T>], key: impl Fn(&T) -> u64, better: impl 
 
 /// RW31: click scan. Valid copies carry their *user* key in `person`; persons are resolved
 /// in `clicks_dedup`, so this can run while links are still being resolved.
-fn clicks_scan(src: &[&'static Source], campaigns: &IdMap, lo: i64, hi: i64, names: &Names, stats: &Stats) -> ByPerson<ClRec> {
+fn clicks_scan(src: &[&'static Source], campaigns: &IdMap, lo: i64, hi: i64, names: &Names, stats: &Stats) -> ByPerson<ClickV> {
     let mut st = Stage::start();
     let items = work_items::<4>(src, ["click_id", "user_id", "campaign_id", "ts"]);
     let scattered = clicks_scan_items(&items, campaigns, lo, hi, names, stats, fast_enabled());
     st.mark("clicks: scan+parse+partition");
-    let by_cid = transpose(scattered);
+    let by_person = transpose(scattered);
     st.mark("clicks: transpose");
-    by_cid
+    by_person
 }
 
-/// The per-chunk clicks scan: scan + validate each copy + partition on click_id (exact path,
-/// or v2 P1 fast path with exact fallback).
-fn clicks_scan_items(items: &[([usize; 4], S)], campaigns: &IdMap, lo: i64, hi: i64, names: &Names, stats: &Stats, fast_ok: bool) -> Vec<Vec<Vec<ClRec>>> {
+/// The per-chunk clicks scan: scan + validate each copy + partition the valid ones by person
+/// (exact path, or v2 P1 fast path with exact fallback).
+///
+/// v2 P2: no click dedup. rules.md promises that copies of a click have identical values
+/// (so the same user, person, ts, campaign and validity), and a copy cannot change any
+/// output: credit goes to the latest qualifying click with the smallest click_id (a copy is
+/// that same click) and assists count distinct campaigns. Invalid copies are dropped here.
+fn clicks_scan_items(items: &[([usize; 4], S)], campaigns: &IdMap, lo: i64, hi: i64, names: &Names, stats: &Stats, fast_ok: bool) -> Vec<Vec<Vec<ClickV>>> {
     items
         .par_iter()
         .map(|(order, chunk)| {
-            let mut parts: Vec<Vec<ClRec>> = (0..NB).map(|_| Vec::with_capacity(chunk.len() / 24 / NB + 32)).collect(); // v2: clicks lines ~26 B
+            let mut parts: Vec<Vec<ClickV>> = (0..NB).map(|_| Vec::with_capacity(chunk.len() / 24 / NB + 32)).collect(); // v2: clicks lines ~26 B
+            let mut why = [0u64; 4];
             let (mut lines, mut bad, mut noid) = (0u64, 0u64, 0u64);
             // v2: valid copies resolve their person here, in prefetched batches (links are
             // resolved before the scan); invalid copies (user EMPTY) go straight in
             let mut pend: Vec<(ClRec, u64, u64)> = Vec::with_capacity(PBATCH);
             // (every copy goes through the batch, so scan order is kept exactly)
-            let flush = |pend: &mut Vec<(ClRec, u64, u64)>, parts: &mut Vec<Vec<ClRec>>| {
-                for &(mut r, user, um) in pend.iter() {
-                    r.person = if user == keys::EMPTY { keys::EMPTY } else { names.person_mixed(um, user) };
-                    parts[keys::part(r.cid, LOG_NB)].push(r);
+            let flush = |pend: &mut Vec<(ClRec, u64, u64)>, parts: &mut Vec<Vec<ClickV>>, why: &mut [u64; 4]| {
+                for &(r, user, um) in pend.iter() {
+                    if user == keys::EMPTY {
+                        why[r.why as usize] += 1;
+                        continue;
+                    }
+                    let person = names.person_mixed(um, user);
+                    parts[keys::part(person, LOG_NB)].push(ClickV { person, ts: r.ts, cid: r.cid, camp: r.camp });
                 }
                 pend.clear();
             };
@@ -1035,7 +1045,7 @@ fn clicks_scan_items(items: &[([usize; 4], S)], campaigns: &IdMap, lo: i64, hi: 
                 }
                 pend.push((r, user, um));
                 if pend.len() == PBATCH {
-                    flush(&mut pend, &mut parts);
+                    flush(&mut pend, &mut parts, &mut why);
                 }
             };
             let mut exact = |rec: Option<[S; 4]>, put: &mut dyn FnMut(ClRec, u64)| {
@@ -1098,7 +1108,11 @@ fn clicks_scan_items(items: &[([usize; 4], S)], campaigns: &IdMap, lo: i64, hi: 
             }
             drop(exact);
             drop(put);
-            flush(&mut pend, &mut parts);
+            flush(&mut pend, &mut parts, &mut why);
+            stats.add(K::ClBadUser, why[1]);
+            stats.add(K::ClBadTs, why[2]);
+            stats.add(K::ClBadCampaign, why[3]);
+            stats.add(K::ClSurvived, parts.iter().map(|v| v.len() as u64).sum());
             stats.add(K::ClLines, lines);
             stats.add(K::ClMalformed, bad);
             stats.add(K::ClNoId, noid);
@@ -1107,41 +1121,6 @@ fn clicks_scan_items(items: &[([usize; 4], S)], campaigns: &IdMap, lo: i64, hi: 
         .collect()
 }
 
-/// RW31: click dedup + person resolution (batched) + repartition by person.
-fn clicks_dedup(by_cid: ByPerson<ClRec>, stats: &Stats) -> ByPerson<ClickV> {
-    let mut st = Stage::start();
-    // rules.md, Clicks step 2: copies are identical, keep any one (the first in scan
-    // order: transpose keeps file-then-chunk order, so this is thread-count independent)
-    let out: Vec<Vec<Vec<ClickV>>> = by_cid
-        .into_par_iter()
-        .map(|parts| {
-            let n: usize = parts.iter().map(Vec::len).sum();
-            let mut dst: Vec<Vec<ClickV>> = (0..NB).map(|_| Vec::with_capacity(n / NB + n / NB / 8 + 32)).collect(); // v2: room for the spread (no regrowth)
-            let mut why = [0u64; 4];
-            let mut emit = |r: ClRec, person: u64| {
-                dst[keys::part(person, LOG_NB)].push(ClickV { person, ts: r.ts, cid: r.cid, camp: r.camp });
-            };
-            let kept = dedup(&parts, |r: &ClRec| r.cid, |_, _| false, |r| {
-                if r.person == keys::EMPTY {
-                    why[r.why as usize] += 1;
-                } else {
-                    emit(*r, r.person); // v2: person resolved at scan
-                }
-            });
-            drop(emit);
-            stats.add(K::ClDupCopies, (n - kept) as u64);
-            stats.add(K::ClBadUser, why[1]);
-            stats.add(K::ClBadTs, why[2]);
-            stats.add(K::ClBadCampaign, why[3]);
-            stats.add(K::ClSurvived, dst.iter().map(|v| v.len() as u64).sum());
-            dst
-        })
-        .collect();
-    st.mark("clicks: dedup+validate+repartition");
-    let t = transpose(out);
-    st.mark("clicks: transpose");
-    t
-}
 
 // ====================================================================== events
 
@@ -2027,8 +2006,8 @@ mod fast_click_tests {
             let chunk: S = Box::leak(buf.into_bytes().into_boxed_slice());
             let items = vec![([0, 1, 2, 3], chunk)];
             let (s1, s2) = (Stats::default(), Stats::default());
-            let f = |v: Vec<Vec<Vec<ClRec>>>| -> Vec<Vec<(u64, u64, i64, u32, u32)>> {
-                v.into_iter().map(|c| c.into_iter().flatten().map(|r| (r.cid, r.person, r.ts, r.camp, r.why)).collect()).collect()
+            let f = |v: Vec<Vec<Vec<ClickV>>>| -> Vec<Vec<(u64, u64, i64, u32)>> {
+                v.into_iter().map(|c| c.into_iter().flatten().map(|r| (r.cid, r.person, r.ts, r.camp)).collect()).collect()
             };
             let a = f(clicks_scan_items(&items, &camps, lo - 7 * DAY, hi, &Names::empty(), &s1, true));
             let b = f(clicks_scan_items(&items, &camps, lo - 7 * DAY, hi, &Names::empty(), &s2, false));
