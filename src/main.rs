@@ -225,14 +225,12 @@ fn main() {
     // ---------------------------------------------------------------- identity
     // RW31: links resolve while clicks and events are scanned (the scans carry user keys;
     // persons are resolved in the dedup steps below)
-    let (names, (click_copies, event_copies)) = rayon::join(
-        || resolve_links(lk_src, &stats),
-        || {
-            let c = clicks_scan(cl_src, &campaigns, ws - WEEK, we, &stats);
-            let e = events_scan(ev_src, &products, unknown_cat, ws, we, &stats);
-            (c, e)
-        },
-    );
+    // v2: links first, on all threads. Run concurrently (RW31), their tasks were starved by
+    // the scans and finished last at 60M (x86 CI: links 3.8 s vs events scan 3.0 s);
+    // alone they take a fraction of that.
+    let names = resolve_links(lk_src, &stats);
+    let click_copies = clicks_scan(cl_src, &campaigns, ws - WEEK, we, &stats);
+    let event_copies = events_scan(ev_src, &products, unknown_cat, ws, we, &stats);
     lap("links resolved + clicks/events scanned");
     if std::env::var("SS_EXP2").is_ok() {
         experiment2(ev_src, &products, ws, we);
