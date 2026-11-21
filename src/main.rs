@@ -12,6 +12,7 @@
 mod dialect;
 mod hashing;
 mod output;
+mod packed;
 mod timefmt;
 
 use std::collections::hash_map::Entry;
@@ -25,6 +26,7 @@ use hashing::Seeded as RandomState;
 use rayon::prelude::*;
 
 use dialect::{Source, chunks, csv_files, data_region, for_each_line, for_each_record, header_order, split};
+use packed::{PMap, pack9};
 use timefmt::{BAD, DAY};
 
 pub type Map<K, V> = std::collections::HashMap<K, V, RandomState>;
@@ -266,7 +268,7 @@ fn main() {
 
 /// products(product_id PK, category). First occurrence wins if a key repeats.
 /// Categories are numbered in byte order, so "smallest index" == "byte-wise smallest name".
-fn load_products(src: &'static Source) -> (Map<S, u32>, Vec<S>) {
+fn load_products(src: &'static Source) -> (PMap<u32>, Vec<S>) {
     let bytes: S = src.bytes();
     let order = header_order::<2>(bytes, ["product_id", "category"]);
     let mut rows: Vec<(S, S)> = Vec::new();
@@ -286,24 +288,24 @@ fn load_products(src: &'static Source) -> (Map<S, u32>, Vec<S>) {
     for (i, c) in cats.iter().enumerate() {
         idx.insert(*c, i as u32);
     }
-    let mut products: Map<S, u32> = new_map(rows.len());
+    let mut products: PMap<u32> = PMap::with_capacity(rows.len());
     for (p, c) in rows {
-        products.entry(p).or_insert(idx[c]);
+        products.insert_first(p, idx[c]);
     }
     (products, cats)
 }
 
 /// campaigns(campaign_id PK, channel). Returns id -> dense index, channel per index, id per index.
-fn load_campaigns(src: &'static Source) -> (Map<S, u32>, Vec<S>, Vec<S>) {
+fn load_campaigns(src: &'static Source) -> (PMap<u32>, Vec<S>, Vec<S>) {
     let bytes: S = src.bytes();
     let order = header_order::<2>(bytes, ["campaign_id", "channel"]);
-    let mut m: Map<S, u32> = new_map(4096);
+    let mut m: PMap<u32> = PMap::with_capacity(4096);
     let (mut ch, mut ids) = (Vec::new(), Vec::new());
     for_each_line(data_region(bytes), |line| {
         if let Some(f) = split::<2>(line) {
             let f = reorder(f, &order);
             if !f[0].is_empty() && !m.contains_key(f[0]) {
-                m.insert(f[0], ids.len() as u32);
+                m.insert_first(f[0], ids.len() as u32);
                 ids.push(f[0]);
                 ch.push(f[1]);
             }
@@ -527,7 +529,7 @@ fn transpose<T>(v: Vec<Vec<Vec<T>>>) -> ByPerson<T> {
 
 fn clicks(
     src: &[&'static Source],
-    campaigns: &Map<S, u32>,
+    campaigns: &PMap<u32>,
     lo: i64,
     hi: i64,
     person_of: &(dyn Fn(S) -> S + Sync),
@@ -622,24 +624,7 @@ const T_CART: u8 = 1;
 const T_PURCHASE: u8 = 2;
 const T_BAD: u8 = 3;
 
-/// Night-03: an ID of at most 9 bytes, each in 1..=127, packed left-aligned at 7 bits
-/// per byte. Integer order equals byte-wise order (a shorter prefix pads with 0, which
-/// sorts before every allowed byte), and packing is injective. Anything else is None
-/// and goes through an exact byte-string path.
-#[inline]
-pub fn pack9(s: &[u8]) -> Option<u64> {
-    if s.len() > 9 {
-        return None;
-    }
-    let mut v = 0u64;
-    let mut ok = true;
-    for (i, &c) in s.iter().enumerate() {
-        ok &= c.wrapping_sub(1) < 127;
-        v |= ((c & 0x7f) as u64) << (56 - 7 * i);
-    }
-    ok.then_some(v)
-}
-
+// Night-03/05: `pack9` (packed IDs) lives in `packed.rs`.
 #[derive(Clone, Copy)]
 struct EvRaw {
     person: S,      // empty if user_id was empty
@@ -687,7 +672,7 @@ fn parse_ingest(b: &[u8]) -> Option<i64> {
 #[allow(clippy::too_many_arguments)]
 fn events(
     src: &[&'static Source],
-    products: &Map<S, u32>,
+    products: &PMap<u32>,
     unknown_cat: u32,
     lo: i64,
     hi: i64,
@@ -1021,37 +1006,9 @@ mod layout {
 }
 
 #[cfg(test)]
-mod packed {
+mod packed_keys {
     use super::*;
-    fn lcg(x: &mut u64) -> u64 {
-        *x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        *x >> 33
-    }
-    /// Night-03: pack9 is injective and order-preserving on its domain, and rejects
-    /// everything outside it (long, NUL, non-ASCII).
-    #[test]
-    fn order_and_domain() {
-        let mut x = 1u64;
-        let alpha: &[u8] = b"\x01 !\"09AZaz_~\x7f";
-        let mut v: Vec<Vec<u8>> = vec![vec![]];
-        for _ in 0..20_000 {
-            let len = (lcg(&mut x) % 10) as usize;
-            let s: Vec<u8> = (0..len).map(|_| alpha[(lcg(&mut x) as usize) % alpha.len()]).collect();
-            v.push(s);
-        }
-        for w in v.windows(2) {
-            let (a, b) = (&w[0], &w[1]);
-            let (pa, pb) = (pack9(a).unwrap(), pack9(b).unwrap());
-            assert_eq!(pa.cmp(&pb), a.cmp(b), "{a:?} {b:?}");
-        }
-        assert_eq!(pack9(b"a"), Some(0x61u64 << 56));
-        assert!(pack9(b"a").unwrap() < pack9(b"a\x01").unwrap());
-        assert_eq!(pack9(b"abcdefghi").map(|p| p >> 63), Some(0));
-        assert_eq!(pack9(b"abcdefghij"), None);
-        assert_eq!(pack9(b"a\0"), None);
-        assert_eq!(pack9(b"a\x80"), None);
-        assert_eq!(pack9("é".as_bytes()), None);
-    }
+    // pack9 order/domain tests: packed.rs
     /// Night-03: partition bits spread for packed IDs.
     #[test]
     fn packed_partition_spread() {
