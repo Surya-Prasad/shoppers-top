@@ -14,12 +14,36 @@ fn d2(b: &[u8], i: usize) -> Option<i64> {
     if a < 10 && c < 10 { Some((a * 10 + c) as i64) } else { None }
 }
 
-pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+pub const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
     let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
     era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
+}
+
+/// RW14: day number of the first of each month, 1970-01 .. 2129-12 (compile-time table).
+const TY0: i64 = 1970;
+const TYEARS: usize = 160;
+static MONTH_START: [i64; TYEARS * 12] = {
+    let mut t = [0i64; TYEARS * 12];
+    let mut i = 0;
+    while i < TYEARS * 12 {
+        t[i] = days_from_civil(TY0 + (i / 12) as i64, (i % 12) as i64 + 1, 1);
+        i += 1;
+    }
+    t
+};
+
+/// `days_from_civil` via the table inside its range (identical results; tested).
+#[inline(always)]
+fn days_fast(y: i64, m: i64, d: i64) -> i64 {
+    let yi = y - TY0;
+    if (0..TYEARS as i64).contains(&yi) {
+        MONTH_START[yi as usize * 12 + (m - 1) as usize] + d - 1
+    } else {
+        days_from_civil(y, m, d)
+    }
 }
 
 fn days_in_month(y: i64, m: i64) -> i64 {
@@ -32,6 +56,26 @@ fn days_in_month(y: i64, m: i64) -> i64 {
     }
 }
 
+/// RW14: an all-digit 13-byte F3 value via two overlapping 8-byte loads (SWAR digit check and
+/// Lemire's 8-digit conversion); None if any byte is not an ASCII digit.
+#[inline(always)]
+fn f3_13(b: &[u8]) -> Option<i64> {
+    let a = u64::from_le_bytes(b[0..8].try_into().unwrap()) ^ 0x3030_3030_3030_3030;
+    let c = u64::from_le_bytes(b[5..13].try_into().unwrap()) ^ 0x3030_3030_3030_3030;
+    // every byte must be 0..=9 after the xor: high nibble 0 and adding 6 must not carry into it
+    let bad = |x: u64| (x & 0xf0f0_f0f0_f0f0_f0f0) | (x.wrapping_add(0x0606_0606_0606_0606) & 0xf0f0_f0f0_f0f0_f0f0);
+    if bad(a) | bad(c) != 0 {
+        return None;
+    }
+    let p8 = |x: u64| -> u64 {
+        let x = x.wrapping_mul(10).wrapping_add(x >> 8) & 0x00ff_00ff_00ff_00ff;
+        let x = x.wrapping_mul(100).wrapping_add(x >> 16) & 0x0000_ffff_0000_ffff;
+        x.wrapping_mul(10000).wrapping_add(x >> 32) & 0xffff_ffff
+    };
+    // digits 0..8 and 5..13; the low 5 digits of the second are digits 8..13
+    Some((p8(a) * 100_000 + p8(c) % 100_000) as i64)
+}
+
 /// Parse any of the three forms to epoch ms. F3 values too large for i64 return None
 /// (they are "just a number" outside every window, so the caller treats them as bad).
 ///
@@ -42,6 +86,9 @@ pub fn parse(b: &[u8]) -> Option<i64> {
     let n = b.len();
     if (n == 20 || n == 25) && b[4] == b'-' {
         return parse_dt(b);
+    }
+    if n == 13 {
+        return f3_13(b); // RW14: the common F3 length (epoch ms of years 2001..2286)
     }
     if n == 0 || !b.iter().all(u8::is_ascii_digit) {
         return None; // not F3, and not the F1/F2 layout
@@ -116,7 +163,7 @@ fn parse_dt(b: &[u8]) -> Option<i64> {
     if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) || h > 23 || mi > 59 || s > 59 {
         return None;
     }
-    Some(days_from_civil(y, mo, d) * DAY + ((h * 60 + mi) * 60 + s) * SECOND - offset)
+    Some(days_fast(y, mo, d) * DAY + ((h * 60 + mi) * 60 + s) * SECOND - offset)
 }
 
 /// Parse any of the three forms to epoch ms. F3 values too large for i64 return None
@@ -180,6 +227,39 @@ pub fn parse_in(b: &[u8], lo: i64, hi: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RW14: the fast paths equal the reference parser and the civil formula.
+    #[test]
+    fn fast_paths_match_reference() {
+        for y in 1900..2200i64 {
+            for m in 1..=12 {
+                for d in [1, 15, 28, days_in_month(y, m)] {
+                    assert_eq!(days_fast(y, m, d), days_from_civil(y, m, d), "{y}-{m}-{d}");
+                }
+            }
+        }
+        let mut x = 5u64;
+        let mut rnd = || {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x >> 33
+        };
+        let alpha: &[u8] = b"0123456789/:a \x7f";
+        for _ in 0..300_000 {
+            let mut b: Vec<u8> = (0..13).map(|_| b'0' + (rnd() % 10) as u8).collect();
+            if rnd() % 4 == 0 {
+                let i = (rnd() as usize) % 13;
+                b[i] = alpha[(rnd() as usize) % alpha.len()];
+            }
+            assert_eq!(parse(&b), parse_ref(&b), "{:?}", String::from_utf8_lossy(&b));
+        }
+        for s in ["0000000000000", "9999999999999", "1791071890000", "0001791071890", "179107189000a"] {
+            assert_eq!(parse(s.as_bytes()), parse_ref(s.as_bytes()), "{s}");
+        }
+        for s in ["1969-12-31T23:59:59Z", "1970-01-01T00:00:00Z", "2028-02-29T12:00:00Z", "2129-12-31T23:59:59Z",
+                  "2130-01-01T00:00:00Z", "2026-10-03T19:58:10-04:00", "2027-02-29T00:00:00Z", "0000-01-01T00:00:00Z"] {
+            assert_eq!(parse(s.as_bytes()), parse_ref(s.as_bytes()), "{s}");
+        }
+    }
 
     fn lcg(x: &mut u64) -> u64 {
         *x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
