@@ -739,54 +739,77 @@ fn transpose<T>(v: Vec<Vec<Vec<T>>>) -> ByPerson<T> {
     out
 }
 
-/// Dedup table over the copies of one partition: key -> location (source, position) of
-/// the kept copy. `better(new, kept)` decides replacement; first copy wins on ties.
+/// Dedup over the copies of one partition: per key, keep the copy `better(new, kept)`
+/// prefers (the first copy wins ties); `sink` receives each kept copy; returns how many.
+/// RW13: a large partition is first split by a stable counting sort into sub-buckets of
+/// about `SUB` copies (more hash bits), so each dedup table (~2*SUB slots) stays in L2.
+/// Stability keeps scan order inside a sub-bucket, so ties still go to the first copy.
+const SUB: usize = 8192;
 fn dedup<T: Copy>(parts: &[Vec<T>], key: impl Fn(&T) -> u64, better: impl Fn(&T, &T) -> bool, mut sink: impl FnMut(&T)) -> usize {
     let n: usize = parts.iter().map(Vec::len).sum();
-    let cap = (n * 2).next_power_of_two().max(16);
-    let mask = cap - 1;
-    let mut slots: Vec<(u64, u64)> = vec![(keys::EMPTY, 0); cap];
-    let mut used = 0usize;
-    const B: usize = 16;
-    let mut pend = [(0u64, 0usize, 0u64); B]; // (key, first slot, location)
-    for (si, part) in parts.iter().enumerate() {
-        // RW3: slots of B rows are prefetched before any of them is probed
-        let mut base = 0usize;
-        while base < part.len() {
-            let m = (part.len() - base).min(B);
-            for t in 0..m {
-                let k = key(&part[base + t]);
-                let i = packed::fmix(k) as usize & mask;
-                keys::prefetch_read(slots.as_ptr().wrapping_add(i) as *const u8);
-                pend[t] = (k, i, ((si as u64) << 32) | (base + t) as u64);
-            }
-            for &(k, i0, loc) in &pend[..m] {
-                let r = &part[(loc & 0xffff_ffff) as usize];
-                let mut i = i0;
-                loop {
-                    let s = &mut slots[i];
-                    if s.0 == keys::EMPTY {
-                        *s = (k, loc);
-                        used += 1;
-                        break;
-                    }
-                    if s.0 == k {
-                        let kept = &parts[(s.1 >> 32) as usize][(s.1 & 0xffff_ffff) as usize];
-                        if better(r, kept) {
-                            s.1 = loc;
-                        }
-                        break;
-                    }
-                    i = (i + 1) & mask;
-                }
-            }
-            base += m;
+    let sbits = if n <= 2 * SUB { 0 } else { (n / SUB).next_power_of_two().trailing_zeros() };
+    // sub-bucket bits sit just below the partition bits of the same mix
+    let sub = |k: u64| -> usize { if sbits == 0 { 0 } else { ((packed::fmix(k) << LOG_NB) >> (64 - sbits)) as usize } };
+    let nsub = 1usize << sbits;
+    let mut flat: Vec<T> = Vec::with_capacity(n);
+    let mut starts = vec![0u32; nsub + 1];
+    if sbits == 0 {
+        for part in parts {
+            flat.extend_from_slice(part);
         }
+        starts[1] = n as u32;
+    } else {
+        for part in parts {
+            for r in part {
+                starts[sub(key(r)) + 1] += 1;
+            }
+        }
+        for b in 1..=nsub {
+            starts[b] += starts[b - 1];
+        }
+        let mut at = starts.clone();
+        let spare = flat.spare_capacity_mut();
+        for part in parts {
+            for r in part {
+                let b = sub(key(r));
+                spare[at[b] as usize].write(*r);
+                at[b] += 1;
+            }
+        }
+        // SAFETY: the counting pass wrote each of the n slots exactly once
+        unsafe { flat.set_len(n) };
     }
-    // RW5: kept copies go straight to the caller (no intermediate vector)
-    for s in &slots {
-        if s.0 != keys::EMPTY {
-            sink(&parts[(s.1 >> 32) as usize][(s.1 & 0xffff_ffff) as usize]);
+    let mut used = 0usize;
+    let mut slots: Vec<(u64, u32)> = Vec::new();
+    for b in 0..nsub {
+        let rows = &flat[starts[b] as usize..starts[b + 1] as usize];
+        let cap = (rows.len() * 2).next_power_of_two().max(16);
+        let mask = cap - 1;
+        slots.clear();
+        slots.resize(cap, (keys::EMPTY, 0));
+        for (ri, r) in rows.iter().enumerate() {
+            let k = key(r);
+            let mut i = packed::fmix(k) as usize & mask;
+            loop {
+                let s = &mut slots[i];
+                if s.0 == keys::EMPTY {
+                    *s = (k, ri as u32);
+                    used += 1;
+                    break;
+                }
+                if s.0 == k {
+                    if better(r, &rows[s.1 as usize]) {
+                        s.1 = ri as u32;
+                    }
+                    break;
+                }
+                i = (i + 1) & mask;
+            }
+        }
+        for s in &slots {
+            if s.0 != keys::EMPTY {
+                sink(&rows[s.1 as usize]);
+            }
         }
     }
     used
