@@ -152,7 +152,6 @@ fn work_items<const N: usize>(sources: &[&'static Source], names: [&str; N]) -> 
     out
 }
 
-#[inline]
 /// Fields in the documented order. RW24: the identity order (every generated file) is a
 /// no-op, checked with one predictable branch instead of an indexed copy per line.
 #[inline(always)]
@@ -1191,11 +1190,15 @@ const T_BAD: u8 = 3;
 
 /// RW6: counting sort of the rows of all `parts` into `nbk` buckets, then sort each bucket
 /// with `cmp`. The result is ordered by (bucket, cmp).
-fn bucket_sort<T: Copy>(parts: &[Vec<T>], n: usize, nbk: usize, bucket: impl Fn(&T) -> usize, cmp: impl Fn(&T, &T) -> std::cmp::Ordering) -> Vec<T> {
+fn bucket_sort<T: Copy>(parts: &[Vec<T>], n: usize, nbk: usize, bucket: impl Fn(&T) -> usize, sort: impl Fn(&mut [T])) -> (Vec<T>, Vec<u32>) {
+    // RW27: each row's bucket is computed once (kept in `bk`) and reused for placement
+    let mut bk: Vec<u32> = Vec::with_capacity(n);
     let mut cnt = vec![0u32; nbk + 1];
     for part in parts {
         for r in part {
-            cnt[bucket(r) + 1] += 1;
+            let k = bucket(r);
+            bk.push(k as u32);
+            cnt[k + 1] += 1;
         }
     }
     for i in 1..=nbk {
@@ -1204,9 +1207,11 @@ fn bucket_sort<T: Copy>(parts: &[Vec<T>], n: usize, nbk: usize, bucket: impl Fn(
     let starts = cnt.clone();
     let mut out: Vec<T> = Vec::with_capacity(n);
     let spare = out.spare_capacity_mut();
+    let mut idx = 0usize;
     for part in parts {
         for r in part {
-            let k = bucket(r);
+            let k = bk[idx] as usize;
+            idx += 1;
             spare[cnt[k] as usize].write(*r);
             cnt[k] += 1;
         }
@@ -1214,9 +1219,9 @@ fn bucket_sort<T: Copy>(parts: &[Vec<T>], n: usize, nbk: usize, bucket: impl Fn(
     // SAFETY: the counting pass wrote every one of the n slots exactly once
     unsafe { out.set_len(n) };
     for k in 0..nbk {
-        out[starts[k] as usize..starts[k + 1] as usize].sort_unstable_by(&cmp);
+        sort(&mut out[starts[k] as usize..starts[k + 1] as usize]);
     }
-    out
+    (out, starts)
 }
 
 fn sessionize(
@@ -1240,11 +1245,14 @@ fn sessionize(
     let nbk: usize = (n / 64).next_power_of_two().clamp(1, 1 << 14);
     let bshift = 64 - LOG_NB - nbk.trailing_zeros();
     let bucket = |person: u64| -> usize { ((packed::fmix(person) >> bshift) as usize) & (nbk - 1) };
-    let ev: Vec<EvV> = bucket_sort(&evs[b], n, nbk, |e: &EvV| bucket(e.person), |x, y| (x.person, x.ts).cmp(&(y.person, y.ts)));
+    // events sort on one u128 key: person, then ts (sign-flipped so unsigned order = signed)
+    let (ev, es) = bucket_sort(&evs[b], n, nbk, |e: &EvV| bucket(e.person), |v: &mut [EvV]| {
+        v.sort_unstable_by_key(|e| ((e.person as u128) << 64) | ((e.ts as u64) ^ (1 << 63)) as u128)
+    });
     // clicks: (person, ts asc, click_id desc in byte order), so the last click of a
     // window is the latest one with the byte-wise smallest click_id
-    let cl: Vec<ClickV> = bucket_sort(&cls[b], nc, nbk, |c: &ClickV| bucket(c.person), |x, y| {
-        (x.person, x.ts).cmp(&(y.person, y.ts)).then_with(|| keys::cmp_bytes(y.cid, x.cid))
+    let (cl, cs) = bucket_sort(&cls[b], nc, nbk, |c: &ClickV| bucket(c.person), |v: &mut [ClickV]| {
+        v.sort_unstable_by(|x, y| (x.person, x.ts).cmp(&(y.person, y.ts)).then_with(|| keys::cmp_bytes(y.cid, x.cid)))
     });
 
     let mut rows: Vec<output::UserRow> = Vec::with_capacity(n / 8 + 16);
@@ -1254,23 +1262,25 @@ fn sessionize(
     let mut active: Vec<u32> = Vec::new();
     let (mut sessions_total, mut credited, mut assists, mut persons) = (0u64, 0u64, 0u64, 0u64);
 
-    let mut i = 0usize; // event cursor
-    let mut j = 0usize; // click cursor (first click of current person)
     let mut cat_rev: Vec<(u32, u64)> = Vec::new();
-    while i < ev.len() {
+    // RW27: walk bucket by bucket; inside a bucket both sides are sorted by person, so the
+    // per-person merge needs no hashing
+    for bkt in 0..nbk {
+    let (e1, c1) = (es[bkt + 1] as usize, cs[bkt + 1] as usize);
+    let mut i = es[bkt] as usize; // event cursor
+    let mut j = cs[bkt] as usize; // click cursor (first click of current person)
+    while i < e1 {
         let p = ev[i].person;
         persons += 1;
         let mut pe = i + 1;
-        while pe < ev.len() && ev[pe].person == p {
+        while pe < e1 && ev[pe].person == p {
             pe += 1;
         }
-        // advance clicks to this person: order is (bucket, person) on both sides
-        let pk = (bucket(p), p);
-        while j < cl.len() && (bucket(cl[j].person), cl[j].person) < pk {
+        while j < c1 && cl[j].person < p {
             j += 1;
         }
         let mut pc = j;
-        while pc < cl.len() && cl[pc].person == p {
+        while pc < c1 && cl[pc].person == p {
             pc += 1;
         }
         let (mut lo, mut hi) = (j, j); // window [lo, hi) of this person's clicks
@@ -1368,6 +1378,7 @@ fn sessionize(
         active.clear();
         i = pe;
         j = pc;
+    }
     }
     stats.add(K::Sessions, sessions_total);
     stats.add(K::CreditedSessions, credited);
