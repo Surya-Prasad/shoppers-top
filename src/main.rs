@@ -53,6 +53,11 @@ fn part_of(state: &RandomState, key: &[u8]) -> usize {
     (state.hash_one(key) >> 20) as usize & (NB - 1)
 }
 
+#[inline]
+fn part_of_u64(state: &RandomState, key: u64) -> usize {
+    (state.hash_one(key) >> 20) as usize & (NB - 1)
+}
+
 type S = &'static [u8];
 
 /// Counters: the data profile of a run (written to stderr, and to $STATS_FILE if set).
@@ -535,9 +540,26 @@ const T_CART: u8 = 1;
 const T_PURCHASE: u8 = 2;
 const T_BAD: u8 = 3;
 
+/// Night-03: an ID of at most 9 bytes, each in 1..=127, packed left-aligned at 7 bits
+/// per byte. Integer order equals byte-wise order (a shorter prefix pads with 0, which
+/// sorts before every allowed byte), and packing is injective. Anything else is None
+/// and goes through an exact byte-string path.
+#[inline]
+pub fn pack9(s: &[u8]) -> Option<u64> {
+    if s.len() > 9 {
+        return None;
+    }
+    let mut v = 0u64;
+    let mut ok = true;
+    for (i, &c) in s.iter().enumerate() {
+        ok &= c.wrapping_sub(1) < 127;
+        v |= ((c & 0x7f) as u64) << (56 - 7 * i);
+    }
+    ok.then_some(v)
+}
+
 #[derive(Clone, Copy)]
 struct EvRaw {
-    eid: S,
     person: S,      // empty if user_id was empty
     ts: i64,        // BAD if invalid or outside the event window
     ingest: i64,
@@ -594,10 +616,14 @@ fn events(
     const NAMES: [&str; 7] = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"];
     let mut st = Stage::start();
     let items = work_items::<7>(src, NAMES);
-    let scattered: Vec<Vec<Vec<EvRaw>>> = items
+    // Night-03: rows whose event_id packs into a u64 are keyed by it; the rest (none in
+    // generated data, but allowed) keep the exact byte string in a parallel fallback set.
+    // A packable and an unpackable ID are never equal, so the two sets dedup separately.
+    let scattered: Vec<(Vec<Vec<(u64, EvRaw)>>, Vec<Vec<(S, EvRaw)>>)> = items
         .par_iter()
         .map(|(order, chunk)| {
-            let mut parts: Vec<Vec<EvRaw>> = (0..NB).map(|_| Vec::with_capacity(chunk.len() / 80 / NB + 8)).collect();
+            let mut parts: Vec<Vec<(u64, EvRaw)>> = (0..NB).map(|_| Vec::with_capacity(chunk.len() / 80 / NB + 8)).collect();
+            let mut fb: Vec<Vec<(S, EvRaw)>> = (0..NB).map(|_| Vec::new()).collect();
             let (mut lines, mut bad, mut noid) = (0u64, 0u64, 0u64);
             for_each_record::<7>(chunk, |rec| {
                 lines += 1;
@@ -625,8 +651,7 @@ fn events(
                     }
                 };
                 let ingest = parse_ingest(f[3]);
-                parts[part_of(ps, f[0])].push(EvRaw {
-                    eid: f[0],
+                let r = EvRaw {
                     person: if f[1].is_empty() { b"" } else { person_of(f[1]) },
                     ts: timefmt::parse_in(f[2], lo, hi),
                     ingest: ingest.unwrap_or(i64::MAX),
@@ -635,27 +660,34 @@ fn events(
                     typ,
                     ingest_bad: ingest.is_none(),
                     unknown_product,
-                });
+                };
+                match pack9(f[0]) {
+                    Some(k) => parts[part_of_u64(ps, k)].push((k, r)),
+                    None => fb[part_of(ps, f[0])].push((f[0], r)),
+                }
             });
             stats.add(K::EvLines, lines);
             stats.add(K::EvMalformed, bad);
             stats.add(K::EvNoId, noid);
-            parts
+            (parts, fb)
         })
         .collect();
     st.mark("events: scan+parse+partition");
-    let by_eid = transpose(scattered);
+    let (main_s, fb_s): (Vec<_>, Vec<_>) = scattered.into_iter().unzip();
+    let by_eid: Vec<(Vec<Vec<(u64, EvRaw)>>, Vec<Vec<(S, EvRaw)>>)> =
+        transpose(main_s).into_iter().zip(transpose(fb_s)).collect();
     st.mark("events: transpose");
     let out: Vec<Vec<Vec<EvV>>> = by_eid
         .into_par_iter()
-        .map(|parts| {
+        .map(|(parts, fparts)| {
             let n: usize = parts.iter().map(Vec::len).sum();
-            let mut best: Map<S, EvRaw> = new_map(n);
+            let nf: usize = fparts.iter().map(Vec::len).sum();
+            let mut best: Map<u64, EvRaw> = new_map(n);
             for part in &parts {
-                for r in part {
+                for (k, r) in part {
                     // A1: one hash probe per copy (entry) instead of get_mut + insert.
                     // Same rule: keep the copy that `earlier` prefers (smallest ingest_ts).
-                    match best.entry(r.eid) {
+                    match best.entry(*k) {
                         Entry::Vacant(slot) => {
                             slot.insert(*r);
                         }
@@ -667,10 +699,25 @@ fn events(
                     }
                 }
             }
-            stats.add(K::EvDupCopies, (n - best.len()) as u64);
+            let mut fbest: Map<S, EvRaw> = new_map(nf);
+            for part in &fparts {
+                for (k, r) in part {
+                    match fbest.entry(*k) {
+                        Entry::Vacant(slot) => {
+                            slot.insert(*r);
+                        }
+                        Entry::Occupied(mut slot) => {
+                            if earlier(r, slot.get()) {
+                                slot.insert(*r);
+                            }
+                        }
+                    }
+                }
+            }
+            stats.add(K::EvDupCopies, (n - best.len() + nf - fbest.len()) as u64);
             let mut dst: Vec<Vec<EvV>> = (0..NB).map(|_| Vec::with_capacity(n / NB + 8)).collect();
             let mut c = [0u64; 8];
-            for r in best.values() {
+            for r in best.values().chain(fbest.values()) {
                 // validation of the kept copy, in the order of rules.md
                 let reason = if r.person.is_empty() {
                     0
@@ -888,5 +935,50 @@ mod layout {
     fn record_sizes() {
         eprintln!("EvRaw={} EvV={} ClickRaw={} ClickV={}", std::mem::size_of::<super::EvRaw>(),
             std::mem::size_of::<super::EvV>(), std::mem::size_of::<super::ClickRaw>(), std::mem::size_of::<super::ClickV>());
+    }
+}
+
+#[cfg(test)]
+mod packed {
+    use super::*;
+    fn lcg(x: &mut u64) -> u64 {
+        *x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *x >> 33
+    }
+    /// Night-03: pack9 is injective and order-preserving on its domain, and rejects
+    /// everything outside it (long, NUL, non-ASCII).
+    #[test]
+    fn order_and_domain() {
+        let mut x = 1u64;
+        let alpha: &[u8] = b"\x01 !\"09AZaz_~\x7f";
+        let mut v: Vec<Vec<u8>> = vec![vec![]];
+        for _ in 0..20_000 {
+            let len = (lcg(&mut x) % 10) as usize;
+            let s: Vec<u8> = (0..len).map(|_| alpha[(lcg(&mut x) as usize) % alpha.len()]).collect();
+            v.push(s);
+        }
+        for w in v.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            let (pa, pb) = (pack9(a).unwrap(), pack9(b).unwrap());
+            assert_eq!(pa.cmp(&pb), a.cmp(b), "{a:?} {b:?}");
+        }
+        assert_eq!(pack9(b"a"), Some(0x61u64 << 56));
+        assert!(pack9(b"a").unwrap() < pack9(b"a\x01").unwrap());
+        assert_eq!(pack9(b"abcdefghi").map(|p| p >> 63), Some(0));
+        assert_eq!(pack9(b"abcdefghij"), None);
+        assert_eq!(pack9(b"a\0"), None);
+        assert_eq!(pack9(b"a\x80"), None);
+        assert_eq!(pack9("é".as_bytes()), None);
+    }
+    /// Night-03: partition bits spread for packed IDs.
+    #[test]
+    fn packed_partition_spread() {
+        let st = RandomState(PART_SEED);
+        let mut b = [0u32; NB];
+        for i in 0..512_000u32 {
+            b[part_of_u64(&st, pack9(format!("e{i:x}").as_bytes()).unwrap())] += 1;
+        }
+        let (mn, mx) = (*b.iter().min().unwrap(), *b.iter().max().unwrap());
+        assert!(mn > 800 && mx < 1200, "{mn} {mx}");
     }
 }
