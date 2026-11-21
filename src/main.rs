@@ -196,7 +196,7 @@ fn main() {
     // ---------------------------------------------------------------- identity
     let names = resolve_links(lk_src, &stats);
     lap("links resolved");
-    let person_of = |user: S| -> S { names.get(user).copied().unwrap_or(user) };
+    let person_of = |user: S| -> Person { names.get(user).copied().unwrap_or_else(|| Person::new(user)) };
     let part_state = RandomState(PART_SEED);
 
     // ---------------------------------------------------------------- clicks
@@ -323,13 +323,33 @@ const LINK_SEED: u64 = 0x1319_8A2E_0370_7344;
 /// Person names of linked IDs, split into `LP` hash partitions so the tables are built
 /// in parallel. Holds only the IDs whose person name differs from the ID itself.
 /// Night-06: tables keyed by packed IDs (`PMap`), partitioned by `packed::id_hash`.
+/// Night-10: a person's name plus its packed form (`NOPK` if the name does not pack),
+/// computed once where the name is at hand, so later stages partition and look up
+/// persons by an integer without reading the name bytes again.
+#[derive(Clone, Copy)]
+pub struct Person {
+    pub name: S,
+    pub key: u64,
+}
+pub const NOPK: u64 = u64::MAX; // packed values never have the top bit set
+impl Person {
+    #[inline]
+    pub fn new(name: S) -> Person {
+        Person { name, key: pack9(name).unwrap_or(NOPK) }
+    }
+}
+#[inline]
+fn person_part(ps: &RandomState, p: &Person) -> usize {
+    if p.key != NOPK { part_of_u64(ps, p.key) } else { part_of(ps, p.name) }
+}
+
 pub struct Names {
     state: RandomState,
-    parts: Vec<PMap<S>>,
+    parts: Vec<PMap<Person>>,
 }
 impl Names {
     #[inline]
-    pub fn get(&self, s: S) -> Option<&S> {
+    pub fn get(&self, s: S) -> Option<&Person> {
         let p = (packed::id_hash(&self.state, s) >> 40) as usize & (LP - 1);
         self.parts[p].get(s)
     }
@@ -342,7 +362,7 @@ impl Names {
 fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
     let mut st = Stage::start();
     let lstate = RandomState(LINK_SEED);
-    let names_of = |parts: Vec<PMap<S>>| Names { state: lstate, parts };
+    let names_of = |parts: Vec<PMap<Person>>| Names { state: lstate, parts };
     let part = |s: S| (packed::id_hash(&lstate, s) >> 40) as usize & (LP - 1);
     let items = work_items::<2>(src, ["user_id_a", "user_id_b"]);
     let edges: Vec<Vec<(S, S)>> = items
@@ -473,14 +493,14 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
     }
     st.mark("links: names");
     // name map, one table per partition (global ids of partition p are poff[p]..poff[p+1])
-    let parts: Vec<PMap<S>> = (0..LP)
+    let parts: Vec<PMap<Person>> = (0..LP)
         .into_par_iter()
         .map(|p| {
-            let mut m: PMap<S> = PMap::with_capacity(poff[p + 1] - poff[p]);
+            let mut m: PMap<Person> = PMap::with_capacity(poff[p + 1] - poff[p]);
             for i in poff[p]..poff[p + 1] {
                 let nm = ids[name[root[i] as usize] as usize];
                 if nm != ids[i] {
-                    m.insert_first(ids[i], nm);
+                    m.insert_first(ids[i], Person::new(nm));
                 }
             }
             m
@@ -500,7 +520,7 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
 #[derive(Clone, Copy)]
 struct ClickRaw {
     cid: S,
-    person: S,
+    person: Person,
     ts: i64,
     camp: u32,
 }
@@ -508,7 +528,7 @@ const NO_CAMP: u32 = u32::MAX - 1;
 
 #[derive(Clone, Copy)]
 pub struct ClickV {
-    pub person: S,
+    pub person: Person,
     pub ts: i64,
     pub cid: S,
     pub camp: u32,
@@ -533,7 +553,7 @@ fn clicks(
     campaigns: &PMap<u32>,
     lo: i64,
     hi: i64,
-    person_of: &(dyn Fn(S) -> S + Sync),
+    person_of: &(dyn Fn(S) -> Person + Sync),
     ps: &RandomState,
     stats: &Stats,
 ) -> ByPerson<ClickV> {
@@ -560,7 +580,7 @@ fn clicks(
                 }
                 let r = ClickRaw {
                     cid: f[0],
-                    person: if f[1].is_empty() { b"" } else { person_of(f[1]) },
+                    person: if f[1].is_empty() { Person { name: b"", key: NOPK } } else { person_of(f[1]) },
                     ts: timefmt::parse_in(f[3], lo, hi),
                     camp: campaigns.get(f[2]).copied().unwrap_or(NO_CAMP),
                 };
@@ -606,7 +626,7 @@ fn clicks(
             let mut dst: Vec<Vec<ClickV>> = (0..NB).map(|_| Vec::new()).collect();
             let (mut bu, mut bt, mut bc) = (0u64, 0u64, 0u64);
             for r in best.values().chain(fbest.values()) {
-                if r.person.is_empty() {
+                if r.person.name.is_empty() {
                     bu += 1;
                     continue;
                 }
@@ -618,7 +638,7 @@ fn clicks(
                     bc += 1;
                     continue;
                 }
-                dst[part_of(ps, r.person)].push(ClickV { person: r.person, ts: r.ts, cid: r.cid, camp: r.camp });
+                dst[person_part(ps, &r.person)].push(ClickV { person: r.person, ts: r.ts, cid: r.cid, camp: r.camp });
             }
             stats.add(K::ClBadUser, bu);
             stats.add(K::ClBadTs, bt);
@@ -643,7 +663,7 @@ const T_BAD: u8 = 3;
 // Night-03/05: `pack9` (packed IDs) lives in `packed.rs`.
 #[derive(Clone, Copy)]
 struct EvRaw {
-    person: S,      // empty if user_id was empty
+    person: Person, // empty name if user_id was empty
     ts: i64,        // BAD if invalid or outside the event window
     ingest: i64,
     cat: u32,   // NO_CAT if product_id empty
@@ -655,7 +675,7 @@ struct EvRaw {
 
 #[derive(Clone, Copy)]
 pub struct EvV {
-    pub person: S,
+    pub person: Person,
     pub ts: i64,
     pub cat: u32,
     pub price: u32, // > 0 iff purchase
@@ -692,7 +712,7 @@ fn events(
     unknown_cat: u32,
     lo: i64,
     hi: i64,
-    person_of: &(dyn Fn(S) -> S + Sync),
+    person_of: &(dyn Fn(S) -> Person + Sync),
     ps: &RandomState,
     stats: &Stats,
 ) -> ByPerson<EvV> {
@@ -735,7 +755,7 @@ fn events(
                 };
                 let ingest = parse_ingest(f[3]);
                 let r = EvRaw {
-                    person: if f[1].is_empty() { b"" } else { person_of(f[1]) },
+                    person: if f[1].is_empty() { Person { name: b"", key: NOPK } } else { person_of(f[1]) },
                     ts: timefmt::parse_in(f[2], lo, hi),
                     ingest: ingest.unwrap_or(i64::MAX),
                     cat,
@@ -802,7 +822,7 @@ fn events(
             let mut c = [0u64; 8];
             for r in best.values().chain(fbest.values()) {
                 // validation of the kept copy, in the order of rules.md
-                let reason = if r.person.is_empty() {
+                let reason = if r.person.name.is_empty() {
                     0
                 } else if r.ts == BAD {
                     1
@@ -818,7 +838,7 @@ fn events(
                     if r.unknown_product {
                         c[6] += 1;
                     }
-                    dst[part_of(ps, r.person)].push(EvV { person: r.person, ts: r.ts, cat: r.cat, price: r.price });
+                    dst[person_part(ps, &r.person)].push(EvV { person: r.person, ts: r.ts, cat: r.cat, price: r.price });
                     continue;
                 };
                 c[reason] += 1;
@@ -862,16 +882,23 @@ fn sessionize(
     stats: &Stats,
 ) -> Vec<output::UserRow> {
     let n: usize = evs[b].iter().map(Vec::len).sum();
-    let mut pid: Map<S, u32> = new_map(n / 8 + 16);
+    // Night-10: persons are numbered by packed key (exact name table for unpackable ones)
+    let mut pid: Map<u64, u32> = new_map(n / 8 + 16);
+    let mut pid_s: Map<S, u32> = new_map(0);
     let mut pname: Vec<S> = Vec::new();
     // (person, ts, cat, price)
     let mut ev: Vec<(u32, i64, u32, u32)> = Vec::with_capacity(n);
     for part in &evs[b] {
         for e in part {
-            let p = *pid.entry(e.person).or_insert_with(|| {
-                pname.push(e.person);
+            let mut fresh = || {
+                pname.push(e.person.name);
                 (pname.len() - 1) as u32
-            });
+            };
+            let p = if e.person.key != NOPK {
+                *pid.entry(e.person.key).or_insert_with(&mut fresh)
+            } else {
+                *pid_s.entry(e.person.name).or_insert_with(&mut fresh)
+            };
             ev.push((p, e.ts, e.cat, e.price));
         }
     }
@@ -881,7 +908,8 @@ fn sessionize(
     let mut cl: Vec<(u32, i64, S, u32)> = Vec::new();
     for part in &cls[b] {
         for c in part {
-            if let Some(&p) = pid.get(c.person) {
+            let found = if c.person.key != NOPK { pid.get(&c.person.key) } else { pid_s.get(c.person.name) };
+            if let Some(&p) = found {
                 cl.push((p, c.ts, c.cid, c.camp));
             }
         }
