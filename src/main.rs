@@ -494,13 +494,16 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
 
 // ====================================================================== clicks
 
+/// Night-07: a click parsed at scan time. `person` is empty iff user_id was empty,
+/// `ts` is BAD if invalid or outside the click window, `camp` is NO_CAMP if unknown.
 #[derive(Clone, Copy)]
 struct ClickRaw {
     cid: S,
-    user: S,
-    camp: S,
-    ts: S,
+    person: S,
+    ts: i64,
+    camp: u32,
 }
+const NO_CAMP: u32 = u32::MAX - 1;
 
 #[derive(Clone, Copy)]
 pub struct ClickV {
@@ -536,10 +539,12 @@ fn clicks(
     let mut st = Stage::start();
     let items = work_items::<4>(src, ["click_id", "user_id", "campaign_id", "ts"]);
     // scan + partition on click_id
-    let scattered: Vec<Vec<Vec<ClickRaw>>> = items
+    let scattered: Vec<(Vec<Vec<(u64, ClickRaw)>>, Vec<Vec<ClickRaw>>)> = items
         .par_iter()
         .map(|(order, chunk)| {
-            let mut parts: Vec<Vec<ClickRaw>> = (0..NB).map(|_| Vec::new()).collect();
+            // night-07: packed click_id keys (exact byte-string fallback set, as for events)
+            let mut parts: Vec<Vec<(u64, ClickRaw)>> = (0..NB).map(|_| Vec::new()).collect();
+            let mut fb: Vec<Vec<ClickRaw>> = (0..NB).map(|_| Vec::new()).collect();
             let (mut lines, mut bad, mut noid) = (0u64, 0u64, 0u64);
             for_each_line(chunk, |line| {
                 lines += 1;
@@ -552,54 +557,67 @@ fn clicks(
                     noid += 1;
                     return;
                 }
-                parts[part_of(ps, f[0])].push(ClickRaw { cid: f[0], user: f[1], camp: f[2], ts: f[3] });
+                let r = ClickRaw {
+                    cid: f[0],
+                    person: if f[1].is_empty() { b"" } else { person_of(f[1]) },
+                    ts: timefmt::parse_in(f[3], lo, hi),
+                    camp: campaigns.get(f[2]).copied().unwrap_or(NO_CAMP),
+                };
+                match pack9(f[0]) {
+                    Some(k) => parts[part_of_u64(ps, k)].push((k, r)),
+                    None => fb[part_of(ps, f[0])].push(r),
+                }
             });
             stats.add(K::ClLines, lines);
             stats.add(K::ClMalformed, bad);
             stats.add(K::ClNoId, noid);
-            parts
+            (parts, fb)
         })
         .collect();
     st.mark("clicks: scan+parse+partition");
-    let by_cid = transpose(scattered);
+    let (main_s, fb_s): (Vec<_>, Vec<_>) = scattered.into_iter().unzip();
+    let by_cid: Vec<(Vec<Vec<(u64, ClickRaw)>>, Vec<Vec<ClickRaw>>)> =
+        transpose(main_s).into_iter().zip(transpose(fb_s)).collect();
     st.mark("clicks: transpose");
-    // dedup on click_id (copies are identical; keep the smallest tuple for determinism),
-    // then validate, then re-partition on person
+    // dedup on click_id (copies are identical; keep the first), then validate the kept
+    // copy, then re-partition on person
     let out: Vec<Vec<Vec<ClickV>>> = by_cid
         .into_par_iter()
-        .map(|parts| {
+        .map(|(parts, fparts)| {
             let n: usize = parts.iter().map(Vec::len).sum();
-            let mut best: Map<S, ClickRaw> = new_map(n);
+            let nf: usize = fparts.iter().map(Vec::len).sum();
+            // rules.md, Clicks step 2: "Copies of a click have identical values, so keep
+            // any one". The first copy in scan order is kept (deterministic: transpose
+            // keeps file-then-chunk order, independent of thread count).
+            let mut best: Map<u64, ClickRaw> = new_map(n);
             for part in &parts {
-                for r in part {
-                    best.entry(r.cid)
-                        .and_modify(|cur| {
-                            if (r.user, r.camp, r.ts) < (cur.user, cur.camp, cur.ts) {
-                                *cur = *r;
-                            }
-                        })
-                        .or_insert(*r);
+                for (k, r) in part {
+                    best.entry(*k).or_insert(*r);
                 }
             }
-            stats.add(K::ClDupCopies, (n - best.len()) as u64);
+            let mut fbest: Map<S, ClickRaw> = new_map(nf);
+            for part in &fparts {
+                for r in part {
+                    fbest.entry(r.cid).or_insert(*r);
+                }
+            }
+            stats.add(K::ClDupCopies, (n - best.len() + nf - fbest.len()) as u64);
             let mut dst: Vec<Vec<ClickV>> = (0..NB).map(|_| Vec::new()).collect();
             let (mut bu, mut bt, mut bc) = (0u64, 0u64, 0u64);
-            for r in best.values() {
-                if r.user.is_empty() {
+            for r in best.values().chain(fbest.values()) {
+                if r.person.is_empty() {
                     bu += 1;
                     continue;
                 }
-                let ts = timefmt::parse_in(r.ts, lo, hi);
-                if ts == BAD {
+                if r.ts == BAD {
                     bt += 1;
                     continue;
                 }
-                let Some(&camp) = campaigns.get(r.camp) else {
+                if r.camp == NO_CAMP {
                     bc += 1;
                     continue;
-                };
-                let person = person_of(r.user);
-                dst[part_of(ps, person)].push(ClickV { person, ts, cid: r.cid, camp });
+                }
+                dst[part_of(ps, r.person)].push(ClickV { person: r.person, ts: r.ts, cid: r.cid, camp: r.camp });
             }
             stats.add(K::ClBadUser, bu);
             stats.add(K::ClBadTs, bt);
