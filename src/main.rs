@@ -314,9 +314,36 @@ fn load_campaigns(src: &'static Source) -> (Map<S, u32>, Vec<S>, Vec<S>) {
 
 // ====================================================================== identity
 
+/// Night-02: number of hash partitions for link IDs (interning and the name map).
+const LP: usize = 64;
+const LINK_SEED: u64 = 0x1319_8A2E_0370_7344;
+
+/// Person names of linked IDs, split into `LP` hash partitions so the tables are built
+/// in parallel. Holds only the IDs whose person name differs from the ID itself.
+pub struct Names {
+    state: RandomState,
+    parts: Vec<Map<S, S>>,
+}
+impl Names {
+    #[inline]
+    fn part(&self, s: S) -> usize {
+        (self.state.hash_one(s) >> 40) as usize & (LP - 1)
+    }
+    #[inline]
+    pub fn get(&self, s: S) -> Option<&S> {
+        self.parts[self.part(s)].get(s)
+    }
+}
+
 /// Connected components over link edges (union-find with path halving + union by size).
-/// Returns only the IDs whose person name differs from the ID itself.
-fn resolve_links(src: &[&'static Source], stats: &Stats) -> Map<S, S> {
+/// Night-02: IDs are interned in parallel, one table per hash partition; the union-find
+/// itself then runs on dense integers. The name of a person is still the byte-wise
+/// smallest member ID, so the result does not depend on partitioning or union order.
+fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
+    let mut st = Stage::start();
+    let lstate = RandomState(LINK_SEED);
+    let names_of = |parts: Vec<Map<S, S>>| Names { state: lstate, parts };
+    let part = |s: S| (lstate.hash_one(s) >> 40) as usize & (LP - 1);
     let items = work_items::<2>(src, ["user_id_a", "user_id_b"]);
     let edges: Vec<Vec<(S, S)>> = items
         .par_iter()
@@ -344,20 +371,68 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Map<S, S> {
             v
         })
         .collect();
-    let n_edges: usize = edges.iter().map(Vec::len).sum();
-    let mut id: Map<S, u32> = new_map(n_edges * 2);
-    let mut ids: Vec<S> = Vec::with_capacity(n_edges * 2);
-    let mut parent: Vec<u32> = Vec::with_capacity(n_edges * 2);
-    let mut size: Vec<u32> = Vec::with_capacity(n_edges * 2);
-    let mut intern = |s: S, ids: &mut Vec<S>, parent: &mut Vec<u32>, size: &mut Vec<u32>| -> u32 {
-        *id.entry(s).or_insert_with(|| {
-            let i = ids.len() as u32;
-            ids.push(s);
-            parent.push(i);
-            size.push(1);
-            i
+    st.mark("links: parse");
+    // global edge numbering: chunk offsets
+    let mut eoff = Vec::with_capacity(edges.len() + 1);
+    eoff.push(0usize);
+    for c in &edges {
+        eoff.push(eoff.last().unwrap() + c.len());
+    }
+    let n_edges = *eoff.last().unwrap();
+    // scatter (id, slot) by partition, slot = 2 * edge + side
+    let scattered: Vec<Vec<Vec<(S, u32)>>> = edges
+        .par_iter()
+        .enumerate()
+        .map(|(ci, c)| {
+            let mut out: Vec<Vec<(S, u32)>> = (0..LP).map(|_| Vec::with_capacity(c.len() * 2 / LP + 8)).collect();
+            for (k, &(a, b)) in c.iter().enumerate() {
+                let slot = (2 * (eoff[ci] + k)) as u32;
+                out[part(a)].push((a, slot));
+                out[part(b)].push((b, slot + 1));
+            }
+            out
         })
-    };
+        .collect();
+    // per partition: intern -> (distinct ids, (slot, local index) pairs)
+    let interned: Vec<(Vec<S>, Vec<(u32, u32)>)> = (0..LP)
+        .into_par_iter()
+        .map(|p| {
+            let n: usize = scattered.iter().map(|v| v[p].len()).sum();
+            let mut m: Map<S, u32> = new_map(n);
+            let mut ids: Vec<S> = Vec::with_capacity(n);
+            let mut slots: Vec<(u32, u32)> = Vec::with_capacity(n);
+            for v in &scattered {
+                for &(s, slot) in &v[p] {
+                    let l = *m.entry(s).or_insert_with(|| {
+                        ids.push(s);
+                        (ids.len() - 1) as u32
+                    });
+                    slots.push((slot, l));
+                }
+            }
+            (ids, slots)
+        })
+        .collect();
+    drop(scattered);
+    let mut poff = Vec::with_capacity(LP + 1);
+    poff.push(0usize);
+    for (ids, _) in &interned {
+        poff.push(poff.last().unwrap() + ids.len());
+    }
+    let n = poff[LP];
+    let mut side = vec![0u32; 2 * n_edges];
+    let mut ids: Vec<S> = Vec::with_capacity(n);
+    for (p, (pids, slots)) in interned.iter().enumerate() {
+        ids.extend_from_slice(pids);
+        let o = poff[p] as u32;
+        for &(slot, l) in slots {
+            side[slot as usize] = o + l;
+        }
+    }
+    drop(interned);
+    st.mark("links: intern");
+    let mut parent: Vec<u32> = (0..n as u32).collect();
+    let mut size: Vec<u32> = vec![1; n];
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         while parent[x as usize] != x {
             let g = parent[parent[x as usize] as usize];
@@ -366,19 +441,16 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Map<S, S> {
         }
         x
     }
-    for chunk in &edges {
-        for &(a, b) in chunk {
-            let ia = intern(a, &mut ids, &mut parent, &mut size);
-            let ib = intern(b, &mut ids, &mut parent, &mut size);
-            let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
-            if ra != rb {
-                let (big, small) = if size[ra as usize] >= size[rb as usize] { (ra, rb) } else { (rb, ra) };
-                parent[small as usize] = big;
-                size[big as usize] += size[small as usize];
-            }
+    for e in side.chunks_exact(2) {
+        let (ra, rb) = (find(&mut parent, e[0]), find(&mut parent, e[1]));
+        if ra != rb {
+            let (big, small) = if size[ra as usize] >= size[rb as usize] { (ra, rb) } else { (rb, ra) };
+            parent[small as usize] = big;
+            size[big as usize] += size[small as usize];
         }
     }
-    let n = ids.len();
+    drop(side);
+    st.mark("links: union");
     let mut name: Vec<u32> = (0..n as u32).collect(); // per root: index of the smallest member
     let mut root = vec![0u32; n];
     for i in 0..n {
@@ -388,26 +460,36 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Map<S, S> {
             name[r as usize] = i as u32;
         }
     }
-    let mut out: Map<S, S> = new_map(n);
     let mut multi = 0u64;
     let mut largest = 0u64;
     for i in 0..n {
-        let r = root[i] as usize;
-        if r == i {
-            if size[r] > 1 {
+        if root[i] as usize == i {
+            if size[i] > 1 {
                 multi += 1;
             }
-            largest = largest.max(size[r] as u64);
-        }
-        let nm = ids[name[r] as usize];
-        if nm != ids[i] {
-            out.insert(ids[i], nm);
+            largest = largest.max(size[i] as u64);
         }
     }
+    st.mark("links: names");
+    // name map, one table per partition (global ids of partition p are poff[p]..poff[p+1])
+    let parts: Vec<Map<S, S>> = (0..LP)
+        .into_par_iter()
+        .map(|p| {
+            let mut m: Map<S, S> = new_map(poff[p + 1] - poff[p]);
+            for i in poff[p]..poff[p + 1] {
+                let nm = ids[name[root[i] as usize] as usize];
+                if nm != ids[i] {
+                    m.insert(ids[i], nm);
+                }
+            }
+            m
+        })
+        .collect();
+    st.mark("links: out map");
     stats.add(K::LkIds, n as u64);
     stats.add(K::LkPeopleMultiId, multi);
     stats.add(K::LkLargestPerson, largest);
-    out
+    names_of(parts)
 }
 
 // ====================================================================== clicks
@@ -979,5 +1061,21 @@ mod packed {
         }
         let (mn, mx) = (*b.iter().min().unwrap(), *b.iter().max().unwrap());
         assert!(mn > 800 && mx < 1200, "{mn} {mx}");
+    }
+}
+
+#[cfg(test)]
+mod link_parts {
+    use std::hash::BuildHasher;
+    /// Night-02: link partitions (LINK_SEED, bits 40..46) are well spread over user-like IDs.
+    #[test]
+    fn link_partition_spread() {
+        let st = super::RandomState(super::LINK_SEED);
+        let mut b = [0u32; super::LP];
+        for i in 0..640_000u32 {
+            b[(st.hash_one(format!("u{i}").as_bytes()) >> 40) as usize & (super::LP - 1)] += 1;
+        }
+        let (mn, mx) = (*b.iter().min().unwrap(), *b.iter().max().unwrap());
+        assert!(mn > 9_500 && mx < 10_500, "{mn} {mx}");
     }
 }
