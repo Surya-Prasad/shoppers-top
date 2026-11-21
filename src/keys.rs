@@ -123,9 +123,47 @@ impl KeyMap {
     pub fn len(&self) -> usize {
         self.len
     }
+    /// RW11: double the table when it would pass half full (it never fills up).
+    fn grow_if_needed(&mut self) {
+        if (self.len + 1) * 2 <= self.slots.len() {
+            return;
+        }
+        let bigger = vec![(EMPTY, 0); self.slots.len() * 2];
+        let old = std::mem::replace(&mut self.slots, bigger);
+        self.mask = self.slots.len() - 1;
+        for (k, v) in old {
+            if k != EMPTY {
+                let mut i = fmix(k) as usize & self.mask;
+                while self.slots[i].0 != EMPTY {
+                    i = (i + 1) & self.mask;
+                }
+                self.slots[i] = (k, v);
+            }
+        }
+    }
+    /// The value of `k`, inserting `f()` first if absent.
+    pub fn get_or_insert_with(&mut self, k: u64, f: impl FnOnce() -> u64) -> u64 {
+        debug_assert!(k != EMPTY);
+        self.grow_if_needed();
+        let mut i = fmix(k) as usize & self.mask;
+        loop {
+            let s = &mut self.slots[i];
+            if s.0 == EMPTY {
+                let v = f();
+                *s = (k, v);
+                self.len += 1;
+                return v;
+            }
+            if s.0 == k {
+                return s.1;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
     /// Insert unless present (first value wins).
     pub fn insert_first(&mut self, k: u64, v: u64) {
         debug_assert!(k != EMPTY);
+        self.grow_if_needed();
         let mut i = fmix(k) as usize & self.mask;
         loop {
             let s = &mut self.slots[i];
@@ -195,6 +233,16 @@ mod tests {
             m.insert_first(pack9(format!("u{i:x}").as_bytes()).unwrap(), i);
         }
         m.insert_first(pack9(b"u1").unwrap(), 999); // first wins
+        // growth from a tiny table keeps every entry
+        let mut g = KeyMap::with_capacity(1);
+        for i in 1..=50_000u64 {
+            assert_eq!(g.get_or_insert_with(pack9(format!("p{i}").as_bytes()).unwrap(), || i), i);
+        }
+        for i in 1..=50_000u64 {
+            let k = pack9(format!("p{i}").as_bytes()).unwrap();
+            assert_eq!(g.get_mixed(fmix(k), k), Some(i));
+            assert_eq!(g.get_or_insert_with(k, || 0), i);
+        }
         assert_eq!(m.len(), 100_000);
         for i in 1..=100_000u64 {
             let k = pack9(format!("u{i:x}").as_bytes()).unwrap();

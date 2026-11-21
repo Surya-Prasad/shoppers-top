@@ -78,6 +78,47 @@ pub fn id_hash(st: &crate::RandomState, s: &[u8]) -> u64 {
     }
 }
 
+/// RW11: u32-valued ID map: packed IDs in a flat `KeyMap`, all others in an exact byte-string
+/// table. Lookups never intern (an unknown long ID just misses).
+pub struct IdMap {
+    packed: crate::keys::KeyMap,
+    other: Map<S, u32>,
+}
+
+impl IdMap {
+    pub fn with_capacity(n: usize) -> IdMap {
+        IdMap { packed: crate::keys::KeyMap::with_capacity(n), other: new_map(0) }
+    }
+    #[inline]
+    pub fn get(&self, s: &[u8]) -> Option<u32> {
+        match pack9(s) {
+            Some(k) if !s.is_empty() => self.packed.get_mixed(fmix(k), k).map(|v| v as u32),
+            Some(_) => None,
+            None => self.other.get(s).copied(),
+        }
+    }
+    pub fn contains_key(&self, s: &[u8]) -> bool {
+        self.get(s).is_some()
+    }
+    /// Value of `s`, inserting `f()` first if absent (`s` non-empty).
+    #[inline]
+    pub fn get_or_insert_with(&mut self, s: S, f: impl FnOnce() -> u32) -> u32 {
+        match pack9(s) {
+            Some(k) if !s.is_empty() => self.packed.get_or_insert_with(k, || f() as u64) as u32,
+            _ => *self.other.entry(s).or_insert_with(f),
+        }
+    }
+    /// Insert unless the key is present (first occurrence wins; `s` non-empty).
+    pub fn insert_first(&mut self, s: S, v: u32) {
+        match pack9(s) {
+            Some(k) if !s.is_empty() => self.packed.insert_first(k, v as u64),
+            _ => {
+                self.other.entry(s).or_insert(v);
+            }
+        }
+    }
+}
+
 pub struct PMap<V> {
     packed: MixedMap<V>, // keyed by fmix(pack9(id))
     other: Map<S, V>,

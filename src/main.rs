@@ -9,6 +9,7 @@
 //!   5. per person part   sort(person, ts) -> sessionize -> attribute -> aggregate
 //!   6. output            user_daily(user_id, day) PK, campaign_daily(campaign_id, day) PK
 
+#[allow(dead_code)]
 mod alloc;
 mod dialect;
 mod hashing;
@@ -26,14 +27,13 @@ use std::hash::BuildHasher;
 
 use hashing::Seeded as RandomState;
 
-// RW8: large allocations on 2 MiB transparent huge pages (Linux); system allocator otherwise
-#[global_allocator]
-static GLOBAL: alloc::HugeAlloc = alloc::HugeAlloc;
+// RW8's huge-page allocator (src/alloc.rs) measured neutral on x86 CI and adds unsafe code
+// whose failure would score zero; RW11 leaves it unregistered (the system allocator is used).
 use rayon::prelude::*;
 
 use dialect::{Source, chunks, for_each_record_idx, for_each_record_ix, for_each_record_swar, csv_files, data_region, for_each_line, for_each_record, header_order, split};
 use keys::{KeyMap, key_of};
-use packed::{PMap, pack9};
+use packed::{IdMap, pack9};
 use timefmt::{BAD, DAY};
 
 pub type Map<K, V> = std::collections::HashMap<K, V, RandomState>;
@@ -278,7 +278,7 @@ fn main() {
 }
 
 /// SS_EXP=1: single-thread cost of each scan layer over all event files (profiling only).
-fn experiment(src: &[&'static Source], products: &PMap<u32>, lo: i64, hi: i64, names: &Names) {
+fn experiment(src: &[&'static Source], products: &IdMap, lo: i64, hi: i64, names: &Names) {
     const NAMES: [&str; 7] = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"];
     let items = work_items::<7>(src, NAMES);
     let bytes: usize = items.iter().map(|(_, c)| c.len()).sum();
@@ -388,7 +388,7 @@ fn experiment(src: &[&'static Source], products: &PMap<u32>, lo: i64, hi: i64, n
     });
     run("+ person lookup", &|f| {
         key_of(f[0]) ^ names.person(key_of(f[1])) ^ timefmt::parse_in(f[2], lo, hi) as u64 ^ parse_ingest(f[3]).unwrap_or(0) as u64
-            ^ (f[4] == b"purchase") as u64 ^ parse_price(f[6]) as u64 ^ products.get(f[5]).copied().unwrap_or(0) as u64
+            ^ (f[4] == b"purchase") as u64 ^ parse_price(f[6]) as u64 ^ products.get(f[5]).unwrap_or(0) as u64
     });
     // + scatter: the same work, pushing a 40-byte record into one of NB partition vectors
     let t = Instant::now();
@@ -400,7 +400,7 @@ fn experiment(src: &[&'static Source], products: &PMap<u32>, lo: i64, hi: i64, n
                 let f = reorder(r, order);
                 let eid = key_of(f[0]);
                 let r = EvRec { eid, rank: rank_of(parse_ingest(f[3])), person: names.person(key_of(f[1])), ts: timefmt::parse_in(f[2], lo, hi),
-                    price: parse_price(f[6]), cat: products.get(f[5]).copied().unwrap_or(0) };
+                    price: parse_price(f[6]), cat: products.get(f[5]).unwrap_or(0) };
                 parts[keys::part(eid, LOG_NB)].push(r);
             }
         });
@@ -410,7 +410,7 @@ fn experiment(src: &[&'static Source], products: &PMap<u32>, lo: i64, hi: i64, n
     eprintln!("{:<28} {secs:>6.3}s  {:>6.1} ns/line  (kept {kept})", "+ person + scatter", secs * 1e9 / lines as f64);
     run("+ product lookup", &|f| {
         key_of(f[0]) ^ key_of(f[1]) ^ timefmt::parse_in(f[2], lo, hi) as u64 ^ parse_ingest(f[3]).unwrap_or(0) as u64
-            ^ (f[4] == b"purchase") as u64 ^ parse_price(f[6]) as u64 ^ products.get(f[5]).copied().unwrap_or(0) as u64
+            ^ (f[4] == b"purchase") as u64 ^ parse_price(f[6]) as u64 ^ products.get(f[5]).unwrap_or(0) as u64
     });
 }
 
@@ -418,7 +418,7 @@ fn experiment(src: &[&'static Source], products: &PMap<u32>, lo: i64, hi: i64, n
 
 /// products(product_id PK, category). First occurrence wins if a key repeats.
 /// Categories are numbered in byte order, so "smallest index" == "byte-wise smallest name".
-fn load_products(src: &'static Source) -> (PMap<u32>, Vec<S>) {
+fn load_products(src: &'static Source) -> (IdMap, Vec<S>) {
     let bytes: S = src.bytes();
     let order = header_order::<2>(bytes, ["product_id", "category"]);
     let mut rows: Vec<(S, S)> = Vec::new();
@@ -438,7 +438,7 @@ fn load_products(src: &'static Source) -> (PMap<u32>, Vec<S>) {
     for (i, c) in cats.iter().enumerate() {
         idx.insert(*c, i as u32);
     }
-    let mut products: PMap<u32> = PMap::with_capacity(rows.len());
+    let mut products: IdMap = IdMap::with_capacity(rows.len());
     for (p, c) in rows {
         products.insert_first(p, idx[c]);
     }
@@ -446,10 +446,10 @@ fn load_products(src: &'static Source) -> (PMap<u32>, Vec<S>) {
 }
 
 /// campaigns(campaign_id PK, channel). Returns id -> dense index, channel per index, id per index.
-fn load_campaigns(src: &'static Source) -> (PMap<u32>, Vec<S>, Vec<S>) {
+fn load_campaigns(src: &'static Source) -> (IdMap, Vec<S>, Vec<S>) {
     let bytes: S = src.bytes();
     let order = header_order::<2>(bytes, ["campaign_id", "channel"]);
-    let mut m: PMap<u32> = PMap::with_capacity(4096);
+    let mut m: IdMap = IdMap::with_capacity(4096);
     let (mut ch, mut ids) = (Vec::new(), Vec::new());
     for_each_line(data_region(bytes), |line| {
         if let Some(f) = split::<2>(line) {
@@ -587,12 +587,12 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
         .into_par_iter()
         .map(|p| {
             let n: usize = scattered.iter().map(|v| v[p].len()).sum();
-            let mut m: PMap<u32> = PMap::with_capacity(n);
+            let mut m: IdMap = IdMap::with_capacity(n);
             let mut ids: Vec<S> = Vec::with_capacity(n);
             let mut slots: Vec<(u32, u32)> = Vec::with_capacity(n);
             for v in &scattered {
                 for &(s, slot) in &v[p] {
-                    let l = *m.get_or_insert_with(s, || {
+                    let l = m.get_or_insert_with(s, || {
                         ids.push(s);
                         (ids.len() - 1) as u32
                     });
@@ -792,7 +792,7 @@ fn dedup<T: Copy>(parts: &[Vec<T>], key: impl Fn(&T) -> u64, better: impl Fn(&T,
     used
 }
 
-fn clicks(src: &[&'static Source], campaigns: &PMap<u32>, lo: i64, hi: i64, names: &Names, stats: &Stats) -> ByPerson<ClickV> {
+fn clicks(src: &[&'static Source], campaigns: &IdMap, lo: i64, hi: i64, names: &Names, stats: &Stats) -> ByPerson<ClickV> {
     let mut st = Stage::start();
     let items = work_items::<4>(src, ["click_id", "user_id", "campaign_id", "ts"]);
     // scan + validate each copy + partition on click_id
@@ -828,7 +828,7 @@ fn clicks(src: &[&'static Source], campaigns: &PMap<u32>, lo: i64, hi: i64, name
                     } else {
                         match campaigns.get(f[2]) {
                             None => r.why = 3,
-                            Some(&c) => {
+                            Some(c) => {
                                 r.ts = ts;
                                 r.camp = c;
                                 pend.push(names, r, key_of(f[1]), &mut put);
@@ -940,7 +940,7 @@ fn rank_of(ingest: Option<i64>) -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn events(src: &[&'static Source], products: &PMap<u32>, unknown_cat: u32, lo: i64, hi: i64, names: &Names, stats: &Stats) -> ByPerson<EvV> {
+fn events(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: i64, hi: i64, names: &Names, stats: &Stats) -> ByPerson<EvV> {
     const NAMES: [&str; 7] = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"];
     let mut st = Stage::start();
     let items = work_items::<7>(src, NAMES);
@@ -993,7 +993,7 @@ fn events(src: &[&'static Source], products: &PMap<u32>, unknown_cat: u32, lo: i
                             Some(ing) if ing.saturating_sub(ts) <= DAY => {
                                 r.ts = ts;
                                 r.price = price;
-                                r.cat = products.get(f[5]).copied().unwrap_or(unknown_cat);
+                                r.cat = products.get(f[5]).unwrap_or(unknown_cat);
                                 // RW2: person resolved in a prefetched batch
                                 pend.push(names, r, key_of(f[1]), &mut put);
                                 return;
