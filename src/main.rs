@@ -153,12 +153,30 @@ fn work_items<const N: usize>(sources: &[&'static Source], names: [&str; N]) -> 
 }
 
 #[inline]
+/// Fields in the documented order. RW24: the identity order (every generated file) is a
+/// no-op, checked with one predictable branch instead of an indexed copy per line.
+#[inline(always)]
 fn reorder<const N: usize>(f: [S; N], order: &[usize; N]) -> [S; N] {
+    if is_identity(order) {
+        return f;
+    }
     let mut out = f;
     for i in 0..N {
         out[i] = f[order[i]];
     }
     out
+}
+
+#[inline(always)]
+fn is_identity<const N: usize>(order: &[usize; N]) -> bool {
+    let mut i = 0;
+    while i < N {
+        if order[i] != i {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 fn main() {
