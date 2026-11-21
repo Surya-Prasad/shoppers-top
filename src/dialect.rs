@@ -214,3 +214,168 @@ mod tests {
         assert!(data_region(b"header\n").is_empty());
     }
 }
+
+// ====================================================================== night-04: fused scanner
+
+/// Bitmasks of `\n`, `,` and `"` for 16 bytes at `p` (bit i = byte p+i).
+#[inline(always)]
+fn masks16(p: &[u8; 16]) -> (u32, u32, u32) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        // SSE2 is part of the x86_64 baseline: no runtime detection needed.
+        let v = _mm_loadu_si128(p.as_ptr() as *const __m128i);
+        let nl = _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(b'\n' as i8))) as u32;
+        let c = _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(b',' as i8))) as u32;
+        let q = _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(b'"' as i8))) as u32;
+        (nl, c, q)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let (mut nl, mut c, mut q) = (0u32, 0u32, 0u32);
+        for (i, &b) in p.iter().enumerate() {
+            nl |= ((b == b'\n') as u32) << i;
+            c |= ((b == b',') as u32) << i;
+            q |= ((b == b'"') as u32) << i;
+        }
+        (nl, c, q)
+    }
+}
+
+/// One pass over a chunk: for every line (same lines as `for_each_line`), call `f` with
+/// the line's N fields under the dialect (`split::<N>`), or None if it is malformed.
+/// Lines up to 128 bytes take a mask-based fast path; longer ones fall back to `split`.
+#[inline]
+pub fn for_each_record<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(Option<[&'a [u8]; N]>)) {
+    let len = chunk.len();
+    let mut start = 0usize;
+    #[allow(unused_assignments)]
+    let mut tail = [b'\n'; 16];
+    while start < len {
+        // gather masks block by block until the line's '\n' (or a long line)
+        let (mut cm, mut qm) = (0u128, 0u128);
+        let mut k = 0usize; // blocks read
+        let line_len;
+        loop {
+            let p = start + 16 * k;
+            let blk: &[u8; 16] = if p + 16 <= len {
+                chunk[p..p + 16].try_into().unwrap()
+            } else {
+                // past the chunk: pad with '\n', which ends a final line without one
+                tail = [b'\n'; 16];
+                let n = len.saturating_sub(p);
+                tail[..n].copy_from_slice(&chunk[p..p + n]);
+                &tail
+            };
+            let (nl, c, q) = masks16(blk);
+            if k < 8 {
+                cm |= (c as u128) << (16 * k);
+                qm |= (q as u128) << (16 * k);
+            }
+            if nl != 0 {
+                line_len = 16 * k + nl.trailing_zeros() as usize;
+                break;
+            }
+            k += 1;
+        }
+        let end = (start + line_len).min(len);
+        let line = &chunk[start..end];
+        start = start + line_len + 1;
+        if line_len > 128 {
+            f(split::<N>(line));
+            continue;
+        }
+        if line_len == 0 {
+            f(None);
+            continue;
+        }
+        let keep = if line_len == 128 { u128::MAX } else { (1u128 << line_len) - 1 };
+        let (mut cm, qm) = (cm & keep, qm & keep);
+        if cm.count_ones() as usize != N - 1 {
+            f(None);
+            continue;
+        }
+        let mut out: [&'a [u8]; N] = [&[]; N];
+        let mut s = 0usize;
+        let mut ok = true;
+        for slot in out.iter_mut() {
+            let e = if cm == 0 { line_len } else { cm.trailing_zeros() as usize };
+            cm &= cm.wrapping_sub(1);
+            // field [s, e): no quote, or exactly one at s and one at e-1 (e-1 > s)
+            let range = if e - s == 128 { u128::MAX } else { ((1u128 << (e - s)) - 1) << s };
+            let fq = qm & range;
+            if fq == 0 {
+                *slot = &line[s..e];
+            } else if e >= s + 2 && fq == ((1u128 << s) | (1u128 << (e - 1))) {
+                *slot = &line[s + 1..e - 1];
+            } else {
+                ok = false;
+                break;
+            }
+            s = e + 1;
+        }
+        f(if ok { Some(out) } else { None });
+    }
+}
+
+#[cfg(test)]
+mod fused_tests {
+    use super::*;
+
+    fn lcg(x: &mut u64) -> u64 {
+        *x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *x >> 33
+    }
+
+    fn reference<const N: usize>(chunk: &[u8]) -> Vec<Option<Vec<Vec<u8>>>> {
+        let mut v = Vec::new();
+        for_each_line(chunk, |l| v.push(split::<N>(l).map(|a| a.iter().map(|x| x.to_vec()).collect())));
+        v
+    }
+    fn fused<const N: usize>(chunk: &[u8]) -> Vec<Option<Vec<Vec<u8>>>> {
+        let mut v = Vec::new();
+        for_each_record::<N>(chunk, |r| v.push(r.map(|a| a.iter().map(|x| x.to_vec()).collect())));
+        v
+    }
+
+    /// The fused scanner equals for_each_line + split on random dialect-noise chunks,
+    /// including lines around the 16/128-byte block edges and chunks without a final '\n'.
+    #[test]
+    fn fused_matches_split() {
+        let alpha: &[u8] = b"ab,,,\"\"\"\n\n\r 0z";
+        let mut x = 7u64;
+        for _ in 0..30_000 {
+            let len = (lcg(&mut x) % 300) as usize;
+            let mut c: Vec<u8> = Vec::with_capacity(len);
+            while c.len() < len {
+                match lcg(&mut x) % 6 {
+                    0 => { // a near-valid line with long fields
+                        let fl = (lcg(&mut x) % 40) as usize;
+                        for i in 0..(1 + lcg(&mut x) % 8) {
+                            if i > 0 { c.push(b','); }
+                            let q = lcg(&mut x) % 3 == 0;
+                            if q { c.push(b'"'); }
+                            for _ in 0..fl { c.push(b'a' + (lcg(&mut x) % 26) as u8); }
+                            if q { c.push(b'"'); }
+                        }
+                        c.push(b'\n');
+                    }
+                    _ => c.push(alpha[(lcg(&mut x) as usize) % alpha.len()]),
+                }
+            }
+            assert_eq!(fused::<2>(&c), reference::<2>(&c), "{:?}", String::from_utf8_lossy(&c));
+            assert_eq!(fused::<4>(&c), reference::<4>(&c), "{:?}", String::from_utf8_lossy(&c));
+            assert_eq!(fused::<7>(&c), reference::<7>(&c), "{:?}", String::from_utf8_lossy(&c));
+        }
+        // exact block edges
+        for n in [15usize, 16, 17, 31, 32, 33, 126, 127, 128, 129, 130, 200] {
+            let mut line = vec![b'a'; n];
+            line[n / 2] = b',';
+            for tail in [true, false] {
+                let mut c = line.clone();
+                if tail { c.push(b'\n'); }
+                assert_eq!(fused::<2>(&c), reference::<2>(&c), "n={n} tail={tail}");
+            }
+        }
+    }
+}
