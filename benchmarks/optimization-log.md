@@ -262,6 +262,7 @@ work at open time, which is what we see. On a real disk the result may differ.
 | N06 | Packed link interning + name map | B | `3aa0b90` | CI gate PASS | CI 6.506 vs 6.799 (−4.3%, 6/7) | – | CI 23.070 vs 24.202 (−4.7%, 5/5) | – | 11.4 GB RSS | **Keep** |
 | N07 | Clicks parsed at scan + packed click_id | B | `2d683c6` | CI gate PASS | CI 6.550 vs 6.706 (−2.3%, 7/7) | – | CI 22.246 vs 22.948 (−3.1%, 5/5) | – | 11.4 GB RSS | **Keep** |
 | N09 | Dedup table of row indices | B | not pushed | local only | local 20M dedup 0.774 vs 0.738 s | – | – | – | – | **Revert** (no local gain) |
+| N08 | SWAR F1/F2 timestamp parse | B | `48a91c9` | CI gate PASS | CI 5.052 vs 5.136 (−1.6%, 5/7) | – | CI 16.854 vs 16.888 (−0.2%, 3/5) | – | 11.4 GB RSS | **Revert** (below −2%) |
 
 ## Overnight loop (2026-11-21, CI x86 timing)
 
@@ -362,3 +363,14 @@ CI (`2d683c6` vs `42fa641`; Xeon 8573C): gate PASS; **20M 6.706 → 6.550 s (−
 
 Screened out locally, not pushed: *dedup table of row indices* (key → (part, row), 16-byte entries instead of
 56-byte records): 20M dedup 0.738 → 0.774 s, no gain.
+
+### Night-08: SWAR F1/F2 timestamp parsing: **REVERT**
+
+`timefmt::parse` checks the F1/F2 layout (separators and digit positions) with three word-sized masks and extracts
+fields from the XOR-0x30 words; F3 keeps the original code (a one-pass F3 rewrite was slower in a microbenchmark,
+26.6 vs 16.7 ns, and was dropped before pushing). Equivalence test vs the original parser (2M random mutations of
+every form, every calendar day 2024–2029, leap-day edges) passed. Microbenchmark F1: 29 → 14 ns per parse.
+
+CI (`48a91c9` vs `42fa641`; Xeon 6975P-C): gate PASS; 20M 5.136 → 5.052 s (**−1.6%**, 5/7); 60M 16.888 → 16.854 s
+(−0.2%, 3/5). Below the −2% bar: **revert** (branch `opt/night-08-swar-ts` kept). A candidate to combine with
+another parse-side change later.
