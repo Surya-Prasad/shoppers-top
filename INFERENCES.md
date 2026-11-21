@@ -156,3 +156,51 @@ Raw counters for the dev run: [docs/data/dev-stats.json](docs/data/dev-stats.jso
 3. Cold I/O on the scorer is unmeasured; `madvise(WILLNEED)` prefetch is a cheap option.
 4. Submissions are rate-limited (2/hour): run `make fixtures`, `make check-dev` and
    `tests/fuzz.py` before every submit.
+
+## F. Head-to-head: Vishi99/builders2026 @ 8a74d83 (2026-11-20)
+
+Their engine: C++ (packed integer IDs, AVX2/NEON CSV scan, pread chunks) called from Python;
+PyArrow writes Parquet. Built and run **only inside Docker** (no network, read-only root,
+caps dropped, uid 1000). Both images built natively for linux/arm64 on this Mac; colima VM
+with 8 CPUs / 18 GB; data on a **VM-local volume** (colima's Mac file sharing penalizes mmap,
+which made ours look ~2× slower at first; the scorer mounts local disk).
+
+| Check | Theirs | Ours |
+| --- | --- | --- |
+| 36 fixtures (container, scorer flags) | 36/36 | 36/36 |
+| 1M dev answer | MATCH | MATCH |
+| Fuzz, 800 cases, strict-spec | 0 failures | 0 failures |
+| Fuzz, 800 cases, incl. header-like *event* row | **crashes** (5 of first 84): `Invalid ingest_ts on a parsed event` | passes |
+| 20M and 60M outputs, theirs vs ours | identical (60M: 6,633,859 + 28,014 rows) | — |
+| Image size (arm64) | 521 MB | 141 MB |
+
+End-to-end wall time, container start → exit (lower is better):
+
+| Input | Theirs cold / warm | Ours cold / warm |
+| --- | --- | --- |
+| 1M (Mac file share) | ~0.3 s | ~0.33 s |
+| 20M | 3.48 s / 2.06–2.23 s | 4.62 s / 2.61–2.74 s |
+| **60M** | **7.64 s / 4.27–4.99 s** | **17.43 s / 11.08–11.77 s** |
+| 60M peak memory (cgroup) | **3.3 GB** | **8.3 GB** |
+
+- [DATA] At 60M theirs is **~2.3–2.6× faster** and uses **~2.5× less memory**. Ours is still
+  ~10× under the 180 s cap, but on the leaderboard theirs would rank well ahead.
+- [INF] Where our time goes (60M warm): events 6.1 s vs their parse+dedup 2.0 s. Causes: 80-byte
+  `EvRaw` records holding 16-byte slices (vs their 40-byte copies with 8-byte packed IDs),
+  string hashing vs integer hashing, and faulting in 2.5× more memory in a VM.
+- [INF] Their crash input (a data row equal to the header in events/) is **outside the rules'
+  promise** that `ingest_ts` is always valid F1, and the generator never emits it. Low risk in
+  practice, but an unrecoverable failure mode where ours degrades gracefully.
+- [DECISION] `tests/fuzz.py` gained `STRICT_SPEC=1`, which keeps every case inside the data
+  promises (used to judge them fairly). The default mode still includes the out-of-spec row.
+- [DECISION] **Benchmark only, no porting.** Their engine is a yardstick for what is achievable
+  (≈4.3 s warm at 60M, 3.3 GB), not a source of techniques. Our improvements come from our own
+  profiling and the design principles in docs/DESIGN.md.
+
+## G. Official score
+
+- [DATA] Submission **BB-DB9B9054** (`shoppers-top` @ 34a18e7), Fri 2026-11-20 11:21 PM:
+  **5.79 s** with a 362 ms wait. It is our best score and is entered in the final.
+  Baseline: 171.91 s (about 30× faster).
+- [INF] Scorer 5.79 s vs our local container 2.6 s (20M warm) / 4.6 s (20M cold) suggests the
+  practice set was run cold, roughly matching the local cold numbers.

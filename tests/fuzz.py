@@ -247,7 +247,9 @@ class Case:
                 g[2] = self.bad_ts(ts)
                 g[3] = f1(ing - 1000)
                 emit(g)
-        if r.random() < 0.1:
+        # A header-like data row has ingest_ts "ingest_ts", which breaks the rules' promise
+        # that ingest_ts is always valid F1. STRICT_SPEC=1 keeps every case inside the promises.
+        if r.random() < 0.1 and not os.environ.get("STRICT_SPEC"):
             ev.append("event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents")
         self.write_parts(os.path.join(d, "events"), "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents", ev)
 

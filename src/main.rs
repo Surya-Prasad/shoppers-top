@@ -95,6 +95,18 @@ impl Stats {
     }
 }
 
+/// Sub-stage timer for profiling (stderr only; never changes output).
+struct Stage(Instant);
+impl Stage {
+    fn start() -> Stage {
+        Stage(Instant::now())
+    }
+    fn mark(&mut self, what: &str) {
+        eprintln!("    {what:<34} {:>7.3}s", self.0.elapsed().as_secs_f64());
+        self.0 = Instant::now();
+    }
+}
+
 fn env_or(k: &str, d: &str) -> String {
     std::env::var(k).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| d.to_string())
 }
@@ -189,10 +201,23 @@ fn main() {
 
     // ---------------------------------------------------------------- sessions
     let ncamp = camp_ids.len();
-    let results: Vec<(Vec<output::UserRow>, Map<(u32, i32), [u64; 4]>)> = (0..NB)
+    let timed: Vec<((Vec<output::UserRow>, Map<(u32, i32), [u64; 4]>), (f64, usize, usize))> = (0..NB)
         .into_par_iter()
-        .map(|b| sessionize(b, &events_by_person, &clicks_by_person, ncamp, &stats))
+        .map(|b| {
+            let t = Instant::now();
+            let r = sessionize(b, &events_by_person, &clicks_by_person, ncamp, &stats);
+            let ne: usize = events_by_person[b].iter().map(Vec::len).sum();
+            let nc: usize = clicks_by_person[b].iter().map(Vec::len).sum();
+            (r, (t.elapsed().as_secs_f64(), ne, nc))
+        })
         .collect();
+    let mut slow: Vec<(usize, (f64, usize, usize))> = timed.iter().map(|x| x.1).enumerate().collect();
+    slow.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+    let total: f64 = slow.iter().map(|x| x.1.0).sum();
+    for (b, (secs, ne, nc)) in slow.iter().take(3) {
+        eprintln!("    slow partition {b:>3}: {secs:.3}s events {ne} clicks {nc} (sum of all partitions {total:.3}s)");
+    }
+    let results: Vec<(Vec<output::UserRow>, Map<(u32, i32), [u64; 4]>)> = timed.into_iter().map(|x| x.0).collect();
     lap("sessions");
 
     let mut camp_agg: Map<(u32, i32), [u64; 4]> = new_map(1 << 14);
@@ -412,6 +437,7 @@ fn clicks(
     ps: &RandomState,
     stats: &Stats,
 ) -> ByPerson<ClickV> {
+    let mut st = Stage::start();
     let items = work_items::<4>(src, ["click_id", "user_id", "campaign_id", "ts"]);
     // scan + partition on click_id
     let scattered: Vec<Vec<Vec<ClickRaw>>> = items
@@ -438,7 +464,9 @@ fn clicks(
             parts
         })
         .collect();
+    st.mark("clicks: scan+parse+partition");
     let by_cid = transpose(scattered);
+    st.mark("clicks: transpose");
     // dedup on click_id (copies are identical; keep the smallest tuple for determinism),
     // then validate, then re-partition on person
     let out: Vec<Vec<Vec<ClickV>>> = by_cid
@@ -484,7 +512,10 @@ fn clicks(
             dst
         })
         .collect();
-    transpose(out)
+    st.mark("clicks: dedup+validate+repartition");
+    let t = transpose(out);
+    st.mark("clicks: transpose");
+    t
 }
 
 // ====================================================================== events
@@ -552,6 +583,7 @@ fn events(
     stats: &Stats,
 ) -> ByPerson<EvV> {
     const NAMES: [&str; 7] = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"];
+    let mut st = Stage::start();
     let items = work_items::<7>(src, NAMES);
     let scattered: Vec<Vec<Vec<EvRaw>>> = items
         .par_iter()
@@ -603,7 +635,9 @@ fn events(
             parts
         })
         .collect();
+    st.mark("events: scan+parse+partition");
     let by_eid = transpose(scattered);
+    st.mark("events: transpose");
     let out: Vec<Vec<Vec<EvV>>> = by_eid
         .into_par_iter()
         .map(|parts| {
@@ -657,7 +691,10 @@ fn events(
             dst
         })
         .collect();
-    transpose(out)
+    st.mark("events: dedup+validate+repartition");
+    let t = transpose(out);
+    st.mark("events: transpose");
+    t
 }
 
 /// Is copy `a` preferred over `b` in dedup? Smallest parseable ingest_ts first
