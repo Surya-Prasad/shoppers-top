@@ -788,6 +788,49 @@ fn transpose<T>(v: Vec<Vec<Vec<T>>>) -> ByPerson<T> {
 const SUB: usize = 8192;
 fn dedup<T: Copy>(parts: &[Vec<T>], key: impl Fn(&T) -> u64, better: impl Fn(&T, &T) -> bool, mut sink: impl FnMut(&T)) -> usize {
     let n: usize = parts.iter().map(Vec::len).sum();
+    // RW26: singleton filter. 2-bit saturating counters (0, 1, 2 = "two or more") over
+    // ~8n hash slots. A row whose slot counted exactly 1 is the only copy of its key, so it
+    // is kept as is; every other row (true duplicates and hash collisions) goes, in scan
+    // order, through the exact table below, so tie-breaking is unchanged.
+    if n > 2 * SUB {
+        let bits = (n * 8).next_power_of_two().trailing_zeros();
+        let slots = 1usize << bits;
+        let mut cnt = vec![0u64; slots / 32]; // 32 two-bit counters per word
+        let slot = |k: u64| -> usize { ((packed::fmix(k) >> 8) as usize) & (slots - 1) };
+        for part in parts {
+            for r in part {
+                let i = slot(key(r));
+                let (w, sh) = (i >> 5, (i & 31) * 2);
+                let c = (cnt[w] >> sh) & 3;
+                if c < 2 {
+                    cnt[w] += 1 << sh;
+                }
+            }
+        }
+        let mut rest: Vec<T> = Vec::new();
+        let mut kept = 0usize;
+        for part in parts {
+            for r in part {
+                let i = slot(key(r));
+                if (cnt[i >> 5] >> ((i & 31) * 2)) & 3 == 1 {
+                    sink(r);
+                    kept += 1;
+                } else {
+                    rest.push(*r);
+                }
+            }
+        }
+        drop(cnt);
+        // the exact pass runs once over the leftovers (never the filter again)
+        return kept + dedup_exact(std::slice::from_ref(&rest), key, better, sink);
+    }
+    dedup_exact(parts, key, better, sink)
+}
+
+/// The exact dedup (RW13): stable counting sort into L2-sized sub-buckets, one table each.
+fn dedup_exact<T: Copy>(parts: &[Vec<T>], key: impl Fn(&T) -> u64, better: impl Fn(&T, &T) -> bool, mut sink: impl FnMut(&T)) -> usize {
+    let n: usize = parts.iter().map(Vec::len).sum();
+    {
     let sbits = if n <= 2 * SUB { 0 } else { (n / SUB).next_power_of_two().trailing_zeros() };
     // sub-bucket bits sit just below the partition bits of the same mix
     let sub = |k: u64| -> usize { if sbits == 0 { 0 } else { ((packed::fmix(k) << LOG_NB) >> (64 - sbits)) as usize } };
@@ -854,6 +897,7 @@ fn dedup<T: Copy>(parts: &[Vec<T>], key: impl Fn(&T) -> u64, better: impl Fn(&T,
         }
     }
     used
+    }
 }
 
 fn clicks(src: &[&'static Source], campaigns: &IdMap, lo: i64, hi: i64, names: &Names, stats: &Stats) -> ByPerson<ClickV> {
@@ -1375,5 +1419,46 @@ mod link_parts {
         }
         let (mn, mx) = (*b.iter().min().unwrap(), *b.iter().max().unwrap());
         assert!(mn > 9_500 && mx < 10_500, "{mn} {mx}");
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    /// RW26: dedup (singleton filter + exact pass) equals a naive first-min reference on
+    /// mixes of singletons and heavy duplicates, across several source parts.
+    #[test]
+    fn dedup_matches_naive() {
+        let mut x = 17u64;
+        let mut rnd = || {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x >> 33
+        };
+        for case in 0..6 {
+            // rows: (key, rank, id); smaller rank wins, ties keep the first seen
+            let nparts = 1 + case % 3;
+            let mut parts: Vec<Vec<(u64, u64, u32)>> = vec![Vec::new(); nparts];
+            let total = [1_000usize, 40_000, 120_000, 60_000, 90_000, 30_000][case];
+            for id in 0..total as u32 {
+                let k = match case {
+                    3 => 1 + rnd() % 4,                   // 60k rows on 4 keys
+                    4 => if id % 2 == 0 { 1 + rnd() % 7 } else { 1000 + id as u64 },
+                    _ => 1 + rnd() % (total as u64 / 3 + 1),
+                };
+                parts[(rnd() as usize) % nparts].push((k, rnd() % 5, id));
+            }
+            let mut got: Vec<(u64, u64, u32)> = Vec::new();
+            let kept = super::dedup(&parts, |r| r.0, |a, b| a.1 < b.1, |r| got.push(*r));
+            let mut want: std::collections::HashMap<u64, (u64, u64, u32)> = std::collections::HashMap::new();
+            for p in &parts {
+                for r in p {
+                    want.entry(r.0).and_modify(|c| if r.1 < c.1 { *c = *r }).or_insert(*r);
+                }
+            }
+            let mut w: Vec<_> = want.into_values().collect();
+            got.sort();
+            w.sort();
+            assert_eq!(kept, w.len(), "case {case}");
+            assert_eq!(got, w, "case {case}");
+        }
     }
 }
