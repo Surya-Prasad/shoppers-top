@@ -14,8 +14,8 @@ answer + identical Parquet output vs the base at 20M and 60M):
 
 | Base | Run (candidate = same engine as `7809b52`) | Runner | Gate | 20M base → cand (Δ, wins) | 60M base → cand (Δ, wins) | 60M max RSS base / cand |
 |---|---|---|---|---:|---:|---:|
-| **`34a18e7`** (scored 5.79 s) | `66101a2`, [results](../../bench-results/results/66101a2b048901893adac2756ff3332f340c9fc0.md) | EPYC 7763 | PASS | 9.028 → **4.628 s** (**−48.7%**, 7/7) | 31.382 → **17.725 s** (**−43.5%**, 5/5) | 13.19 / 12.27 GB |
-| **`b85649a`** (previous BEST) | `9dcf1a5`, [results](../../bench-results/results/9dcf1a563f5bd0ed55b49d3765d94e65ddab243f.md) | Xeon 8370C | PASS | 8.600 → **4.959 s** (**−42.3%**, 7/7) | 29.117 → **17.182 s** (**−41.0%**, 5/5) | 12.25 / 12.30 GB |
+| **`34a18e7`** (scored 5.79 s) | `66101a2`, `bench-results:results/66101a2b048901893adac2756ff3332f340c9fc0.md` | EPYC 7763 | PASS | 9.028 → **4.628 s** (**−48.7%**, 7/7) | 31.382 → **17.725 s** (**−43.5%**, 5/5) | 13.19 / 12.27 GB |
+| **`b85649a`** (previous BEST) | `9dcf1a5`, `bench-results:results/9dcf1a563f5bd0ed55b49d3765d94e65ddab243f.md` | Xeon 8370C | PASS | 8.600 → **4.959 s** (**−42.3%**, 7/7) | 29.117 → **17.182 s** (**−41.0%**, 5/5) | 12.25 / 12.30 GB |
 
 Results live on the `bench-results` branch (`results/<sha>.md` / `.json`). Both gates include identical Parquet output
 to the base at 20M and 60M. A naive scale of the 5.79 s practice score by the 20M ratio suggests roughly 3 s, but the
