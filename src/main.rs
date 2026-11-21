@@ -1112,20 +1112,20 @@ fn events_scan(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: 
             let (mut lines, mut bad, mut noid) = (0u64, 0u64, 0u64);
             // RW15: (row, user key, user mix, product key or 0, product mix); person and
             // product slots of a whole batch are prefetched before any lookup runs
-            let mut pend: Vec<(EvRec, u64, u64, u64, u64)> = Vec::with_capacity(PBATCH);
-            let mut put = |mut r: EvRec, person: u64| {
-                r.person = person;
+            // RW32: fixed-size batch (row with its user key in `person`, product key, mix)
+            const Z: EvRec = EvRec { eid: 0, rank: 0, person: 0, ts: 0, price: 0, cat: 0 };
+            let mut pend: [(EvRec, u64, u64); PBATCH] = [(Z, 0, 0); PBATCH];
+            let mut np = 0usize;
+            let mut put = |r: EvRec| {
                 parts[keys::part(r.eid, LOG_NB)].push(r);
             };
-            let flush = |pend: &mut Vec<(EvRec, u64, u64, u64, u64)>, put: &mut dyn FnMut(EvRec, u64)| {
-                for &(mut r, user, um, pk, pm) in pend.iter() {
+            let flush = |pend: &mut [(EvRec, u64, u64)], put: &mut dyn FnMut(EvRec)| {
+                for &(mut r, pk, pm) in pend.iter() {
                     if pk != 0 {
                         r.cat = products.get_packed(pm, pk).unwrap_or(unknown_cat);
                     }
-                    let _ = um;
-                    put(r, user);
+                    put(r);
                 }
-                pend.clear();
             };
             for_each_record_bq::<7>(chunk, |rec| {
                 lines += 1;
@@ -1177,10 +1177,12 @@ fn events_scan(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: 
                                         (0, 0)
                                     }
                                 };
-                                let user = key_of(f[1]);
-                                pend.push((r, user, 0, pk, pm));
-                                if pend.len() == PBATCH {
-                                    flush(&mut pend, &mut put);
+                                r.person = key_of(f[1]);
+                                pend[np] = (r, pk, pm);
+                                np += 1;
+                                if np == PBATCH {
+                                    flush(&mut pend[..], &mut put);
+                                    np = 0;
                                 }
                                 return;
                             }
@@ -1188,9 +1190,9 @@ fn events_scan(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: 
                         }
                     }
                 }
-                put(r, keys::EMPTY);
+                put(r); // invalid copy: person stays EMPTY
             });
-            flush(&mut pend, &mut put);
+            flush(&mut pend[..np], &mut put);
             drop(put);
             stats.add(K::EvLines, lines);
             stats.add(K::EvMalformed, bad);
