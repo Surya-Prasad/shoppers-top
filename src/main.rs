@@ -545,7 +545,7 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
             let mut v = Vec::new();
             let (mut lines, mut bad, mut empty) = (0u64, 0u64, 0u64);
             // night-04: fused one-pass line + field scanner (same dialect as split)
-            for_each_record_bq::<2>(chunk, |rec| {
+            for_each_record_ix::<2>(chunk, |rec| {
                 lines += 1;
                 match rec {
                     None => bad += 1,
@@ -852,7 +852,7 @@ fn clicks(src: &[&'static Source], campaigns: &IdMap, lo: i64, hi: i64, names: &
                 r.person = person;
                 parts[keys::part(r.cid, LOG_NB)].push(r);
             };
-            for_each_record_bq::<4>(chunk, |rec| {
+            for_each_record_ix::<4>(chunk, |rec| {
                 lines += 1;
                 let Some(f) = rec else {
                     bad += 1;
@@ -1011,7 +1011,7 @@ fn events(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: i64, 
                 }
                 pend.clear();
             };
-            for_each_record_bq::<7>(chunk, |rec| {
+            for_each_record_ix::<7>(chunk, |rec| {
                 lines += 1;
                 let Some(f) = rec else {
                     bad += 1;
