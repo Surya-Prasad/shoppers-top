@@ -1251,47 +1251,58 @@ fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u
                 // v2 P1: shape-specialized fast path; every line it declines takes `exact`
                 let len = chunk.len();
                 let base = chunk.as_ptr();
-                let mut s = 0usize;
-                while s + fast::SLACK <= len {
-                    // v4: software prefetch of the input ahead of the decoder
-                    keys::prefetch_read(base.wrapping_add(s + PF_AHEAD));
-                    // SAFETY: s + SLACK <= len, so the decoder reads inside the chunk
-                    if let Some((l, res)) = unsafe { fast::event2(base.add(s), lo, hi, products.dense_prefix()) } {
-                        sc.lines += 1;
-                        let ev = match res {
-                            Ok(ev) => ev,
-                            Err(b) => {
-                                // v4: a well-formed invalid copy (still takes part in dedup)
-                                sc.put(EvRec { eid: b.eid, rank: rank_of(Some(b.ingest)), person: keys::EMPTY, hk: 0, ts: 0, pc: b.why });
-                                s += l + 1;
-                                continue;
+                // one line at `s` (fast path, else exact); returns the next line's start
+                let step = |sc: &mut EvScan, s: usize| -> usize {
+                    if s + fast::SLACK <= len {
+                        // v4: software prefetch of the input ahead of the decoder
+                        keys::prefetch_read(base.wrapping_add(s + PF_AHEAD));
+                        // SAFETY: s + SLACK <= len, so the decoder reads inside the chunk
+                        if let Some((l, res)) = unsafe { fast::event2(base.add(s), lo, hi, products.dense_prefix()) } {
+                            sc.lines += 1;
+                            let ev = match res {
+                                Ok(ev) => ev,
+                                Err(b) => {
+                                    // v4: a well-formed invalid copy (still takes part in dedup)
+                                    sc.put(EvRec { eid: b.eid, rank: rank_of(Some(b.ingest)), person: keys::EMPTY, hk: 0, ts: 0, pc: b.why });
+                                    return s + l + 1;
+                                }
+                            };
+                            let r = EvRec { eid: ev.eid, rank: rank_of(Some(ev.ingest)), person: ev.user, hk: 0, ts: (ev.ts - lo) as u32, pc: ev.price };
+                            // v4: a long user ID is interned at the batch flush (lock and slot prefetched now)
+                            if ev.ulong.1 > 0 {
+                                let u: S = &chunk[s + ev.ulong.0 as usize..s + ev.ulong.1 as usize];
+                                sc.ul = (u, keys::hint(u));
                             }
-                        };
-                        let r = EvRec { eid: ev.eid, rank: rank_of(Some(ev.ingest)), person: ev.user, hk: 0, ts: (ev.ts - lo) as u32, pc: ev.price };
-                        // v4: a long user ID is interned at the batch flush (lock and slot prefetched now)
-                        if ev.ulong.1 > 0 {
-                            let u: S = &chunk[s + ev.ulong.0 as usize..s + ev.ulong.1 as usize];
-                            sc.ul = (u, keys::hint(u));
+                            if ev.pnum != 0 {
+                                // v2: canonical product ID: direct index (no hash, no batch)
+                                sc.valid(EvRec { pc: r.pc | products.get_dense(ev.pnum).unwrap_or(unknown_cat) << 24, ..r }, 0, 0);
+                            } else {
+                                let m = packed::fmix(ev.product);
+                                products.prefetch_packed(m);
+                                sc.valid(r, ev.product, m);
+                            }
+                            return s + l + 1;
                         }
-                        if ev.pnum != 0 {
-                            // v2: canonical product ID: direct index (no hash, no batch)
-                            sc.valid(EvRec { pc: r.pc | products.get_dense(ev.pnum).unwrap_or(unknown_cat) << 24, ..r }, 0, 0);
-                        } else {
-                            let m = packed::fmix(ev.product);
-                            products.prefetch_packed(m);
-                            sc.valid(r, ev.product, m);
-                        }
-                        s += l + 1;
-                        continue;
                     }
                     let e = memchr::memchr(b'\n', &chunk[s..]).map_or(len, |i| s + i);
                     sc.exact(split::<7>(&chunk[s..e]), order);
-                    s = e + 1;
+                    e + 1
+                };
+                // v4: two independent cursors (the chunk's halves, split after a newline) decoded
+                // in turn, so the per-line dependency chains of the two overlap. Row order does
+                // not matter: equal-ingest copies are identical (A2) and equal timestamps share
+                // a session.
+                let mid = memchr::memchr(b'\n', &chunk[len / 2..]).map_or(len, |i| len / 2 + i + 1);
+                let (mut a, mut b) = (0usize, mid);
+                while a < mid && b < len {
+                    a = step(&mut sc, a);
+                    b = step(&mut sc, b);
                 }
-                while s < len {
-                    let e = memchr::memchr(b'\n', &chunk[s..]).map_or(len, |i| s + i);
-                    sc.exact(split::<7>(&chunk[s..e]), order);
-                    s = e + 1;
+                while a < mid {
+                    a = step(&mut sc, a);
+                }
+                while b < len {
+                    b = step(&mut sc, b);
                 }
             } else {
                 for_each_record_bq::<7>(chunk, |rec| sc.exact(rec, order));
