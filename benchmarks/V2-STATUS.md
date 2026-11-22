@@ -12,7 +12,10 @@ speed: input not in page cache). The scorer's page cache is warm, so this is not
 runs (`ab/v2-final2`, `ab/v2-final3`, EPYC 9V74) were I/O-bound the same way (base ~6 s at 20M, ~22 s at 60M) and gave
 +0.8% (3/7) / +2.9% (0/5) and +2.3% (1/7) / +2.0% (0/5). So: on warm page cache (all earlier runs, and the scorer per
 public probes) a02705c is 14–18% faster; when the input must be read from disk, it is ~1–9% slower than b9481b1
-(the parse savings vanish behind I/O). Since 02:00 UTC every CI runner has behaved this way.
+(the parse savings vanish behind I/O). Since 02:00 UTC every CI runner has behaved this way, even with the 20M input on tmpfs (base 6.4 s on EPYC 9V74), so
+it is not disk I/O: the scan, which touches the mapped input, is ~3x slower while later phases are normal (suspect:
+expensive file-mapping faults on these VMs; profiling). The harness now keeps one dataset at a time and puts 20M on
+/dev/shm.
 
 CI runners vary a lot (EPYC 7763 / 9V45 / 9V74, Xeon 8370C / 6975P / 8573C), so only same-run pairs are compared.
 
@@ -32,6 +35,7 @@ CI runners vary a lot (EPYC 7763 / 9V45 / 9V74, Xeon 8370C / 6975P / 8573C), so 
 | ClScan | `80c1ff3` | monomorphic clicks loop (no measured change locally) | vs b9481b1: **−15.9% (7/7) / −15.7% (5/5)** (EPYC 7763); Docker PASS |
 | NB 512 | `466f6a7` (exp/v2-nb512) | 512 hash partitions | vs 80c1ff3: **+5.2% (0/7)** / +0.5% (Xeon 6975P) — dropped |
 | P2c | `5306bd6` | bit filter of linked users (skip probes for unlinked) | vs 80c1ff3: −1.2% (6/7) / **+4.0% (0/5)** (Xeon 6973P) — reverted |
+| v3 Parted | `d7cc29e` | per-source partition buffers on huge-page mappings | vs 599c093: −2.9% (7/7) / −5.0% (5/5) (EPYC 7763, I/O-bound runner); vs 1c0881a: **−3.5% (6/7) / −3.0% (4/5)** (EPYC 7763, 20M on tmpfs) — keep; RSS 60M 11.0 → 12.9 GB |
 | PBATCH 64 | `4ad18e2` (ab/v2-pb64) | prefetch batch 32 → 64 | vs e450f86: −0.9% (4/7) / **−2.3% (5/5)** (EPYC 9V45) — take |
 | CHUNK 2 MiB | `788ec62` (ab/v2-chunk2) | scan granule 4 → 2 MiB | vs e450f86: **+6.7% (0/7) / +8.2% (0/5)** (EPYC 9V74) — dropped |
 | P2e hybrid | `33e6bad` (exp/v2-hybrid) | persons in the scan once links are published, flagged rest in dedup | vs a02705c: **+4.5% (0/7) / +2.8% (0/5)** (Xeon 6975P) — dropped |
