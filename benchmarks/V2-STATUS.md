@@ -111,6 +111,8 @@ Previous (old generator only): `a02705ccf8d8bfff6a09f0311a7330018dfeb302` (−17
 
 ## Tried and dropped
 
+- `ab/v3-outpar` (`5a2dc02`): campaign_daily written alongside user_daily, 2 × ncpu user files. CI vs 298e7c4
+  (Xeon 6975P): −0.8% (3/7) / −0.9% (3/5): neutral, dropped.
 - `ab/v3-pgo` (`b9dc99a`, Docker fix `ed18eed`): PGO from an instrumented rust 1.95 build on 20M data (sparse profile
   1.4 MB; RUSTFLAGS profile-use on x86-64 in the Dockerfile and the A/B harness). Docker PASS, but CI vs 298e7c4
   (EPYC 9V45): +1.5% (5/7) / +0.2% (2/5): neutral, dropped (not worth the build risk).
