@@ -185,20 +185,33 @@ fn hex_shape(s: &[u8]) -> Option<(u8, u64, u64)> {
     if s.len() != 33 {
         return None;
     }
+    // branch-free: a table maps each byte to its nibble or 0x10 (not lowercase hex)
+    static HEXV: [u8; 256] = {
+        let mut t = [0x10u8; 256];
+        let mut i = 0;
+        while i < 10 {
+            t[b'0' as usize + i] = i as u8;
+            i += 1;
+        }
+        let mut i = 0;
+        while i < 6 {
+            t[b'a' as usize + i] = 10 + i as u8;
+            i += 1;
+        }
+        t
+    };
     let mut v = [0u64; 2];
+    let mut bad = 0u8;
     for (w, part) in v.iter_mut().zip(s[1..].chunks_exact(16)) {
         let mut x = 0u64;
         for &c in part {
-            let d = match c {
-                b'0'..=b'9' => c - b'0',
-                b'a'..=b'f' => c - b'a' + 10,
-                _ => return None,
-            };
-            x = x << 4 | d as u64;
+            let d = HEXV[c as usize];
+            bad |= d;
+            x = x << 4 | (d & 0xf) as u64;
         }
         *w = x;
     }
-    Some((s[0], v[0], v[1]))
+    (bad & 0x10 == 0).then_some((s[0], v[0], v[1]))
 }
 
 fn shards() -> &'static [Mutex<Shard>] {
