@@ -10,6 +10,7 @@
 //!
 //! Generated data never needs the interner (every ID packs), so its lock is cold.
 
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::{Mutex, OnceLock};
 
 use crate::packed::{fmix, pack9};
@@ -80,22 +81,60 @@ const SHARD_BITS: u32 = 10;
 const SHARDS: usize = 1 << SHARD_BITS;
 const BLOCK: usize = 1 << 20;
 
-struct Shard {
-    // v3: open addressing over 24-byte slots; a lookup touches one slot line (and, for
-    // non-hex IDs, the stored bytes once). Hex-shaped IDs (one byte + 32 lowercase hex digits,
-    // the generator's long IDs): (hi, lo, HEX | prefix << 32 | index + 1), matched by value.
-    // Other IDs: (hash, bytes address, len << 32 | index + 1). c == 0 marks a free slot.
-    slots: Vec<(u64, u64, u64)>,
+// v3b: lookups are lock-free. A shard's slot table is published through an atomic pointer;
+// a slot's third word (c, non-zero once used) is stored last with Release, after the other
+// two words and the arena bytes, so a reader that sees c sees the whole entry. Inserts and
+// growth take the shard's mutex and re-probe the current table first. Growth publishes a new
+// table and leaks the old one (readers may still be probing it; an entry missing from it
+// only sends the reader to the locked path).
+struct Table {
+    mask: usize,
+    s: Box<[AtomicU64]>, // 3 words per slot: (a, b, c)
+}
+
+impl Table {
+    fn leak(cap: usize) -> &'static Table {
+        Box::leak(Box::new(Table { mask: cap - 1, s: (0..cap * 3).map(|_| AtomicU64::new(0)).collect() }))
+    }
+    /// Ok(index) of the entry `m` accepts, or Err(free slot) where it would go.
+    #[inline(always)]
+    fn probe(&self, h: u64, m: impl Fn(u64, u64, u64) -> bool) -> Result<u32, usize> {
+        let mut j = (h as usize) & self.mask;
+        loop {
+            let c = self.s[3 * j + 2].load(Acquire);
+            if c == 0 {
+                return Err(j);
+            }
+            if m(self.s[3 * j].load(Relaxed), self.s[3 * j + 1].load(Relaxed), c) {
+                return Ok((c as u32) - 1);
+            }
+            j = (j + 1) & self.mask;
+        }
+    }
+    fn put(&self, j: usize, e: (u64, u64, u64)) {
+        self.s[3 * j].store(e.0, Relaxed);
+        self.s[3 * j + 1].store(e.1, Relaxed);
+        self.s[3 * j + 2].store(e.2, Release);
+    }
+}
+
+struct Inner {
     bytes: Vec<S>, // index -> bytes (in a leaked arena block), for bytes_of
     block: &'static mut [u8], // free tail of the current arena block
 }
 
+// Hex-shaped IDs (one byte + 32 lowercase hex digits, the generator's long IDs):
+// (hi, lo, HEX | prefix << 32 | index + 1), matched by value.
+// Other IDs: (hash, bytes address, len << 32 | index + 1). c == 0 marks a free slot.
+#[repr(align(128))]
+struct Shard {
+    table: AtomicPtr<Table>,
+    inner: Mutex<Inner>,
+}
+
 const HEX: u64 = 1 << 63;
 
-impl Shard {
-    fn new() -> Shard {
-        Shard { slots: vec![(0, 0, 0); 16], bytes: Vec::new(), block: &mut [] }
-    }
+impl Inner {
     fn copy(&mut self, s: S) -> S {
         if s.len() > BLOCK / 4 {
             return Box::leak(s.to_vec().into_boxed_slice());
@@ -108,69 +147,78 @@ impl Shard {
         self.block = rest;
         dst
     }
-    #[inline]
-    fn slot_hash(e: &(u64, u64, u64)) -> u64 {
-        if e.2 & HEX != 0 { hex_hash(e.0, e.1) } else { e.0 }
+}
+
+#[inline]
+fn slot_hash(e: (u64, u64, u64)) -> u64 {
+    if e.2 & HEX != 0 { hex_hash(e.0, e.1) } else { e.0 }
+}
+
+impl Shard {
+    fn new() -> Shard {
+        Shard { table: AtomicPtr::new(Table::leak(16) as *const Table as *mut Table), inner: Mutex::new(Inner { bytes: Vec::new(), block: &mut [] }) }
     }
-    fn grow(&mut self) {
-        let cap = self.slots.len() * 2;
-        let old = std::mem::replace(&mut self.slots, vec![(0, 0, 0); cap]);
-        for e in old {
-            if e.2 != 0 {
-                let mut j = (Self::slot_hash(&e) as usize) & (cap - 1);
-                while self.slots[j].2 != 0 {
-                    j = (j + 1) & (cap - 1);
-                }
-                self.slots[j] = e;
-            }
+    #[inline(always)]
+    fn table(&self) -> &'static Table {
+        // SAFETY: tables are leaked, never freed
+        unsafe { &*self.table.load(Acquire) }
+    }
+    /// The index of the ID `s` (hash `h`) that `m` matches, inserting `mk(copy, index + 1)`.
+    #[inline(always)]
+    fn get_or_insert_by(&self, s: S, h: u64, m: impl Fn(u64, u64, u64) -> bool + Copy, mk: impl FnOnce(S, u64) -> (u64, u64, u64)) -> u32 {
+        if let Ok(i) = self.table().probe(h, m) {
+            return i;
         }
+        self.insert_slow(s, h, m, mk)
     }
-    fn insert_at(&mut self, j: usize, s: S, mk: impl FnOnce(S, u64) -> (u64, u64, u64)) -> u32 {
-        let idx = self.bytes.len() as u32;
-        let c = self.copy(s);
-        self.bytes.push(c);
-        self.slots[j] = mk(c, idx as u64 + 1);
-        if self.bytes.len() * 2 > self.slots.len() {
-            self.grow();
+    #[cold]
+    #[inline(never)]
+    fn insert_slow(&self, s: S, h: u64, m: impl Fn(u64, u64, u64) -> bool + Copy, mk: impl FnOnce(S, u64) -> (u64, u64, u64)) -> u32 {
+        let mut g = self.inner.lock().unwrap();
+        let t = self.table();
+        let j = match t.probe(h, m) {
+            Ok(i) => return i,
+            Err(j) => j,
+        };
+        let idx = g.bytes.len() as u32;
+        let c = g.copy(s);
+        g.bytes.push(c);
+        t.put(j, mk(c, idx as u64 + 1));
+        if g.bytes.len() * 2 > t.mask + 1 {
+            let n = Table::leak((t.mask + 1) * 2);
+            for k in 0..=t.mask {
+                let e = (t.s[3 * k].load(Relaxed), t.s[3 * k + 1].load(Relaxed), t.s[3 * k + 2].load(Relaxed));
+                if e.2 != 0 {
+                    let mut j = (slot_hash(e) as usize) & n.mask;
+                    while n.s[3 * j + 2].load(Relaxed) != 0 {
+                        j = (j + 1) & n.mask;
+                    }
+                    n.put(j, e);
+                }
+            }
+            self.table.store(n as *const Table as *mut Table, Release);
         }
         idx
     }
     /// The index of the hex-shaped ID `s` = (prefix, hi, lo), inserting a copy if absent.
-    fn get_or_insert_hex(&mut self, s: S, prefix: u8, hi: u64, lo: u64) -> u32 {
-        let mask = self.slots.len() - 1;
-        let mut j = (hex_hash(hi, lo) as usize) & mask;
+    #[inline]
+    fn get_or_insert_hex(&self, s: S, prefix: u8, hi: u64, lo: u64) -> u32 {
         let tag = HEX | (prefix as u64) << 32;
-        loop {
-            let e = self.slots[j];
-            if e.2 == 0 {
-                break;
-            }
-            if e.0 == hi && e.1 == lo && e.2 & !0xffff_ffff == tag {
-                return (e.2 as u32) - 1;
-            }
-            j = (j + 1) & mask;
-        }
-        self.insert_at(j, s, |_, i| (hi, lo, tag | i))
+        self.get_or_insert_by(s, hex_hash(hi, lo), move |a, b, c| a == hi && b == lo && c & !0xffff_ffff == tag, move |_, i| (hi, lo, tag | i))
     }
     /// The index of `s` (hash `h`), inserting a copy if absent.
-    fn get_or_insert(&mut self, s: S, h: u64) -> u32 {
-        let mask = self.slots.len() - 1;
-        let mut j = (h as usize) & mask;
-        loop {
-            let e = self.slots[j];
-            if e.2 == 0 {
-                break;
-            }
-            if e.2 & HEX == 0 && e.0 == h && (e.2 >> 32) as usize == s.len() {
-                // SAFETY: e.1 is the address of a leaked arena copy of length e.2 >> 32
-                let b = unsafe { std::slice::from_raw_parts(e.1 as *const u8, s.len()) };
-                if b == s {
-                    return (e.2 as u32) - 1;
-                }
-            }
-            j = (j + 1) & mask;
-        }
-        self.insert_at(j, s, |c, i| (h, c.as_ptr() as u64, (c.len() as u64) << 32 | i))
+    #[inline]
+    fn get_or_insert(&self, s: S, h: u64) -> u32 {
+        let n = s.len();
+        self.get_or_insert_by(
+            s,
+            h,
+            move |a, b, c| {
+                // SAFETY: b is the address of a leaked arena copy of length c >> 32 (= n here)
+                c & HEX == 0 && a == h && (c >> 32) as usize == n && unsafe { std::slice::from_raw_parts(b as *const u8, n) } == s
+            },
+            |c, i| (h, c.as_ptr() as u64, (c.len() as u64) << 32 | i),
+        )
     }
 }
 
@@ -214,9 +262,9 @@ fn hex_shape(s: &[u8]) -> Option<(u8, u64, u64)> {
     (bad & 0x10 == 0).then_some((s[0], v[0], v[1]))
 }
 
-fn shards() -> &'static [Mutex<Shard>] {
-    static I: OnceLock<Vec<Mutex<Shard>>> = OnceLock::new();
-    I.get_or_init(|| (0..SHARDS).map(|_| Mutex::new(Shard::new())).collect())
+fn shards() -> &'static [Shard] {
+    static I: OnceLock<Vec<Shard>> = OnceLock::new();
+    I.get_or_init(|| (0..SHARDS).map(|_| Shard::new()).collect())
 }
 
 /// Byte hash for the interner (shard = top bits, slot = low bits).
@@ -239,16 +287,15 @@ pub fn key_of(s: S) -> u64 {
 }
 
 /// Key of an unpackable ID: INTERNED | shard << 32 | index in the shard.
-#[cold]
 pub fn intern(s: S) -> u64 {
     if let Some((prefix, hi, lo)) = hex_shape(s) {
         let sh = (crate::packed::fmix(hex_hash(hi, lo) ^ prefix as u64) >> (64 - SHARD_BITS)) as usize;
-        let idx = shards()[sh].lock().unwrap().get_or_insert_hex(s, prefix, hi, lo);
+        let idx = shards()[sh].get_or_insert_hex(s, prefix, hi, lo);
         return INTERNED | (sh as u64) << 32 | idx as u64;
     }
     let h = byte_hash(s);
     let sh = (h >> (64 - SHARD_BITS)) as usize;
-    let idx = shards()[sh].lock().unwrap().get_or_insert(s, h);
+    let idx = shards()[sh].get_or_insert(s, h);
     INTERNED | (sh as u64) << 32 | idx as u64
 }
 
@@ -259,7 +306,7 @@ pub fn bytes_of(k: u64, buf: &mut [u8; 9]) -> &[u8] {
     }
     if k & INTERNED != 0 {
         let sh = ((k >> 32) as usize) & (SHARDS - 1);
-        return shards()[sh].lock().unwrap().bytes[(k & 0xffff_ffff) as usize];
+        return shards()[sh].inner.lock().unwrap().bytes[(k & 0xffff_ffff) as usize];
     }
     let mut n = 0;
     while n < 9 {
@@ -555,7 +602,7 @@ mod intern_bench {
         for _ in 0..10 { for s in &ids { acc ^= super::byte_hash(s); } }
         eprintln!("hash {:.0} ns/op ({acc})", t.elapsed().as_nanos() as f64 / (10 * ids.len()) as f64);
         let t = std::time::Instant::now();
-        for _ in 0..10 { for s in &ids { let h = super::byte_hash(s); let g = super::shards()[(h >> 54) as usize].lock().unwrap(); acc ^= g.bytes.len() as u64; } }
+        for _ in 0..10 { for s in &ids { let h = super::byte_hash(s); let g = super::shards()[(h >> 54) as usize].inner.lock().unwrap(); acc ^= g.bytes.len() as u64; } }
         eprintln!("hash+lock {:.0} ns/op ({acc})", t.elapsed().as_nanos() as f64 / (10 * ids.len()) as f64);
     }
 }
