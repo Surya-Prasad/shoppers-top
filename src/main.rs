@@ -189,7 +189,16 @@ fn main() {
     let ncpu = if ncpu == 0 { std::thread::available_parallelism().map_or(4, |n| n.get()) } else { ncpu };
     rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global().expect("thread pool");
     let stats = Stats::default();
-    let lap = |what: &str| eprintln!("[{:>7.3}s] {what}", t0.elapsed().as_secs_f64());
+    // v4: each lap also reports process CPU (user+sys) since the previous lap
+    let last = std::cell::Cell::new((0.0f64, 0.0f64));
+    let lap = |what: &str| {
+        let mut r: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut r) };
+        let tv = |x: libc::timeval| x.tv_sec as f64 + x.tv_usec as f64 * 1e-6;
+        let (w, c) = (t0.elapsed().as_secs_f64(), tv(r.ru_utime) + tv(r.ru_stime));
+        let (pw, pc) = last.replace((w, c));
+        eprintln!("[{w:>7.3}s] {what}  (cpu {:.2}s, {:.0}% of {} threads)", c - pc, 100.0 * (c - pc) / ((w - pw).max(1e-9) * ncpu as f64), ncpu);
+    };
 
     // ---------------------------------------------------------------- manifest
     let manifest: serde_json::Value = serde_json::from_slice(
