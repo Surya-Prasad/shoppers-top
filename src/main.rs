@@ -1243,8 +1243,17 @@ fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u
                     // v4: software prefetch of the input ahead of the decoder
                     keys::prefetch_read(base.wrapping_add(s + PF_AHEAD));
                     // SAFETY: s + SLACK <= len, so the decoder reads inside the chunk
-                    if let Some((l, ev)) = unsafe { fast::event(base.add(s), lo, hi, products.dense_prefix()) } {
+                    if let Some((l, res)) = unsafe { fast::event2(base.add(s), lo, hi, products.dense_prefix()) } {
                         sc.lines += 1;
+                        let ev = match res {
+                            Ok(ev) => ev,
+                            Err(b) => {
+                                // v4: a well-formed invalid copy (still takes part in dedup)
+                                sc.put(EvRec { eid: b.eid, rank: rank_of(Some(b.ingest)), person: keys::EMPTY, hk: 0, ts: 0, pc: b.why });
+                                s += l + 1;
+                                continue;
+                            }
+                        };
                         let r = EvRec { eid: ev.eid, rank: rank_of(Some(ev.ingest)), person: ev.user, hk: 0, ts: (ev.ts - lo) as u32, pc: ev.price };
                         // v4: a long user ID is interned at the batch flush (lock and slot prefetched now)
                         if ev.ulong.1 > 0 {

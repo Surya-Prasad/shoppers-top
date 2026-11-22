@@ -344,28 +344,84 @@ pub unsafe fn event(p: *const u8, lo: i64, hi: i64, pprefix: u8) -> Option<(usiz
 /// `event` with the line's masks given.
 #[inline(always)]
 pub unsafe fn event_m(p: *const u8, m: (u128, u128, u128), lo: i64, hi: i64, pprefix: u8) -> Option<(usize, Ev)> {
+    match unsafe { event_any(p, m, lo, hi, pprefix) } {
+        Some((l, Ok(ev))) => Some((l, ev)),
+        _ => None,
+    }
+}
+
+/// v4: `event_any` with the masks computed here.
+#[inline(always)]
+pub unsafe fn event2(p: *const u8, lo: i64, hi: i64, pprefix: u8) -> Option<(usize, Result<Ev, EvBad>)> {
+    unsafe { event_any(p, masks128(p), lo, hi, pprefix) }
+}
+
+/// v4: an event line that is well-formed but whose copy is invalid: its event key, ingest_ts
+/// and the reason code of the exact path (0 empty user, 1 bad ts, 2 bad type, 3 empty product,
+/// 4 bad price, 5 late).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EvBad {
+    pub eid: u64,
+    pub ingest: i64,
+    pub why: u32,
+}
+
+/// v4: decode the events line at `p`: `Ok` for a valid copy (as `event`), `Err` for a copy the
+/// exact rules reject (same reason code), None for the exact path (malformed, empty event ID,
+/// unusual shapes or values).
+#[inline(always)]
+pub unsafe fn event_any(p: *const u8, m: (u128, u128, u128), lo: i64, hi: i64, pprefix: u8) -> Option<(usize, Result<Ev, EvBad>)> {
     let (len, f) = unsafe { fields_m::<7>(p, m) }?;
     let eid = unsafe { id_local(p, f[0]) }?;
+    let tsr = crate::timefmt::parse(unsafe { slice(p, f[2]) });
+    let ingest = match tsr {
+        Some(ts) => unsafe { same_hour_f1(p, f[2], f[3], ts) }.or_else(|| crate::timefmt::parse(unsafe { slice(p, f[3]) })),
+        None => crate::timefmt::parse(unsafe { slice(p, f[3]) }),
+    }?;
+    let bad = |why: u32| Some((len, Err(EvBad { eid, ingest, why })));
     let un = f[1].1 - f[1].0;
-    let (user, ulong) = if un > 9 { (0, f[1]) } else { (unsafe { id(p, f[1]) }?, (0, 0)) };
-    let ts = crate::timefmt::parse(unsafe { slice(p, f[2]) })?;
-    if ts < lo || ts >= hi {
-        return None;
+    if un == 0 {
+        return bad(0);
     }
-    let ingest = unsafe { same_hour_f1(p, f[2], f[3], ts) }.or_else(|| crate::timefmt::parse(unsafe { slice(p, f[3]) }))?;
+    let ts = match tsr {
+        Some(t) if t >= lo && t < hi => t,
+        _ => return bad(1),
+    };
     let tl = f[4].1 - f[4].0;
     let tp = unsafe { p.add(f[4].0 as usize) };
     let purchase = if tl == 4 {
         let w = u32::from_le_bytes(unsafe { std::ptr::read_unaligned(tp as *const [u8; 4]) });
         if w != u32::from_le_bytes(*b"view") && w != u32::from_le_bytes(*b"cart") {
-            return None;
+            return bad(2);
         }
         false
     } else if tl == 8 && unsafe { load64(tp) } == u64::from_le_bytes(*b"purchase") {
         true
     } else {
-        return None;
+        return bad(2);
     };
+    if f[5].1 == f[5].0 {
+        return bad(3);
+    }
+    let price = if purchase {
+        let n = (f[6].1 - f[6].0) as usize;
+        if n == 0 {
+            return bad(4);
+        }
+        if n > 8 {
+            return None; // leading zeros may make it valid: exact path
+        }
+        match unsafe { digits8(p.add(f[6].0 as usize), n) } {
+            Some(v) if (1..=10_000_000).contains(&v) => v,
+            _ => return bad(4),
+        }
+    } else {
+        0
+    };
+    if ingest.saturating_sub(ts) > crate::timefmt::DAY {
+        return bad(5);
+    }
+    let (user, ulong) = if un > 9 { (0, f[1]) } else { (unsafe { id(p, f[1]) }?, (0, 0)) };
     let product = unsafe { id(p, f[5]) }?;
     // canonical product ID: prefix + 1..=7 digits without a leading zero (< DMAX = 2^22 holds
     // for up to 6 digits; 7-digit numbers are checked)
@@ -379,23 +435,7 @@ pub unsafe fn event_m(p: *const u8, m: (u128, u128, u128), lo: i64, hi: i64, ppr
     } else {
         0
     };
-    let price = if purchase {
-        let n = (f[6].1 - f[6].0) as usize;
-        if n == 0 || n > 8 {
-            return None;
-        }
-        let v = unsafe { digits8(p.add(f[6].0 as usize), n) }?;
-        if !(1..=10_000_000).contains(&v) {
-            return None;
-        }
-        v
-    } else {
-        0
-    };
-    if ingest.saturating_sub(ts) > crate::timefmt::DAY {
-        return None;
-    }
-    Some((len, Ev { eid, user, ts, ingest, price, ulong, product, pnum }))
+    Some((len, Ok(Ev { eid, user, ts, ingest, price, ulong, product, pnum })))
 }
 
 /// A fully valid click line in the documented column order, decoded.
