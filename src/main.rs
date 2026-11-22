@@ -243,14 +243,6 @@ fn main() {
     });
     let click_copies = clicks_scan(cl_src, &campaigns, ws - WEEK, we, &names, &stats);
     lap("links resolved + clicks/events scanned");
-    if std::env::var("SS_EXP2").is_ok() {
-        experiment2(ev_src, &products, ws, we);
-        return;
-    }
-    if std::env::var("SS_EXP").is_ok() {
-        experiment(ev_src, &products, ws, we, &names);
-        return;
-    }
 
     // v2: nothing reads the events/clicks/links mappings after the scans (records hold keys;
     // interned IDs own copies; products/campaigns stay mapped for output names), so they
@@ -297,7 +289,7 @@ fn main() {
                 if acc.0.is_empty() {
                     acc = (vec![[0u64; 3]; dense_len], vec![0u32; dense_len]);
                 }
-                rows.push(sessionize(b, &events_by_person, &clicks_by_person, ncamp, day0, ndays, &mut acc.0, &mut acc.1, &stats));
+                rows.push(sessionize(b, &events_by_person, &clicks_by_person, ncamp, day0, ndays, &mut acc.0, &mut acc.1, &stats, ws));
                 (rows, acc)
             },
         )
@@ -351,189 +343,6 @@ fn main() {
     std::process::exit(0);
 }
 
-/// SS_EXP2=1: single-thread cost of the v2 fast-path layers (profiling only).
-fn experiment2(src: &[&'static Source], products: &IdMap, lo: i64, hi: i64) {
-    const NAMES: [&str; 7] = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"];
-    let items = work_items::<7>(src, NAMES);
-    let mut lines = 0u64;
-    for (_, c) in &items {
-        for_each_line(c, |_| lines += 1);
-    }
-    let layer = |name: &str, f: &mut dyn FnMut(*const u8) -> Option<usize>| {
-        let t = Instant::now();
-        for (_, c) in &items {
-            fast::for_each_line_fast(c, &mut *f, |_| {});
-        }
-        eprintln!("{name:<28} {:>6.1} ns/line", t.elapsed().as_secs_f64() * 1e9 / lines as f64);
-    };
-    let mut acc = 0u64;
-    {
-        // which lines the fast decoder declines, by first failing step
-        let mut why = [0u64; 8];
-        for (_, c) in &items {
-            fast::for_each_line_fast(c, |p| unsafe { fast::event(p, lo, hi, b'p') }.map(|(l, _)| l), |line| {
-                let w = match split::<7>(line) {
-                    None => 0,
-                    Some(f) if f.iter().any(|x| x.is_empty() && !std::ptr::eq(*x, f[6])) => 1,
-                    Some(f) => match timefmt::parse(f[2]) { None => 2, Some(t) if t < lo || t >= hi => 3, _ => if timefmt::parse(f[3]).is_none() { 4 } else if !matches!(f[4], b"view" | b"cart" | b"purchase") { 5 } else if f[4] == b"purchase" && parse_price(f[6]) == 0 { 6 } else { 7 } },
-                };
-                why[w] += 1;
-            });
-        }
-        eprintln!("declined: malformed {} empty-field {} bad-ts {} out-of-window {} bad-ingest {} bad-type {} bad-price {} other(late/shape) {} of {lines}", why[0], why[1], why[2], why[3], why[4], why[5], why[6], why[7]);
-    }
-    layer("fields only (cold)", &mut |p| unsafe { fast::fields::<7>(p) }.map(|(l, f)| { acc ^= f[3].0 as u64; l }));
-    layer("fields only", &mut |p| unsafe { fast::fields::<7>(p) }.map(|(l, f)| { acc ^= f[3].0 as u64; l }));
-    layer("event decode", &mut |p| unsafe { fast::event(p, lo, hi, b'p') }.map(|(l, e)| { acc ^= e.eid ^ e.ts as u64; l }));
-    layer("+ product lookup", &mut |p| unsafe { fast::event(p, lo, hi, b'p') }.map(|(l, e)| { acc ^= products.get_packed(packed::fmix(e.product), e.product).unwrap_or(0) as u64; l }));
-    let mut parts: Vec<Vec<EvRec>> = (0..NB).map(|_| Vec::with_capacity(lines as usize / NB + 1024)).collect();
-    layer("+ push (preallocated)", &mut |p| unsafe { fast::event(p, lo, hi, b'p') }.map(|(l, e)| {
-        parts[keys::part(e.eid, LOG_NB)].push(EvRec { eid: e.eid, rank: e.ingest as u64, person: e.user, ts: e.ts, price: e.price, cat: 0, hk: 0 }); l }));
-    eprintln!("acc {acc} {}", parts.iter().map(Vec::len).sum::<usize>());
-}
-
-/// SS_EXP=1: single-thread cost of each scan layer over all event files (profiling only).
-fn experiment(src: &[&'static Source], products: &IdMap, lo: i64, hi: i64, names: &Names) {
-    const NAMES: [&str; 7] = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"];
-    let items = work_items::<7>(src, NAMES);
-    let bytes: usize = items.iter().map(|(_, c)| c.len()).sum();
-    let mut lines = 0u64;
-    for (_, c) in &items {
-        for_each_line(c, |_| lines += 1);
-    }
-    if let Ok(which) = std::env::var("SS_ONLY") {
-        // one scanner, 5 passes, nothing else (for instruction/cycle counts)
-        let t = Instant::now();
-        let mut acc = 0u64;
-        for _ in 0..5 {
-            for (_, c) in &items {
-                let mut g = |rec: Option<[S; 7]>| {
-                    if let Some(r) = rec {
-                        acc = acc.wrapping_add(r[0].len() as u64 + r[6].len() as u64);
-                    }
-                };
-                match which.as_str() {
-                    "v1" => for_each_record::<7>(c, &mut g),
-                    "swar" => for_each_record_swar::<7>(c, &mut g),
-                    "ix" => for_each_record_ix::<7>(c, &mut g),
-                    "bq" => for_each_record_bq::<7>(c, &mut g),
-                    "lines" => for_each_line(c, |l| acc = acc.wrapping_add(l.len() as u64)),
-                    "ix1" => acc = acc.wrapping_add(dialect::ix_stage1(c) as u64),
-                    "masks" => acc = acc.wrapping_add(dialect::masks_only(c)),
-                    _ => for_each_record_idx::<7>(c, &mut g),
-                }
-            }
-        }
-        let secs = t.elapsed().as_secs_f64();
-        eprintln!("SS_ONLY={which}: {:.1} ns/line ({acc})", secs * 1e9 / (5.0 * lines as f64));
-        return;
-    }
-    let run = |name: &str, f: &dyn Fn(&[S; 7]) -> u64| {
-        let t = Instant::now();
-        let mut acc = 0u64;
-        for (order, c) in &items {
-            for_each_record_bq::<7>(c, |rec| {
-                if let Some(r) = rec {
-                    acc = acc.wrapping_add(f(&reorder(r, order)));
-                }
-            });
-        }
-        let secs = t.elapsed().as_secs_f64();
-        eprintln!("{name:<28} {secs:>6.3}s  {:>6.1} ns/line  {:>5.2} GB/s  (acc {acc})", secs * 1e9 / lines as f64, bytes as f64 / secs / 1e9);
-    };
-    let t = Instant::now();
-    let mut n = 0u64;
-    for (_, c) in &items {
-        for_each_line(c, |l| n += l.len() as u64);
-    }
-    eprintln!("{:<28} {:>6.3}s  ({lines} lines, {:.2} GB)", "lines only (memchr)", t.elapsed().as_secs_f64(), bytes as f64 / 1e9);
-    run("records (RW16 production)", &|f| f[0].len() as u64);
-    {
-        let t = Instant::now();
-        let mut acc = 0u64;
-        for (_, c) in &items {
-            for_each_record_idx::<7>(c, |rec| {
-                if let Some(r) = rec {
-                    acc = acc.wrapping_add(r[0].len() as u64);
-                }
-            });
-        }
-        let secs = t.elapsed().as_secs_f64();
-        eprintln!("{:<28} {secs:>6.3}s  {:>6.1} ns/line  (acc {acc})", "records (RW4 struct index)", secs * 1e9 / lines as f64);
-        let t = Instant::now();
-        let mut acc = 0u64;
-        for (_, c) in &items {
-            for_each_record::<7>(c, |rec| {
-                if let Some(r) = rec {
-                    acc = acc.wrapping_add(r[0].len() as u64);
-                }
-            });
-        }
-        let secs = t.elapsed().as_secs_f64();
-        eprintln!("{:<28} {secs:>6.3}s  {:>6.1} ns/line  (acc {acc})", "records (night-04, direct)", secs * 1e9 / lines as f64);
-        let t = Instant::now();
-        let mut acc = 0u64;
-        for (_, c) in &items {
-            for_each_record_swar::<7>(c, |rec| {
-                if let Some(r) = rec {
-                    acc = acc.wrapping_add(r[0].len() as u64);
-                }
-            });
-        }
-        let secs = t.elapsed().as_secs_f64();
-        eprintln!("{:<28} {secs:>6.3}s  {:>6.1} ns/line  (acc {acc})", "records (RW9 memchr+SWAR)", secs * 1e9 / lines as f64);
-        let t = Instant::now();
-        let mut acc = 0u64;
-        for (_, c) in &items {
-            for_each_record_ix::<7>(c, |rec| {
-                if let Some(r) = rec {
-                    acc = acc.wrapping_add(r[0].len() as u64);
-                }
-            });
-        }
-        let secs = t.elapsed().as_secs_f64();
-        eprintln!("{:<28} {secs:>6.3}s  {:>6.1} ns/line  (acc {acc})", "records (RW10 two-stage)", secs * 1e9 / lines as f64);
-    }
-    run("+ key_of(eid)", &|f| key_of(f[0]));
-    run("+ key_of(user)", &|f| key_of(f[0]) ^ key_of(f[1]));
-    run("+ ts parse_in", &|f| key_of(f[0]) ^ key_of(f[1]) ^ timefmt::parse_in(f[2], lo, hi) as u64);
-    run("+ ingest parse", &|f| key_of(f[0]) ^ key_of(f[1]) ^ timefmt::parse_in(f[2], lo, hi) as u64 ^ parse_ingest(f[3]).unwrap_or(0) as u64);
-    run("+ type + price", &|f| {
-        key_of(f[0]) ^ key_of(f[1]) ^ timefmt::parse_in(f[2], lo, hi) as u64 ^ parse_ingest(f[3]).unwrap_or(0) as u64
-            ^ (f[4] == b"purchase") as u64 ^ parse_price(f[6]) as u64
-    });
-    run("+ person lookup", &|f| {
-        key_of(f[0]) ^ names.person(key_of(f[1])) ^ timefmt::parse_in(f[2], lo, hi) as u64 ^ parse_ingest(f[3]).unwrap_or(0) as u64
-            ^ (f[4] == b"purchase") as u64 ^ parse_price(f[6]) as u64 ^ products.get(f[5]).unwrap_or(0) as u64
-    });
-    // + scatter: the same work, pushing a 40-byte record into one of NB partition vectors
-    let t = Instant::now();
-    let mut kept = 0usize;
-    for (order, c) in &items {
-        let mut parts: Vec<Vec<EvRec>> = (0..NB).map(|_| Vec::with_capacity(c.len() / 80 / NB + 8)).collect();
-        for_each_record::<7>(c, |rec| {
-            if let Some(r) = rec {
-                let f = reorder(r, order);
-                let eid = key_of(f[0]);
-                let r = EvRec { eid, rank: rank_of(parse_ingest(f[3])), person: names.person(key_of(f[1])), ts: timefmt::parse_in(f[2], lo, hi), hk: 0,
-                    price: parse_price(f[6]), cat: products.get(f[5]).unwrap_or(0) };
-                parts[keys::part(eid, LOG_NB)].push(r);
-            }
-        });
-        kept += parts.iter().map(Vec::len).sum::<usize>();
-    }
-    let secs = t.elapsed().as_secs_f64();
-    eprintln!("{:<28} {secs:>6.3}s  {:>6.1} ns/line  (kept {kept})", "+ person + scatter", secs * 1e9 / lines as f64);
-    run("+ product lookup", &|f| {
-        key_of(f[0]) ^ key_of(f[1]) ^ timefmt::parse_in(f[2], lo, hi) as u64 ^ parse_ingest(f[3]).unwrap_or(0) as u64
-            ^ (f[4] == b"purchase") as u64 ^ parse_price(f[6]) as u64 ^ products.get(f[5]).unwrap_or(0) as u64
-    });
-}
-
-// ====================================================================== reference tables
-
-/// products(product_id PK, category). First occurrence wins if a key repeats.
-/// Categories are numbered in byte order, so "smallest index" == "byte-wise smallest name".
 fn load_products(src: &'static Source) -> (IdMap, Vec<S>) {
     let bytes: S = src.bytes();
     let order = header_order::<2>(bytes, ["product_id", "category"]);
@@ -884,8 +693,8 @@ struct ClRec {
 #[derive(Clone, Copy)]
 pub struct ClickV {
     pub person: u64,
-    pub ts: i64,
     pub cid: u64,
+    pub ts: u32, // v4: ms since window_start - 7 days
     pub camp: u32,
 }
 
@@ -913,7 +722,9 @@ unsafe impl<T: Sync> Sync for Parted<T> {}
 
 impl<T> Drop for Parted<T> {
     fn drop(&mut self) {
-        alloc::unmap_huge(self.buf as *mut u8, self.map_len);
+        if self.map_len > 0 {
+            alloc::unmap_huge(self.buf as *mut u8, self.map_len);
+        }
     }
 }
 
@@ -922,6 +733,14 @@ impl<T: Copy> Parted<T> {
         let per = per.max(1);
         let (p, map_len) = alloc::map_huge(NB * per * std::mem::size_of::<T>()).expect("out of memory (partition buffer)");
         Parted { buf: p as *mut T, map_len, per, lens: vec![0; NB], spill: (0..NB).map(|_| Vec::new()).collect() }
+    }
+    /// v4: the buffer comes from `arena` (never unmapped); a full arena falls back to `new`.
+    pub fn in_arena(per: usize, arena: &alloc::Arena) -> Self {
+        let per = per.max(1);
+        match arena.take(NB * per * std::mem::size_of::<T>()) {
+            Some(p) => Parted { buf: p as *mut T, map_len: 0, per, lens: vec![0; NB], spill: (0..NB).map(|_| Vec::new()).collect() },
+            None => Self::new(per),
+        }
     }
     #[inline(always)]
     pub fn push(&mut self, p: usize, r: T) {
@@ -945,6 +764,20 @@ impl<T: Copy> Parted<T> {
     pub fn len(&self) -> usize {
         self.lens.iter().map(|&l| l as usize).sum::<usize>() + self.spill.iter().map(Vec::len).sum::<usize>()
     }
+}
+
+/// v4: per-partition slots of a scan chunk of `bytes` bytes (event lines ~82 B, click lines
+/// ~53 B with the 2026-11-22 generator; ~14% room plus a fixed margin; overflow spills).
+fn ev_per(bytes: usize) -> usize {
+    bytes / 72 / NB + 32
+}
+fn cl_per(bytes: usize) -> usize {
+    bytes / 46 / NB + 32
+}
+/// v4: one leaked arena holding a `Parted<T>` of each of the given per-partition sizes.
+fn arena_for<T>(pers: impl Iterator<Item = usize>) -> &'static alloc::Arena {
+    let bytes: usize = pers.map(|p| (NB * p.max(1) * std::mem::size_of::<T>() + 63) & !63).sum();
+    Box::leak(Box::new(alloc::Arena::new(bytes + 4096)))
 }
 
 /// Partition p of all sources, in source order.
@@ -1105,10 +938,11 @@ fn clicks_scan(src: &[&'static Source], campaigns: &IdMap, lo: i64, hi: i64, nam
 /// output: credit goes to the latest qualifying click with the smallest click_id (a copy is
 /// that same click) and assists count distinct campaigns. Invalid copies are dropped here.
 fn clicks_scan_items(items: &[([usize; 4], S)], campaigns: &IdMap, lo: i64, hi: i64, names: &Names, stats: &Stats, fast_ok: bool) -> Vec<Parted<ClickV>> {
+    let arena = arena_for::<ClickV>(items.iter().map(|(_, c)| cl_per(c.len())));
     items
         .par_iter()
         .map(|(order, chunk)| {
-            let mut sc = ClScan::new(chunk.len(), campaigns, lo, hi, names);
+            let mut sc = ClScan::new(chunk.len(), campaigns, lo, hi, names, arena);
             if fast_ok && is_identity(order) {
                 let len = chunk.len();
                 let mut s = 0usize;
@@ -1154,10 +988,10 @@ struct ClScan<'a> {
 }
 
 impl<'a> ClScan<'a> {
-    fn new(bytes: usize, campaigns: &'a IdMap, lo: i64, hi: i64, names: &'a Names) -> Self {
+    fn new(bytes: usize, campaigns: &'a IdMap, lo: i64, hi: i64, names: &'a Names, arena: &alloc::Arena) -> Self {
         const Z: ClickV = ClickV { person: 0, ts: 0, cid: 0, camp: 0 };
         ClScan {
-            parts: Parted::new(bytes / 46 / NB + 32), // v3d: click lines ~53 B (generator 2026-11-22), ~15% room
+            parts: Parted::in_arena(cl_per(bytes), arena), // v3d: click lines ~53 B (generator 2026-11-22), ~15% room
             pend: [(Z, 0); PBATCH],
             np: 0,
             campaigns,
@@ -1175,7 +1009,7 @@ impl<'a> ClScan<'a> {
         let um = packed::fmix(user);
         self.names.prefetch(um);
         // `person` holds the user key until the flush
-        self.pend[self.np] = (ClickV { person: user, ts, cid, camp }, um);
+        self.pend[self.np] = (ClickV { person: user, ts: (ts - self.lo) as u32, cid, camp }, um);
         self.np += 1;
         if self.np == PBATCH {
             self.flush();
@@ -1242,19 +1076,27 @@ struct EvRec {
     eid: u64,
     rank: u64, // order-preserving ingest_ts; u64::MAX if unparseable (ranks last)
     person: u64,
-    ts: i64,
-    price: u32, // > 0 iff a valid purchase
-    cat: u32,
-    hk: u64, // v3: keys::id_hash_key(eid), set by EvScan::put (bytes are hot there)
+    ts: u32, // v4: ms since window_start (valid copies only)
+    pc: u32, // v4: price (low 24 bits, > 0 iff a valid purchase) | category << 24; reason code if invalid
 }
 
 /// A valid, deduplicated event, partitioned by person (24 bytes).
 #[derive(Clone, Copy)]
 pub struct EvV {
     pub person: u64,
-    pub ts: i64,
-    pub cat: u32,
-    pub price: u32,
+    pub ts: u32, // ms since window_start
+    pub pc: u32, // price | cat << 24
+}
+
+impl EvV {
+    #[inline(always)]
+    pub fn price(&self) -> u32 {
+        self.pc & 0x00ff_ffff
+    }
+    #[inline(always)]
+    pub fn cat(&self) -> u32 {
+        self.pc >> 24
+    }
 }
 
 #[inline]
@@ -1307,10 +1149,11 @@ fn events_scan(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: 
 /// The per-chunk events scan (exact path, or v2 P1 fast path with exact fallback).
 #[allow(clippy::too_many_arguments)]
 fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u32, lo: i64, hi: i64, names: Option<&Names>, stats: &Stats, fast_ok: bool) -> Vec<Parted<EvRec>> {
+    let arena = arena_for::<EvRec>(items.iter().map(|(_, c)| ev_per(c.len())));
     items
         .par_iter()
         .map(|(order, chunk)| {
-            let mut sc = EvScan::new(chunk.len(), products, unknown_cat, lo, hi, names);
+            let mut sc = EvScan::new(chunk.len(), products, unknown_cat, lo, hi, names, arena);
             if fast_ok && is_identity(order) {
                 // v2 P1: shape-specialized fast path; every line it declines takes `exact`
                 let len = chunk.len();
@@ -1320,10 +1163,10 @@ fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u
                     // SAFETY: s + SLACK <= len, so the decoder reads inside the chunk
                     if let Some((l, ev)) = unsafe { fast::event(base.add(s), lo, hi, products.dense_prefix()) } {
                         sc.lines += 1;
-                        let r = EvRec { eid: ev.eid, rank: rank_of(Some(ev.ingest)), person: ev.user, ts: ev.ts, price: ev.price, cat: 0, hk: 0 };
+                        let r = EvRec { eid: ev.eid, rank: rank_of(Some(ev.ingest)), person: ev.user, ts: (ev.ts - lo) as u32, pc: ev.price };
                         if ev.pnum != 0 {
                             // v2: canonical product ID: direct index (no hash, no batch)
-                            sc.valid(EvRec { cat: products.get_dense(ev.pnum).unwrap_or(unknown_cat), ..r }, 0, 0);
+                            sc.valid(EvRec { pc: r.pc | products.get_dense(ev.pnum).unwrap_or(unknown_cat) << 24, ..r }, 0, 0);
                         } else {
                             let m = packed::fmix(ev.product);
                             products.prefetch_packed(m);
@@ -1368,10 +1211,10 @@ struct EvScan<'a> {
 }
 
 impl<'a> EvScan<'a> {
-    fn new(bytes: usize, products: &'a IdMap, unknown_cat: u32, lo: i64, hi: i64, names: Option<&'a Names>) -> Self {
-        const Z: EvRec = EvRec { eid: 0, rank: 0, person: 0, ts: 0, price: 0, cat: 0, hk: 0 };
+    fn new(bytes: usize, products: &'a IdMap, unknown_cat: u32, lo: i64, hi: i64, names: Option<&'a Names>, arena: &alloc::Arena) -> Self {
+        const Z: EvRec = EvRec { eid: 0, rank: 0, person: 0, ts: 0, pc: 0 };
         EvScan {
-            parts: Parted::new(bytes / 72 / NB + 32), // v3d: event lines ~82 B (generator 2026-11-22), ~14% room
+            parts: Parted::in_arena(ev_per(bytes), arena), // v3d: event lines ~82 B (generator 2026-11-22), ~14% room
             pend: [(Z, 0, 0, 0); PBATCH],
             names,
             np: 0,
@@ -1385,9 +1228,8 @@ impl<'a> EvScan<'a> {
         }
     }
     #[inline(always)]
-    fn put(&mut self, mut r: EvRec) {
-        r.hk = keys::id_hash_key(r.eid);
-        self.parts.push(keys::part(r.hk, LOG_NB), r);
+    fn put(&mut self, r: EvRec) {
+        self.parts.push(keys::part(keys::id_hash_key(r.eid), LOG_NB), r);
     }
     #[inline(always)]
     fn valid(&mut self, r: EvRec, pk: u64, pm: u64) {
@@ -1414,7 +1256,7 @@ impl<'a> EvScan<'a> {
                 r.person = self.names.unwrap().person_mixed(um, r.person);
             }
             if pk != 0 {
-                r.cat = self.products.get_packed(pm, pk).unwrap_or(self.unknown_cat);
+                r.pc |= self.products.get_packed(pm, pk).unwrap_or(self.unknown_cat) << 24;
             }
             self.put(r);
         }
@@ -1442,7 +1284,7 @@ impl<'a> EvScan<'a> {
         }
         let eid = keys::local_key(f[0]); // v3: pointer key when long (dedup compares bytes)
         let ingest = parse_ingest(f[3]);
-        let mut r = EvRec { eid, rank: rank_of(ingest), person: keys::EMPTY, ts: 0, price: 0, cat: 0, hk: 0 };
+        let mut r = EvRec { eid, rank: rank_of(ingest), person: keys::EMPTY, ts: 0, pc: 0 };
         // validation of this copy, in the order of rules.md (reason codes for stats)
         let typ = match f[4] {
             b"view" => T_VIEW,
@@ -1452,25 +1294,25 @@ impl<'a> EvScan<'a> {
         };
         let ts = if f[1].is_empty() { BAD } else { timefmt::parse_in(f[2], lo, hi) };
         if f[1].is_empty() {
-            r.price = 0;
+            r.pc = 0;
         } else if ts == BAD {
-            r.price = 1;
+            r.pc = 1;
         } else if typ == T_BAD {
-            r.price = 2;
+            r.pc = 2;
         } else if f[5].is_empty() {
-            r.price = 3;
+            r.pc = 3;
         } else {
             let price = if typ == T_PURCHASE { parse_price(f[6]) } else { 0 };
             if typ == T_PURCHASE && price == 0 {
-                r.price = 4;
+                r.pc = 4;
             } else {
                 match ingest {
                     Some(ing) if ing.saturating_sub(ts) <= DAY => {
-                        r.ts = ts;
-                        r.price = price;
+                        r.ts = (ts - lo) as u32;
+                        r.pc = price;
                         let (pk, pm) = match pack9(f[5]) {
                             _ if packed::canon(f[5], self.products.dense_prefix()).is_some() => {
-                                r.cat = self.products.get(f[5]).unwrap_or(self.unknown_cat);
+                                r.pc |= self.products.get(f[5]).unwrap_or(self.unknown_cat) << 24;
                                 (0, 0)
                             }
                             Some(k) => {
@@ -1479,7 +1321,7 @@ impl<'a> EvScan<'a> {
                                 (k, m)
                             }
                             None => {
-                                r.cat = self.products.get(f[5]).unwrap_or(self.unknown_cat);
+                                r.pc |= self.products.get(f[5]).unwrap_or(self.unknown_cat) << 24;
                                 (0, 0)
                             }
                         };
@@ -1487,7 +1329,7 @@ impl<'a> EvScan<'a> {
                         self.valid(r, pk, pm);
                         return;
                     }
-                    _ => r.price = 5,
+                    _ => r.pc = 5,
                 }
             }
         }
@@ -1507,6 +1349,9 @@ static LATE_FREE: std::sync::Mutex<Vec<Box<dyn Send>>> = std::sync::Mutex::new(V
 
 fn events_dedup(by_eid: ByPerson<EvRec>, unknown_cat: u32, names: Option<&Names>, stats: &Stats) -> ByPerson<EvV> {
     let mut st = Stage::start();
+    let dper = |n: usize| n / NB + n / NB / 8 + 32; // v2: room for the spread
+    let ns: Vec<usize> = (0..NB).map(|p| by_eid.iter().map(|s| s.part(p).iter().map(|x| x.len()).sum::<usize>()).sum()).collect();
+    let arena = arena_for::<EvV>(ns.iter().map(|&n| dper(n)));
     let out: Vec<Parted<EvV>> = (0..NB)
         .into_par_iter()
         .map(|p| {
@@ -1514,18 +1359,18 @@ fn events_dedup(by_eid: ByPerson<EvRec>, unknown_cat: u32, names: Option<&Names>
             let n: usize = parts.iter().map(|x| x.len()).sum();
             // rules.md, Events step 2: keep the copy with the smallest ingest_ts; A2: on a
             // tie the first copy stays (equal-ingest copies are promised identical)
-            let mut dst: Parted<EvV> = Parted::new(n / NB + n / NB / 8 + 32); // v2: room for the spread
+            let mut dst: Parted<EvV> = Parted::in_arena(dper(n), arena);
             let mut c = [0u64; 8];
             let mut pb: PersonBatch<EvRec> = PersonBatch::new();
             let mut emit = |r: EvRec, person: u64| {
-                dst.push(keys::part(person, LOG_NB), EvV { person, ts: r.ts, cat: r.cat, price: r.price });
+                dst.push(keys::part(person, LOG_NB), EvV { person, ts: r.ts, pc: r.pc });
             };
-            let kept = dedup(&parts, |r: &EvRec| r.hk, |a, b| keys::same_id(a.eid, b.eid), |a, b| a.rank < b.rank, |r| {
+            let kept = dedup(&parts, |r: &EvRec| keys::id_hash_key(r.eid), |a, b| keys::same_id(a.eid, b.eid), |a, b| a.rank < b.rank, |r| {
                 if r.person == keys::EMPTY {
-                    c[r.price as usize] += 1;
+                    c[r.pc as usize] += 1;
                     return;
                 }
-                if r.cat == unknown_cat {
+                if r.pc >> 24 == unknown_cat {
                     c[6] += 1;
                 }
                 match names {
@@ -1605,7 +1450,9 @@ fn sessionize(
     camp: &mut [[u64; 3]],
     assist: &mut [u32],
     stats: &Stats,
+    ws: i64,
 ) -> Vec<output::UserRow> {
+    let cb = ws - WEEK; // click ts base
     // RW6: events and clicks are grouped by bucket (bits of fmix(person) below the
     // partition bits) with one counting-sort pass, then each small bucket is sorted by
     // (person, ts). The walk only needs every person's rows together and time-ordered,
@@ -1619,7 +1466,7 @@ fn sessionize(
     let bucket = |person: u64| -> usize { ((packed::fmix(person) >> bshift) as usize) & (nbk - 1) };
     // events sort on one u128 key: person, then ts (sign-flipped so unsigned order = signed)
     let (ev, es) = bucket_sort(&evs_b, n, nbk, |e: &EvV| bucket(e.person), |v: &mut [EvV]| {
-        v.sort_unstable_by_key(|e| ((e.person as u128) << 64) | ((e.ts as u64) ^ (1 << 63)) as u128)
+        v.sort_unstable_by_key(|e| ((e.person as u128) << 32) | e.ts as u128)
     });
     // clicks: (person, ts asc, click_id desc in byte order), so the last click of a
     // window is the latest one with the byte-wise smallest click_id
@@ -1664,21 +1511,21 @@ fn sessionize(
         let mut k = i;
         while k < pe {
             // one session: [k, e); equal timestamps never split (gap 0)
-            let start = ev[k].ts;
+            let start = ws + ev[k].ts as i64;
             let mut e = k + 1;
-            while e < pe && ev[e].ts - ev[e - 1].ts <= GAP {
+            while e < pe && (ev[e].ts - ev[e - 1].ts) as i64 <= GAP {
                 e += 1;
             }
             let day = start.div_euclid(DAY) as i32;
             let (mut rev, mut has_p) = (0u64, false);
             for x in &ev[k..e] {
-                if x.price > 0 {
+                if x.price() > 0 {
                     has_p = true;
-                    rev += x.price as u64;
+                    rev += x.price() as u64;
                 }
             }
             // attribution window: clicks with start - 7d <= ts <= start
-            while hi < pc && cl[hi].ts <= start {
+            while hi < pc && cb + (cl[hi].ts as i64) <= start {
                 let c = cl[hi].camp as usize;
                 if cnt[c] == 0 {
                     pos[c] = active.len() as u32;
@@ -1687,7 +1534,7 @@ fn sessionize(
                 cnt[c] += 1;
                 hi += 1;
             }
-            while lo < hi && cl[lo].ts < start - WEEK {
+            while lo < hi && cb + (cl[lo].ts as i64) < start - WEEK {
                 let c = cl[lo].camp as usize;
                 cnt[c] -= 1;
                 if cnt[c] == 0 {
@@ -1732,10 +1579,10 @@ fn sessionize(
             d_rev += rev;
             if has_p {
                 for x in &ev[k..e] {
-                    if x.price > 0 {
-                        match cat_rev.iter_mut().find(|c| c.0 == x.cat) {
-                            Some(c) => c.1 += x.price as u64,
-                            None => cat_rev.push((x.cat, x.price as u64)),
+                    if x.price() > 0 {
+                        match cat_rev.iter_mut().find(|c| c.0 == x.cat()) {
+                            Some(c) => c.1 += x.price() as u64,
+                            None => cat_rev.push((x.cat(), x.price() as u64)),
                         }
                     }
                 }
@@ -1851,8 +1698,8 @@ mod dedup_tests {
 mod fast_scan_tests {
     use super::*;
 
-    fn flat(v: Vec<Parted<EvRec>>) -> Vec<Vec<(u64, u64, u64, i64, u32, u32)>> {
-        (0..NB).map(|p| slices(&v, p).into_iter().flatten().map(|r| (r.eid, r.rank, r.person, r.ts, r.price, r.cat)).collect()).collect()
+    fn flat(v: Vec<Parted<EvRec>>) -> Vec<Vec<(u64, u64, u64, u32, u32)>> {
+        (0..NB).map(|p| slices(&v, p).into_iter().flatten().map(|r| (r.eid, r.rank, r.person, r.ts, r.pc)).collect()).collect()
     }
 
     /// v2 P1: the events scan with the fast path gives exactly the records (same order, same

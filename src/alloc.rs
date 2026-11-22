@@ -181,3 +181,29 @@ pub fn unmap_huge(p: *mut u8, len: usize) {
         System.dealloc(p, Layout::from_size_align_unchecked(len, 4096));
     }
 }
+
+/// v4: a bump arena over one huge-page backed mapping. Slices are handed out with an atomic
+/// offset (64-byte aligned), so many small buffers share huge pages without rounding waste,
+/// and nothing is ever unmapped (the process exits without teardown).
+pub struct Arena {
+    base: usize,
+    cap: usize,
+    off: std::sync::atomic::AtomicUsize,
+}
+
+impl Arena {
+    pub fn new(cap: usize) -> Arena {
+        let (p, len) = map_huge(cap.max(1)).expect("out of memory (arena)");
+        Arena { base: p as usize, cap: len, off: std::sync::atomic::AtomicUsize::new(0) }
+    }
+    /// `bytes` bytes, 64-byte aligned, or None when the arena is full.
+    #[inline]
+    pub fn take(&self, bytes: usize) -> Option<*mut u8> {
+        let b = (bytes + 63) & !63;
+        let o = self.off.fetch_add(b, std::sync::atomic::Ordering::Relaxed);
+        if o + b > self.cap {
+            return None;
+        }
+        Some((self.base + o) as *mut u8)
+    }
+}
