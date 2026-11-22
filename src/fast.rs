@@ -159,28 +159,22 @@ pub unsafe fn fields_m<const N: usize>(p: *const u8, m: (u128, u128, u128)) -> O
     if cm.count_ones() as usize != N - 1 {
         return None;
     }
-    let qn = (q & lm).count_ones();
-    let mut out = [(0u32, 0u32); N];
-    if qn == 0 {
-        // v3e: no quote in the line (the usual case): fields are the spans between commas
-        // (the general loop below gives the same result: every q0 and q1 is 0)
-        let mut fs = 0u32;
-        for (j, o) in out.iter_mut().enumerate() {
-            let fe = if j + 1 < N {
-                let t = cm.trailing_zeros();
-                cm &= cm - 1;
-                t
-            } else {
-                e
-            };
-            *o = (fs, fe);
-            fs = fe + 1;
-        }
-        return Some((e as usize, out));
+    // v4: quotes by mask arithmetic (no per-field byte loads). S = field starts, E = field
+    // ends (comma or line end). A field is quoted iff a quote sits at its start and one at
+    // its end - 1, i.e. bit fs of qs and bit fe of qe (quotes shifted up one). Accept iff the
+    // per-field start and end flags agree, no 1-byte field is a lone quote, and every quote
+    // of the line is such a boundary quote (the exact rules of `split`).
+    let ql = q & lm;
+    let sm = (cm << 1) | 1;
+    let em = cm | (1u128 << e);
+    let qs = ql & sm;
+    let qe = (ql << 1) & em;
+    let ps = pext128(qs, sm);
+    if ps != pext128(qe, em) || (qs << 1) & qe != 0 || ql.count_ones() != 2 * ps.count_ones() {
+        return None;
     }
+    let mut out = [(0u32, 0u32); N];
     let mut fs = 0u32;
-    let mut qsum = 0u32;
-    let mut ok = true;
     for (j, o) in out.iter_mut().enumerate() {
         let fe = if j + 1 < N {
             let t = cm.trailing_zeros();
@@ -189,18 +183,42 @@ pub unsafe fn fields_m<const N: usize>(p: *const u8, m: (u128, u128, u128)) -> O
         } else {
             e
         };
-        let l = fe - fs;
-        let q0 = (l > 0 && unsafe { *p.add(fs as usize) } == b'"') as u32;
-        let q1 = (l > 1 && unsafe { *p.add(fe as usize - 1) } == b'"') as u32;
-        ok &= q0 == q1;
-        qsum += q0 + q1;
-        *o = (fs + q0, fe - q1);
+        let qj = ((ps >> j) & 1) as u32;
+        *o = (fs + qj, fe - qj);
         fs = fe + 1;
     }
-    if !ok || qn != qsum {
-        return None;
-    }
     Some((e as usize, out))
+}
+
+/// Parallel bit extract over 128 bits (BMI2 `pext` on each half).
+#[inline(always)]
+fn pext128(x: u128, m: u128) -> u64 {
+    let (xl, xh, ml, mh) = (x as u64, (x >> 64) as u64, m as u64, (m >> 64) as u64);
+    let (l, h) = (pext64(xl, ml), pext64(xh, mh));
+    let sh = ml.count_ones();
+    l | if sh >= 64 { 0 } else { h << sh }
+}
+
+#[inline(always)]
+fn pext64(x: u64, m: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        // SAFETY: BMI2 is enabled for this build (target feature)
+        unsafe { std::arch::x86_64::_pext_u64(x, m) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let (mut m, mut r, mut b) = (m, 0u64, 0u32);
+        while m != 0 {
+            let low = m & m.wrapping_neg();
+            if x & low != 0 {
+                r |= 1 << b;
+            }
+            b += 1;
+            m ^= low;
+        }
+        r
+    }
 }
 
 #[inline(always)]
