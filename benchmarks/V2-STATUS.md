@@ -111,6 +111,9 @@ Previous (old generator only): `a02705ccf8d8bfff6a09f0311a7330018dfeb302` (−17
 
 ## Tried and dropped
 
+- `ab/v3-pgo` (`b9dc99a`, Docker fix `ed18eed`): PGO from an instrumented rust 1.95 build on 20M data (sparse profile
+  1.4 MB; RUSTFLAGS profile-use on x86-64 in the Dockerfile and the A/B harness). Docker PASS, but CI vs 298e7c4
+  (EPYC 9V45): +1.5% (5/7) / +0.2% (2/5): neutral, dropped (not worth the build risk).
 - `ab/v3-qbits` (`065f8d1`): quote tests from the u128 quote mask instead of byte loads. CI vs 298e7c4 (EPYC 9V74):
   +1.6% (1/7) / +4.8% (1/5): slower (variable u128 shifts), dropped.
 - `ab/v3-hexsimd` (`b742e85`): AVX2 hex-shape check in the interner (lookup 92 → 40 ns in the microbench). CI vs
