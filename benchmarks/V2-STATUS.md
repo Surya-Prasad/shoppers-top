@@ -26,6 +26,7 @@ CI runners vary a lot (EPYC 7763 / 9V45 / 9V74, Xeon 8370C / 6975P / 8573C), so 
 | P2c | `5306bd6` | bit filter of linked users (skip probes for unlinked) | vs 80c1ff3: −1.2% (6/7) / **+4.0% (0/5)** (Xeon 6973P) — reverted |
 | PBATCH 64 | `4ad18e2` (ab/v2-pb64) | prefetch batch 32 → 64 | vs e450f86: −0.9% (4/7) / **−2.3% (5/5)** (EPYC 9V45) — take |
 | CHUNK 2 MiB | `788ec62` (ab/v2-chunk2) | scan granule 4 → 2 MiB | vs e450f86: **+6.7% (0/7) / +8.2% (0/5)** (EPYC 9V74) — dropped |
+| PBATCH 128 | `8e3e842` (ab/v2-pb128) | prefetch batch 64 → 128 | vs a02705c: −0.2% (4/7) / +0.4% (1/5) (Xeon 6975P) — dropped |
 | 1 link thread | `039fd37` (ab/v2-lk1) | link pool ncpu/4 | vs e450f86: −0.0% (4/7) / −0.7% (4/5) (EPYC 7763) — neutral, keep ncpu/2 |
 | links-overlap | `e450f86` | links on own pool concurrent with the events scan; persons in dedup | vs 80c1ff3: **−3.9% (6/7) / −2.9% (4/5)** (EPYC 9V74); Docker PASS |
 
@@ -34,13 +35,13 @@ Whole-branch checks vs b9481b1: `e450f86` **−17.8% (7/7) / −16.8% (5/5)** on
 
 ## Best submittable commit
 
-**`e450f86724aa71882be512bc7ae8ba39bc0fd221`** (branch `opt/v2-fast`; also `docker/v2-e450f86`).
-Evidence: CI gate PASS; vs b9481b1 **−17.8% (7/7) at 20M, −16.8% (5/5) at 60M** on EPYC 7763; vs `80c1ff3` (itself −15.9% / −15.7% vs b9481b1 on EPYC 7763) **−3.9% (6/7) at 20M,
-−2.9% (4/5) at 60M** on EPYC 9V74; Docker check PASS (image builds in 101 s, 30 MB, uid 1000; 36/36 fixtures and dev
-MATCH in the container with scorer flags). Local gates all pass (fuzz strict + default 250 each, 0 failures; MATCH vs
-b9481b1 on 20M seed 11, 20M seed 5, 60M seed 11).
+**`a02705ccf8d8bfff6a09f0311a7330018dfeb302`** (branch `opt/v2-fast`; also `docker/v2-a02705c`) = `e450f86` + prefetch
+batch 64. Evidence: CI gate PASS; vs b9481b1 **−17.0% (7/7) at 20M, −13.8% (5/5) at 60M** on EPYC 7763; same-runner vs
+`e450f86` −0.9% (4/7) / −2.3% (5/5) on EPYC 9V45; Docker check PASS (image builds in 120 s, 30 MB, uid 1000; 36/36
+fixtures and dev MATCH in the container with scorer flags). Local gates all pass (fuzz strict + default 200 each, 0
+failures; MATCH vs b9481b1 on 20M seed 11, 20M seed 5, 60M seed 11).
 
-Previous: `80c1ff330450e1638a7b29d438a37f71f3b385a9` (−15.9% / −15.7% vs b9481b1 on EPYC 7763, Docker PASS); before that `aead35696f173fa9ba4a2909a00bc01f823f7d0d` (−15.7% / −17.8% on EPYC 7763, Docker PASS).
+Previous: `e450f86724aa71882be512bc7ae8ba39bc0fd221` (vs b9481b1 −17.8% / −16.8% on EPYC 7763, Docker PASS); `80c1ff330450e1638a7b29d438a37f71f3b385a9` (−15.9% / −15.7% vs b9481b1 on EPYC 7763, Docker PASS); before that `aead35696f173fa9ba4a2909a00bc01f823f7d0d` (−15.7% / −17.8% on EPYC 7763, Docker PASS).
 
 ## Tried and dropped
 
