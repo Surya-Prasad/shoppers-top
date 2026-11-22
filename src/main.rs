@@ -351,6 +351,21 @@ fn experiment2(src: &[&'static Source], products: &IdMap, lo: i64, hi: i64) {
         eprintln!("{name:<28} {:>6.1} ns/line", t.elapsed().as_secs_f64() * 1e9 / lines as f64);
     };
     let mut acc = 0u64;
+    {
+        // which lines the fast decoder declines, by first failing step
+        let mut why = [0u64; 8];
+        for (_, c) in &items {
+            fast::for_each_line_fast(c, |p| unsafe { fast::event(p, lo, hi, b'p') }.map(|(l, _)| l), |line| {
+                let w = match split::<7>(line) {
+                    None => 0,
+                    Some(f) if f.iter().any(|x| x.is_empty() && !std::ptr::eq(*x, f[6])) => 1,
+                    Some(f) => match timefmt::parse(f[2]) { None => 2, Some(t) if t < lo || t >= hi => 3, _ => if timefmt::parse(f[3]).is_none() { 4 } else if !matches!(f[4], b"view" | b"cart" | b"purchase") { 5 } else if f[4] == b"purchase" && parse_price(f[6]) == 0 { 6 } else { 7 } },
+                };
+                why[w] += 1;
+            });
+        }
+        eprintln!("declined: malformed {} empty-field {} bad-ts {} out-of-window {} bad-ingest {} bad-type {} bad-price {} other(late/shape) {} of {lines}", why[0], why[1], why[2], why[3], why[4], why[5], why[6], why[7]);
+    }
     layer("fields only (cold)", &mut |p| unsafe { fast::fields::<7>(p) }.map(|(l, f)| { acc ^= f[3].0 as u64; l }));
     layer("fields only", &mut |p| unsafe { fast::fields::<7>(p) }.map(|(l, f)| { acc ^= f[3].0 as u64; l }));
     layer("event decode", &mut |p| unsafe { fast::event(p, lo, hi, b'p') }.map(|(l, e)| { acc ^= e.eid ^ e.ts as u64; l }));
@@ -1015,105 +1030,126 @@ fn clicks_scan_items(items: &[([usize; 4], S)], campaigns: &IdMap, lo: i64, hi: 
     items
         .par_iter()
         .map(|(order, chunk)| {
-            let mut parts: Vec<Vec<ClickV>> = (0..NB).map(|_| Vec::with_capacity(chunk.len() / 24 / NB + 32)).collect(); // v2: clicks lines ~26 B
-            let mut why = [0u64; 4];
-            let (mut lines, mut bad, mut noid) = (0u64, 0u64, 0u64);
-            // v2: valid copies resolve their person here, in prefetched batches (links are
-            // resolved before the scan); invalid copies (user EMPTY) go straight in
-            let mut pend: Vec<(ClRec, u64, u64)> = Vec::with_capacity(PBATCH);
-            // (every copy goes through the batch, so scan order is kept exactly)
-            let flush = |pend: &mut Vec<(ClRec, u64, u64)>, parts: &mut Vec<Vec<ClickV>>, why: &mut [u64; 4]| {
-                for &(r, user, um) in pend.iter() {
-                    if user == keys::EMPTY {
-                        why[r.why as usize] += 1;
-                        continue;
-                    }
-                    let person = names.person_mixed(um, user);
-                    parts[keys::part(person, LOG_NB)].push(ClickV { person, ts: r.ts, cid: r.cid, camp: r.camp });
-                }
-                pend.clear();
-            };
-            let mut put = |r: ClRec, user: u64| {
-                let um = packed::fmix(user);
-                if user != keys::EMPTY {
-                    names.prefetch(um);
-                }
-                pend.push((r, user, um));
-                if pend.len() == PBATCH {
-                    flush(&mut pend, &mut parts, &mut why);
-                }
-            };
-            let mut exact = |rec: Option<[S; 4]>, put: &mut dyn FnMut(ClRec, u64)| {
-                lines += 1;
-                let Some(f) = rec else {
-                    bad += 1;
-                    return;
-                };
-                let f = reorder(f, order);
-                if f[0].is_empty() {
-                    noid += 1;
-                    return;
-                }
-                let cid = key_of(f[0]);
-                let mut r = ClRec { cid, person: keys::EMPTY, ts: 0, camp: 0, why: 0 };
-                if f[1].is_empty() {
-                    r.why = 1;
-                } else {
-                    let ts = timefmt::parse_in(f[3], lo, hi);
-                    if ts == BAD {
-                        r.why = 2;
-                    } else {
-                        match campaigns.get(f[2]) {
-                            None => r.why = 3,
-                            Some(c) => {
-                                r.ts = ts;
-                                r.camp = c;
-                                put(r, key_of(f[1]));
-                                return;
+            let mut sc = ClScan::new(chunk.len(), campaigns, lo, hi, names);
+            if fast_ok && is_identity(order) {
+                let len = chunk.len();
+                let mut s = 0usize;
+                while s < len {
+                    if s + fast::SLACK <= len {
+                        // SAFETY: s + SLACK <= len, so the decoder reads inside the chunk
+                        if let Some((l, c)) = unsafe { fast::click(chunk.as_ptr().add(s), lo, hi) } {
+                            if let Some(camp) = campaigns.get_packed(packed::fmix(c.camp), c.camp) {
+                                sc.lines += 1;
+                                sc.valid(c.cid, c.user, c.ts, camp);
+                                s += l + 1;
+                                continue;
                             }
                         }
                     }
+                    let e = memchr::memchr(b'\n', &chunk[s..]).map_or(len, |i| s + i);
+                    sc.exact(split::<4>(&chunk[s..e]), order);
+                    s = e + 1;
                 }
-                put(r, keys::EMPTY);
-            };
-            if fast_ok && is_identity(order) {
-                let mut nfast = 0u64;
-                let st = std::cell::RefCell::new((&mut put, &mut exact));
-                fast::for_each_line_fast(
-                    chunk,
-                    |p| {
-                        // SAFETY: for_each_line_fast guarantees SLACK readable bytes at p
-                        let (l, c) = unsafe { fast::click(p, lo, hi) }?;
-                        let camp = campaigns.get_packed(packed::fmix(c.camp), c.camp)?;
-                        nfast += 1;
-                        let mut g = st.borrow_mut();
-                        (g.0)(ClRec { cid: c.cid, person: keys::EMPTY, ts: c.ts, camp, why: 0 }, c.user);
-                        Some(l)
-                    },
-                    |line| {
-                        let mut g = st.borrow_mut();
-                        let (put, exact) = &mut *g;
-                        exact(split::<4>(line), &mut **put);
-                    },
-                );
-                drop(st);
-                stats.add(K::ClLines, nfast);
             } else {
-                for_each_record_bq::<4>(chunk, |rec| exact(rec, &mut put));
+                for_each_record_bq::<4>(chunk, |rec| sc.exact(rec, order));
             }
-            drop(exact);
-            drop(put);
-            flush(&mut pend, &mut parts, &mut why);
-            stats.add(K::ClBadUser, why[1]);
-            stats.add(K::ClBadTs, why[2]);
-            stats.add(K::ClBadCampaign, why[3]);
-            stats.add(K::ClSurvived, parts.iter().map(|v| v.len() as u64).sum());
-            stats.add(K::ClLines, lines);
-            stats.add(K::ClMalformed, bad);
-            stats.add(K::ClNoId, noid);
-            parts
+            sc.finish(stats)
         })
         .collect()
+}
+
+/// One chunk's clicks scan state (v2: monomorphic, like `EvScan`).
+struct ClScan<'a> {
+    parts: Vec<Vec<ClickV>>,
+    // valid copies waiting for their person: (click, user key, user mix); the person slots of a
+    // whole batch are prefetched before any lookup runs
+    pend: [(ClickV, u64); PBATCH],
+    np: usize,
+    campaigns: &'a IdMap,
+    names: &'a Names,
+    lo: i64,
+    hi: i64,
+    lines: u64,
+    bad: u64,
+    noid: u64,
+    why: [u64; 4],
+}
+
+impl<'a> ClScan<'a> {
+    fn new(bytes: usize, campaigns: &'a IdMap, lo: i64, hi: i64, names: &'a Names) -> Self {
+        const Z: ClickV = ClickV { person: 0, ts: 0, cid: 0, camp: 0 };
+        ClScan {
+            parts: (0..NB).map(|_| Vec::with_capacity(bytes / 24 / NB + 32)).collect(), // v2: clicks lines ~26 B
+            pend: [(Z, 0); PBATCH],
+            np: 0,
+            campaigns,
+            names,
+            lo,
+            hi,
+            lines: 0,
+            bad: 0,
+            noid: 0,
+            why: [0; 4],
+        }
+    }
+    #[inline(always)]
+    fn valid(&mut self, cid: u64, user: u64, ts: i64, camp: u32) {
+        let um = packed::fmix(user);
+        self.names.prefetch(um);
+        // `person` holds the user key until the flush
+        self.pend[self.np] = (ClickV { person: user, ts, cid, camp }, um);
+        self.np += 1;
+        if self.np == PBATCH {
+            self.flush();
+        }
+    }
+    #[inline]
+    fn flush(&mut self) {
+        for i in 0..self.np {
+            let (mut c, um) = self.pend[i];
+            c.person = self.names.person_mixed(um, c.person);
+            self.parts[keys::part(c.person, LOG_NB)].push(c);
+        }
+        self.np = 0;
+    }
+    fn finish(mut self, stats: &Stats) -> Vec<Vec<ClickV>> {
+        self.flush();
+        stats.add(K::ClBadUser, self.why[1]);
+        stats.add(K::ClBadTs, self.why[2]);
+        stats.add(K::ClBadCampaign, self.why[3]);
+        stats.add(K::ClSurvived, self.parts.iter().map(|v| v.len() as u64).sum());
+        stats.add(K::ClLines, self.lines);
+        stats.add(K::ClMalformed, self.bad);
+        stats.add(K::ClNoId, self.noid);
+        self.parts
+    }
+    /// The exact path for one line's fields (None = malformed).
+    fn exact(&mut self, rec: Option<[S; 4]>, order: &[usize; 4]) {
+        self.lines += 1;
+        let Some(f) = rec else {
+            self.bad += 1;
+            return;
+        };
+        let f = reorder(f, order);
+        if f[0].is_empty() {
+            self.noid += 1;
+            return;
+        }
+        let cid = key_of(f[0]);
+        if f[1].is_empty() {
+            self.why[1] += 1;
+            return;
+        }
+        let ts = timefmt::parse_in(f[3], self.lo, self.hi);
+        if ts == BAD {
+            self.why[2] += 1;
+            return;
+        }
+        match self.campaigns.get(f[2]) {
+            None => self.why[3] += 1,
+            Some(c) => self.valid(cid, key_of(f[1]), ts, c),
+        }
+    }
 }
 
 
