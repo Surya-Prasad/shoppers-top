@@ -56,6 +56,7 @@ the fast decoder, no THP advice) **~4.2 s**. All local gates re-run on regenerat
 | ClScan | `80c1ff3` | monomorphic clicks loop (no measured change locally) | vs b9481b1: **−15.9% (7/7) / −15.7% (5/5)** (EPYC 7763); Docker PASS |
 | NB 512 | `466f6a7` (exp/v2-nb512) | 512 hash partitions | vs 80c1ff3: **+5.2% (0/7)** / +0.5% (Xeon 6975P) — dropped |
 | P2c | `5306bd6` | bit filter of linked users (skip probes for unlinked) | vs 80c1ff3: −1.2% (6/7) / **+4.0% (0/5)** (Xeon 6973P) — reverted |
+| v3 THP again | `b9d02ae` (= `971ee32` on c48f601) | MADV_HUGEPAGE on Parted mappings again | `971ee32` vs c48f601: **−7.1% (7/7)** / +2.8% (1/5) (Xeon 6975P; 60M on disk near the 15 GB runner limit, RSS 12.25 → 13.54 GB; 20M RSS 4.20 → 5.15 GB) — kept for the scorer (warm cache, 20M-like); confirm A/B + Docker pending |
 | v3 EvRec hash | (cherry-pick of `22b466b`) | EvRec carries its dedup hash key (computed at scan) | `22b466b` vs 89c8210: **−4.4% (7/7) / −8.5% (5/5)** (EPYC 9V74) — keep; Docker PASS (`c48f601`) |
 | v3 hex LUT | `89c8210` | branch-free hex check in the interner | vs 2bd0fe0: **−2.8% (5/7) / −4.1% (4/5)** (EPYC 7763) — keep; vs b9481b1 −66.7% / −70.8% (Xeon 6973P); Docker PASS |
 | v3 interner slots | `2bd0fe0` | hex IDs matched by value in the slot, others by address (one line per lookup) | vs 7256f58: **−3.3% (7/7) / −4.6% (5/5)** (Xeon 6975P) — keep; vs b9481b1 −55.7% / −60.8% (EPYC 7763) |
