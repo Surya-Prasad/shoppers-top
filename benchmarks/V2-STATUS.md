@@ -81,7 +81,7 @@ Whole-branch checks vs b9481b1: `e450f86` **−17.8% (7/7) / −16.8% (5/5)** on
 **`62c0789a07146806e3d885f0af7afffe8eb2c6f3`** (branch `opt/v2-fast`; also `docker/v3-size`) = `b9d02ae` + scan partition
 buffers sized for the new line lengths (events ~82 B, clicks ~53 B; overflow still spills, so output cannot change).
 Evidence: `9340397` (same change on b9d02ae) vs `b9d02ae`: −0.3% (3/7) / **−3.3% (4/5)** (EPYC 9V74), RSS 5.15 → 5.01 /
-13.85 → 13.76 GB; Docker check PASS (Xeon 8573C: image 129 s, 30 MB, uid 1000; 36/36 fixtures and dev MATCH in the
+13.85 → 13.76 GB; vs b9481b1 **−71.5% (7/7) / −71.1% (5/5)** (EPYC 9V45); Docker check PASS (Xeon 8573C: image 129 s, 30 MB, uid 1000; 36/36 fixtures and dev MATCH in the
 container); local gates pass (tests, fixtures, dev, fuzz strict + default, MATCH vs b9481b1 at 20M seeds 11/5 and 60M).
 Its parent, described next, carries the main evidence.
 
