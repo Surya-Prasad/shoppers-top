@@ -1,0 +1,42 @@
+# docker check of b9dc99a6d816fde027e61de32e47f12a4060fed4 on AMD EPYC 9V74 80-Core Processor
+- image build: FAILED
+#7 [internal] load build context
+#7 transferring context: 232.54kB done
+#7 DONE 0.0s
+
+#8 [build 3/8] COPY Cargo.toml Cargo.lock ./
+#8 CACHED
+
+#9 [build 4/8] COPY .cargo ./.cargo
+#9 CACHED
+
+#10 [build 5/8] COPY pgo ./pgo
+#10 ERROR: failed to calculate checksum of ref r0fmo3j4wdedxdk73wtl7rj9q::fr02ujrby8md99cdusglhmtzi: "/pgo": not found
+
+#11 [build 1/8] FROM docker.io/library/rust:1.95-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082
+#11 resolve docker.io/library/rust:1.95-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082 done
+#11 sha256:b4ccf27c4837092078b76ab11024c3af625ae68e5a10aa62444217ca0c799c99 0B / 286.00MB
+#11 ...
+
+#12 [build 2/8] WORKDIR /src
+#12 CANCELED
+
+#13 [stage-1 1/4] FROM docker.io/library/debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+#13 resolve docker.io/library/debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc done
+#13 sha256:dd051e1b8c92ff101fa3071ab97ea4924885942f15644e01c3dc095764e863e3 0B / 28.25MB 0.0s
+#13 ...
+
+#14 [stage-1 2/4] RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
+#14 CANCELED
+------
+ > [build 5/8] COPY pgo ./pgo:
+------
+Dockerfile:12
+--------------------
+  10 |     # instrumented rust 1.95 build run on generated data). RUSTFLAGS replaces the config's
+  11 |     # rustflags, so it repeats target-cpu. A stale profile only loses the gain, never behaviour.
+  12 | >>> COPY pgo ./pgo
+  13 |     # cache dependencies in their own layer
+  14 |     RUN if [ "$(uname -m)" = x86_64 ]; then export RUSTFLAGS="-C target-cpu=x86-64-v3 -C profile-use=/src/pgo/merged.profdata"; fi; \
+--------------------
+ERROR: failed to build: failed to solve: failed to compute cache key: failed to calculate checksum of ref r0fmo3j4wdedxdk73wtl7rj9q::fr02ujrby8md99cdusglhmtzi: "/pgo": not found
