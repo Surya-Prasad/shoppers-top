@@ -1,0 +1,59 @@
+{
+ "base": "537f83e7adce001ffafb0451028b24dc9a3ffeec",
+ "cand": "9b850aa78f07ba6362fd5a5bdbba4345a48e23d4",
+ "gate": "pass",
+ "cpu": "AMD EPYC 7763 64-Core Processor x 4",
+ "notes": "",
+ "sizes": {
+  "d20": {
+   "base": [
+    2.4188,
+    2.4599,
+    2.4094,
+    2.4584,
+    2.4296,
+    2.4082,
+    2.3988
+   ],
+   "cand": [
+    2.4217,
+    2.4279,
+    2.4125,
+    2.3767,
+    2.3979,
+    2.427,
+    2.4059
+   ],
+   "base_median": 2.4188,
+   "cand_median": 2.4125,
+   "delta_pct": -0.26,
+   "cand_wins": 3,
+   "pairs": 7,
+   "base_rss_gb": 3.12,
+   "cand_rss_gb": 3.12
+  },
+  "d60": {
+   "base": [
+    8.097,
+    7.3265,
+    7.7111,
+    7.2358,
+    7.7361
+   ],
+   "cand": [
+    7.3685,
+    7.2597,
+    7.3117,
+    7.1314,
+    7.5335
+   ],
+   "base_median": 7.7111,
+   "cand_median": 7.3117,
+   "delta_pct": -5.18,
+   "cand_wins": 5,
+   "pairs": 5,
+   "base_rss_gb": 9.33,
+   "cand_rss_gb": 9.34
+  }
+ }
+}
