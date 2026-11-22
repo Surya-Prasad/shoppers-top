@@ -322,7 +322,9 @@ fn main() {
 
     // RW30: returning gigabytes of event/click vectors to the OS takes ~0.06 s on one
     // thread; do it in the background while the output files are written
+    let late: Vec<Box<dyn Send>> = std::mem::take(&mut *LATE_FREE.lock().unwrap());
     let freer = std::thread::spawn(move || {
+        drop(late);
         drop(events_by_person);
         drop(clicks_by_person);
     });
@@ -885,14 +887,71 @@ pub struct ClickV {
 }
 
 /// Partitioned by person, as [person partition][source partition] -> rows.
-type ByPerson<T> = Vec<Vec<Vec<T>>>;
+/// Rows partitioned NB ways, one `Parted` per source (scan chunk or dedup partition), in
+/// source order; partition `p` of the whole is `slices(v, p)`.
+type ByPerson<T> = Vec<Parted<T>>;
 
-fn transpose<T>(v: Vec<Vec<Vec<T>>>) -> ByPerson<T> {
-    // v[src][dst] -> out[dst][src]
-    let mut out: ByPerson<T> = (0..NB).map(|_| Vec::with_capacity(v.len())).collect();
-    for row in v {
-        for (dst, part) in row.into_iter().enumerate() {
-            out[dst].push(part);
+/// v3: one source's rows split into NB partitions inside one contiguous buffer: a single
+/// huge-page backed mapping (`alloc::map_huge`) instead of NB small vectors, so first touch
+/// costs one fault per 2 MiB instead of one per 4 KiB. Partition p owns `per` slots at
+/// `p * per`; rows past that go to a per-partition spill vector (rare). A partition's rows are
+/// its slots then its spill, so insertion order is kept.
+pub struct Parted<T> {
+    buf: *mut T,
+    map_len: usize,
+    per: usize,
+    lens: Vec<u32>,
+    spill: Vec<Vec<T>>,
+}
+
+// SAFETY: Parted owns its buffer exclusively (like a Vec<T>)
+unsafe impl<T: Send> Send for Parted<T> {}
+unsafe impl<T: Sync> Sync for Parted<T> {}
+
+impl<T> Drop for Parted<T> {
+    fn drop(&mut self) {
+        alloc::unmap_huge(self.buf as *mut u8, self.map_len);
+    }
+}
+
+impl<T: Copy> Parted<T> {
+    pub fn new(per: usize) -> Self {
+        let per = per.max(1);
+        let (p, map_len) = alloc::map_huge(NB * per * std::mem::size_of::<T>()).expect("out of memory (partition buffer)");
+        Parted { buf: p as *mut T, map_len, per, lens: vec![0; NB], spill: (0..NB).map(|_| Vec::new()).collect() }
+    }
+    #[inline(always)]
+    pub fn push(&mut self, p: usize, r: T) {
+        let l = self.lens[p] as usize;
+        if l < self.per {
+            // SAFETY: p < NB and l < per, so the slot is inside the mapping
+            unsafe { self.buf.add(p * self.per + l).write(r) };
+            self.lens[p] = l as u32 + 1;
+        } else {
+            self.spill[p].push(r);
+        }
+    }
+    /// Partition p's rows: (slots, spill).
+    #[inline]
+    pub fn part(&self, p: usize) -> [&[T]; 2] {
+        let l = self.lens[p] as usize;
+        // SAFETY: slots p*per .. p*per+l were written by `push`
+        let a = unsafe { std::slice::from_raw_parts(self.buf.add(p * self.per) as *const T, l) };
+        [a, &self.spill[p][..]]
+    }
+    pub fn len(&self) -> usize {
+        self.lens.iter().map(|&l| l as usize).sum::<usize>() + self.spill.iter().map(Vec::len).sum::<usize>()
+    }
+}
+
+/// Partition p of all sources, in source order.
+fn slices<T: Copy>(v: &[Parted<T>], p: usize) -> Vec<&[T]> {
+    let mut out = Vec::with_capacity(2 * v.len());
+    for s in v {
+        for x in s.part(p) {
+            if !x.is_empty() {
+                out.push(x);
+            }
         }
     }
     out
@@ -904,8 +963,8 @@ fn transpose<T>(v: Vec<Vec<Vec<T>>>) -> ByPerson<T> {
 /// about `SUB` copies (more hash bits), so each dedup table (~2*SUB slots) stays in L2.
 /// Stability keeps scan order inside a sub-bucket, so ties still go to the first copy.
 const SUB: usize = 8192;
-fn dedup<T: Copy>(parts: &[Vec<T>], key: impl Fn(&T) -> u64, better: impl Fn(&T, &T) -> bool, mut sink: impl FnMut(&T)) -> usize {
-    let n: usize = parts.iter().map(Vec::len).sum();
+fn dedup<T: Copy>(parts: &[&[T]], key: impl Fn(&T) -> u64, better: impl Fn(&T, &T) -> bool, mut sink: impl FnMut(&T)) -> usize {
+    let n: usize = parts.iter().map(|x| x.len()).sum();
     // RW26: singleton filter. 2-bit saturating counters (0, 1, 2 = "two or more") over
     // ~8n hash slots. A row whose slot counted exactly 1 is the only copy of its key, so it
     // is kept as is; every other row (true duplicates and hash collisions) goes, in scan
@@ -916,7 +975,7 @@ fn dedup<T: Copy>(parts: &[Vec<T>], key: impl Fn(&T) -> u64, better: impl Fn(&T,
         let mut cnt = vec![0u64; slots / 32]; // 32 two-bit counters per word
         let slot = |k: u64| -> usize { ((packed::fmix(k) >> 8) as usize) & (slots - 1) };
         for part in parts {
-            for r in part {
+            for r in part.iter() {
                 let i = slot(key(r));
                 let (w, sh) = (i >> 5, (i & 31) * 2);
                 let c = (cnt[w] >> sh) & 3;
@@ -928,7 +987,7 @@ fn dedup<T: Copy>(parts: &[Vec<T>], key: impl Fn(&T) -> u64, better: impl Fn(&T,
         let mut rest: Vec<T> = Vec::new();
         let mut kept = 0usize;
         for part in parts {
-            for r in part {
+            for r in part.iter() {
                 let i = slot(key(r));
                 if (cnt[i >> 5] >> ((i & 31) * 2)) & 3 == 1 {
                     sink(r);
@@ -940,14 +999,14 @@ fn dedup<T: Copy>(parts: &[Vec<T>], key: impl Fn(&T) -> u64, better: impl Fn(&T,
         }
         drop(cnt);
         // the exact pass runs once over the leftovers (never the filter again)
-        return kept + dedup_exact(std::slice::from_ref(&rest), key, better, sink);
+        return kept + dedup_exact(&[&rest[..]], key, better, sink);
     }
     dedup_exact(parts, key, better, sink)
 }
 
 /// The exact dedup (RW13): stable counting sort into L2-sized sub-buckets, one table each.
-fn dedup_exact<T: Copy>(parts: &[Vec<T>], key: impl Fn(&T) -> u64, better: impl Fn(&T, &T) -> bool, mut sink: impl FnMut(&T)) -> usize {
-    let n: usize = parts.iter().map(Vec::len).sum();
+fn dedup_exact<T: Copy>(parts: &[&[T]], key: impl Fn(&T) -> u64, better: impl Fn(&T, &T) -> bool, mut sink: impl FnMut(&T)) -> usize {
+    let n: usize = parts.iter().map(|x| x.len()).sum();
     {
     let sbits = if n <= 2 * SUB { 0 } else { (n / SUB).next_power_of_two().trailing_zeros() };
     // sub-bucket bits sit just below the partition bits of the same mix
@@ -962,7 +1021,7 @@ fn dedup_exact<T: Copy>(parts: &[Vec<T>], key: impl Fn(&T) -> u64, better: impl 
         starts[1] = n as u32;
     } else {
         for part in parts {
-            for r in part {
+            for r in part.iter() {
                 starts[sub(key(r)) + 1] += 1;
             }
         }
@@ -972,7 +1031,7 @@ fn dedup_exact<T: Copy>(parts: &[Vec<T>], key: impl Fn(&T) -> u64, better: impl 
         let mut at = starts.clone();
         let spare = flat.spare_capacity_mut();
         for part in parts {
-            for r in part {
+            for r in part.iter() {
                 let b = sub(key(r));
                 spare[at[b] as usize].write(*r);
                 at[b] += 1;
@@ -1025,9 +1084,7 @@ fn clicks_scan(src: &[&'static Source], campaigns: &IdMap, lo: i64, hi: i64, nam
     let items = work_items::<4>(src, ["click_id", "user_id", "campaign_id", "ts"]);
     let scattered = clicks_scan_items(&items, campaigns, lo, hi, names, stats, fast_enabled());
     st.mark("clicks: scan+parse+partition");
-    let by_person = transpose(scattered);
-    st.mark("clicks: transpose");
-    by_person
+    scattered
 }
 
 /// The per-chunk clicks scan: scan + validate each copy + partition the valid ones by person
@@ -1037,7 +1094,7 @@ fn clicks_scan(src: &[&'static Source], campaigns: &IdMap, lo: i64, hi: i64, nam
 /// (so the same user, person, ts, campaign and validity), and a copy cannot change any
 /// output: credit goes to the latest qualifying click with the smallest click_id (a copy is
 /// that same click) and assists count distinct campaigns. Invalid copies are dropped here.
-fn clicks_scan_items(items: &[([usize; 4], S)], campaigns: &IdMap, lo: i64, hi: i64, names: &Names, stats: &Stats, fast_ok: bool) -> Vec<Vec<Vec<ClickV>>> {
+fn clicks_scan_items(items: &[([usize; 4], S)], campaigns: &IdMap, lo: i64, hi: i64, names: &Names, stats: &Stats, fast_ok: bool) -> Vec<Parted<ClickV>> {
     items
         .par_iter()
         .map(|(order, chunk)| {
@@ -1071,7 +1128,7 @@ fn clicks_scan_items(items: &[([usize; 4], S)], campaigns: &IdMap, lo: i64, hi: 
 
 /// One chunk's clicks scan state (v2: monomorphic, like `EvScan`).
 struct ClScan<'a> {
-    parts: Vec<Vec<ClickV>>,
+    parts: Parted<ClickV>,
     // valid copies waiting for their person: (click, user key, user mix); the person slots of a
     // whole batch are prefetched before any lookup runs
     pend: [(ClickV, u64); PBATCH],
@@ -1090,7 +1147,7 @@ impl<'a> ClScan<'a> {
     fn new(bytes: usize, campaigns: &'a IdMap, lo: i64, hi: i64, names: &'a Names) -> Self {
         const Z: ClickV = ClickV { person: 0, ts: 0, cid: 0, camp: 0 };
         ClScan {
-            parts: (0..NB).map(|_| Vec::with_capacity(bytes / 24 / NB + 32)).collect(), // v2: clicks lines ~26 B
+            parts: Parted::new(bytes / 24 / NB + 32), // v2: clicks lines ~26 B
             pend: [(Z, 0); PBATCH],
             np: 0,
             campaigns,
@@ -1119,16 +1176,16 @@ impl<'a> ClScan<'a> {
         for i in 0..self.np {
             let (mut c, um) = self.pend[i];
             c.person = self.names.person_mixed(um, c.person);
-            self.parts[keys::part(c.person, LOG_NB)].push(c);
+            self.parts.push(keys::part(c.person, LOG_NB), c);
         }
         self.np = 0;
     }
-    fn finish(mut self, stats: &Stats) -> Vec<Vec<ClickV>> {
+    fn finish(mut self, stats: &Stats) -> Parted<ClickV> {
         self.flush();
         stats.add(K::ClBadUser, self.why[1]);
         stats.add(K::ClBadTs, self.why[2]);
         stats.add(K::ClBadCampaign, self.why[3]);
-        stats.add(K::ClSurvived, self.parts.iter().map(|v| v.len() as u64).sum());
+        stats.add(K::ClSurvived, self.parts.len() as u64);
         stats.add(K::ClLines, self.lines);
         stats.add(K::ClMalformed, self.bad);
         stats.add(K::ClNoId, self.noid);
@@ -1233,14 +1290,12 @@ fn events_scan(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: 
     let items = work_items::<7>(src, NAMES);
     let scattered = events_scan_items(&items, products, unknown_cat, lo, hi, names, stats, fast_enabled());
     st.mark("events: scan+parse+partition");
-    let by_eid = transpose(scattered);
-    st.mark("events: transpose");
-    by_eid
+    scattered
 }
 
 /// The per-chunk events scan (exact path, or v2 P1 fast path with exact fallback).
 #[allow(clippy::too_many_arguments)]
-fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u32, lo: i64, hi: i64, names: Option<&Names>, stats: &Stats, fast_ok: bool) -> Vec<Vec<Vec<EvRec>>> {
+fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u32, lo: i64, hi: i64, names: Option<&Names>, stats: &Stats, fast_ok: bool) -> Vec<Parted<EvRec>> {
     items
         .par_iter()
         .map(|(order, chunk)| {
@@ -1285,7 +1340,7 @@ fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u
 
 /// One chunk's events scan state: partitions by event_id, the product-lookup batch, counters.
 struct EvScan<'a> {
-    parts: Vec<Vec<EvRec>>,
+    parts: Parted<EvRec>,
     // RW15/RW32: (row with its user key in `person`, product key or 0, product mix); the
     // product slots of a whole batch are prefetched before any lookup runs
     pend: [(EvRec, u64, u64, u64); PBATCH],
@@ -1305,7 +1360,7 @@ impl<'a> EvScan<'a> {
     fn new(bytes: usize, products: &'a IdMap, unknown_cat: u32, lo: i64, hi: i64, names: Option<&'a Names>) -> Self {
         const Z: EvRec = EvRec { eid: 0, rank: 0, person: 0, ts: 0, price: 0, cat: 0 };
         EvScan {
-            parts: (0..NB).map(|_| Vec::with_capacity(bytes / 60 / NB + 32)).collect(), // v2: event lines ~67 B
+            parts: Parted::new(bytes / 60 / NB + 32), // v2: event lines ~67 B
             pend: [(Z, 0, 0, 0); PBATCH],
             names,
             np: 0,
@@ -1320,7 +1375,7 @@ impl<'a> EvScan<'a> {
     }
     #[inline(always)]
     fn put(&mut self, r: EvRec) {
-        self.parts[keys::part(r.eid, LOG_NB)].push(r);
+        self.parts.push(keys::part(r.eid, LOG_NB), r);
     }
     #[inline(always)]
     fn valid(&mut self, r: EvRec, pk: u64, pm: u64) {
@@ -1353,7 +1408,7 @@ impl<'a> EvScan<'a> {
         }
         self.np = 0;
     }
-    fn finish(mut self, stats: &Stats) -> Vec<Vec<EvRec>> {
+    fn finish(mut self, stats: &Stats) -> Parted<EvRec> {
         self.flush();
         stats.add(K::EvLines, self.lines);
         stats.add(K::EvMalformed, self.bad);
@@ -1434,19 +1489,24 @@ fn fast_enabled() -> bool {
 }
 
 /// RW31: event dedup + person resolution (batched) + repartition by person.
+/// v3: big buffers released by the output-phase freer thread (unmapping them earlier would
+/// send TLB shootdowns to every worker during the sessions).
+static LATE_FREE: std::sync::Mutex<Vec<Box<dyn Send>>> = std::sync::Mutex::new(Vec::new());
+
 fn events_dedup(by_eid: ByPerson<EvRec>, unknown_cat: u32, names: Option<&Names>, stats: &Stats) -> ByPerson<EvV> {
     let mut st = Stage::start();
-    let out: Vec<Vec<Vec<EvV>>> = by_eid
+    let out: Vec<Parted<EvV>> = (0..NB)
         .into_par_iter()
-        .map(|parts| {
-            let n: usize = parts.iter().map(Vec::len).sum();
+        .map(|p| {
+            let parts = slices(&by_eid, p);
+            let n: usize = parts.iter().map(|x| x.len()).sum();
             // rules.md, Events step 2: keep the copy with the smallest ingest_ts; A2: on a
             // tie the first copy stays (equal-ingest copies are promised identical)
-            let mut dst: Vec<Vec<EvV>> = (0..NB).map(|_| Vec::with_capacity(n / NB + n / NB / 8 + 32)).collect(); // v2: room for the spread (no regrowth)
+            let mut dst: Parted<EvV> = Parted::new(n / NB + n / NB / 8 + 32); // v2: room for the spread
             let mut c = [0u64; 8];
             let mut pb: PersonBatch<EvRec> = PersonBatch::new();
             let mut emit = |r: EvRec, person: u64| {
-                dst[keys::part(person, LOG_NB)].push(EvV { person, ts: r.ts, cat: r.cat, price: r.price });
+                dst.push(keys::part(person, LOG_NB), EvV { person, ts: r.ts, cat: r.cat, price: r.price });
             };
             let kept = dedup(&parts, |r: &EvRec| r.eid, |a, b| a.rank < b.rank, |r| {
                 if r.person == keys::EMPTY {
@@ -1470,14 +1530,14 @@ fn events_dedup(by_eid: ByPerson<EvRec>, unknown_cat: u32, names: Option<&Names>
                 stats.add(k, c[i]);
             }
             stats.add(K::EvKeptBad, c[..5].iter().sum());
-            stats.add(K::EvSurvived, dst.iter().map(|v| v.len() as u64).sum());
+            stats.add(K::EvSurvived, dst.len() as u64);
             dst
         })
         .collect();
     st.mark("events: dedup+validate+repartition");
-    let t = transpose(out);
-    st.mark("events: transpose");
-    t
+    // the scan buffers are unmapped off the critical path, after the sessions (see main)
+    LATE_FREE.lock().unwrap().push(Box::new(by_eid));
+    out
 }
 
 const T_VIEW: u8 = 0;
@@ -1489,12 +1549,12 @@ const T_BAD: u8 = 3;
 
 /// RW6: counting sort of the rows of all `parts` into `nbk` buckets, then sort each bucket
 /// with `cmp`. The result is ordered by (bucket, cmp).
-fn bucket_sort<T: Copy>(parts: &[Vec<T>], n: usize, nbk: usize, bucket: impl Fn(&T) -> usize, sort: impl Fn(&mut [T])) -> (Vec<T>, Vec<u32>) {
+fn bucket_sort<T: Copy>(parts: &[&[T]], n: usize, nbk: usize, bucket: impl Fn(&T) -> usize, sort: impl Fn(&mut [T])) -> (Vec<T>, Vec<u32>) {
     // RW27: each row's bucket is computed once (kept in `bk`) and reused for placement
     let mut bk: Vec<u32> = Vec::with_capacity(n);
     let mut cnt = vec![0u32; nbk + 1];
     for part in parts {
-        for r in part {
+        for r in part.iter() {
             let k = bucket(r);
             bk.push(k as u32);
             cnt[k + 1] += 1;
@@ -1508,7 +1568,7 @@ fn bucket_sort<T: Copy>(parts: &[Vec<T>], n: usize, nbk: usize, bucket: impl Fn(
     let spare = out.spare_capacity_mut();
     let mut idx = 0usize;
     for part in parts {
-        for r in part {
+        for r in part.iter() {
             let k = bk[idx] as usize;
             idx += 1;
             spare[cnt[k] as usize].write(*r);
@@ -1539,18 +1599,19 @@ fn sessionize(
     // (person, ts). The walk only needs every person's rows together and time-ordered,
     // and buckets come in the same order for events and clicks, so the per-person merge
     // below still lines up (within a bucket, persons are in key order on both sides).
-    let n: usize = evs[b].iter().map(Vec::len).sum();
-    let nc: usize = cls[b].iter().map(Vec::len).sum();
+    let (evs_b, cls_b) = (slices(evs, b), slices(cls, b));
+    let n: usize = evs_b.iter().map(|x| x.len()).sum();
+    let nc: usize = cls_b.iter().map(|x| x.len()).sum();
     let nbk: usize = (n / 64).next_power_of_two().clamp(1, 1 << 14);
     let bshift = 64 - LOG_NB - nbk.trailing_zeros();
     let bucket = |person: u64| -> usize { ((packed::fmix(person) >> bshift) as usize) & (nbk - 1) };
     // events sort on one u128 key: person, then ts (sign-flipped so unsigned order = signed)
-    let (ev, es) = bucket_sort(&evs[b], n, nbk, |e: &EvV| bucket(e.person), |v: &mut [EvV]| {
+    let (ev, es) = bucket_sort(&evs_b, n, nbk, |e: &EvV| bucket(e.person), |v: &mut [EvV]| {
         v.sort_unstable_by_key(|e| ((e.person as u128) << 64) | ((e.ts as u64) ^ (1 << 63)) as u128)
     });
     // clicks: (person, ts asc, click_id desc in byte order), so the last click of a
     // window is the latest one with the byte-wise smallest click_id
-    let (cl, cs) = bucket_sort(&cls[b], nc, nbk, |c: &ClickV| bucket(c.person), |v: &mut [ClickV]| {
+    let (cl, cs) = bucket_sort(&cls_b, nc, nbk, |c: &ClickV| bucket(c.person), |v: &mut [ClickV]| {
         v.sort_unstable_by(|x, y| (x.person, x.ts).cmp(&(y.person, y.ts)).then_with(|| keys::cmp_bytes(y.cid, x.cid)))
     });
 
@@ -1757,7 +1818,8 @@ mod dedup_tests {
                 parts[(rnd() as usize) % nparts].push((k, rnd() % 5, id));
             }
             let mut got: Vec<(u64, u64, u32)> = Vec::new();
-            let kept = super::dedup(&parts, |r| r.0, |a, b| a.1 < b.1, |r| got.push(*r));
+            let sl: Vec<&[(u64, u64, u32)]> = parts.iter().map(|v| &v[..]).collect();
+            let kept = super::dedup(&sl, |r| r.0, |a, b| a.1 < b.1, |r| got.push(*r));
             let mut want: std::collections::HashMap<u64, (u64, u64, u32)> = std::collections::HashMap::new();
             for p in &parts {
                 for r in p {
@@ -1777,8 +1839,8 @@ mod dedup_tests {
 mod fast_scan_tests {
     use super::*;
 
-    fn flat(v: Vec<Vec<Vec<EvRec>>>) -> Vec<Vec<(u64, u64, u64, i64, u32, u32)>> {
-        v.into_iter().map(|c| c.into_iter().flatten().map(|r| (r.eid, r.rank, r.person, r.ts, r.price, r.cat)).collect()).collect()
+    fn flat(v: Vec<Parted<EvRec>>) -> Vec<Vec<(u64, u64, u64, i64, u32, u32)>> {
+        (0..NB).map(|p| slices(&v, p).into_iter().flatten().map(|r| (r.eid, r.rank, r.person, r.ts, r.price, r.cat)).collect()).collect()
     }
 
     /// v2 P1: the events scan with the fast path gives exactly the records (same order, same
@@ -1885,8 +1947,8 @@ mod fast_click_tests {
             let chunk: S = Box::leak(buf.into_bytes().into_boxed_slice());
             let items = vec![([0, 1, 2, 3], chunk)];
             let (s1, s2) = (Stats::default(), Stats::default());
-            let f = |v: Vec<Vec<Vec<ClickV>>>| -> Vec<Vec<(u64, u64, i64, u32)>> {
-                v.into_iter().map(|c| c.into_iter().flatten().map(|r| (r.cid, r.person, r.ts, r.camp)).collect()).collect()
+            let f = |v: Vec<Parted<ClickV>>| -> Vec<Vec<(u64, u64, i64, u32)>> {
+                (0..NB).map(|p| slices(&v, p).into_iter().flatten().map(|r| (r.cid, r.person, r.ts, r.camp)).collect()).collect()
             };
             let a = f(clicks_scan_items(&items, &camps, lo - 7 * DAY, hi, &Names::empty(), &s1, true));
             let b = f(clicks_scan_items(&items, &camps, lo - 7 * DAY, hi, &Names::empty(), &s2, false));
