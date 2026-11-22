@@ -34,7 +34,9 @@ ANS=$(dirname "$(find "$W/ans" -name user_daily.csv | head -1)")
 # ---- build both engines ----
 build() { # sha -> binary path
   local d="$W/src-$1"; rm -rf "$d"; git worktree add -q --detach "$d" "$1"
-  ( cd "$d" && cargo build --release --locked -q ) >&2
+  # v3h: a tree with a PGO profile builds with it, as its Dockerfile does (x86-64)
+  local rf=; [ -f "$d/pgo/merged.profdata" ] && [ "$(uname -m)" = x86_64 ] && rf="-C target-cpu=x86-64-v3 -C profile-use=$d/pgo/merged.profdata"
+  ( cd "$d" && if [ -n "$rf" ]; then RUSTFLAGS="$rf" cargo build --release --locked -q; else cargo build --release --locked -q; fi ) >&2
   cp "$d/target/release/shopping-sessions" "$W/bin-$1"; echo "$W/bin-$1"
 }
 BA=$(build "$BASE"); BB=$(build "$CAND")

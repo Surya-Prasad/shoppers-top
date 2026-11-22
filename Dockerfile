@@ -6,12 +6,18 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 # RW25: target-cpu settings (x86-64-v3 on x86-64 Linux) apply to the image build too
 COPY .cargo ./.cargo
+# v3h: profile-guided optimization on x86-64 from pgo/merged.profdata (scripts/pgo.sh: an
+# instrumented rust 1.95 build run on generated data). RUSTFLAGS replaces the config's
+# rustflags, so it repeats target-cpu. A stale profile only loses the gain, never behaviour.
+COPY pgo ./pgo
 # cache dependencies in their own layer
-RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release --locked && rm -rf src
+RUN if [ "$(uname -m)" = x86_64 ]; then export RUSTFLAGS="-C target-cpu=x86-64-v3 -C profile-use=/src/pgo/merged.profdata"; fi; \
+    mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release --locked && rm -rf src
 COPY src ./src
 # x86-64 builds target x86-64-v3 (AVX2/BMI2; .cargo/config.toml): supported by the scorer's
 # Cascade Lake-or-newer Xeons and by every CI runner. Other architectures build generically.
-RUN touch src/main.rs && cargo build --release --locked && strip target/release/shopping-sessions
+RUN if [ "$(uname -m)" = x86_64 ]; then export RUSTFLAGS="-C target-cpu=x86-64-v3 -C profile-use=/src/pgo/merged.profdata"; fi; \
+    touch src/main.rs && cargo build --release --locked && strip target/release/shopping-sessions
 
 FROM debian:bookworm-slim
 # The scorer runs the container as uid 1000; give that uid a name and a home.
