@@ -123,14 +123,56 @@ pub fn id_hash(st: &crate::RandomState, s: &[u8]) -> u64 {
 pub struct IdMap {
     packed: crate::keys::KeyMap,
     other: Map<S, u32>,
+    // v2: IDs of the canonical form `prefix` + a number without leading zeros (1..=7 digits,
+    // below DMAX) live only in `dense` (value + 1 at index number; 0 = absent); every other
+    // ID only in `packed`/`other`. The two key sets are disjoint, so lookups route by form.
+    dprefix: u8,
+    dense: Vec<u32>,
+}
+
+/// v2: numbers of canonical IDs kept in the dense table are below this.
+pub const DMAX: u32 = 1 << 22;
+
+/// v2: the number of a canonical ID `prefix` + `[1-9][0-9]{0,6}` below DMAX, else None.
+#[inline]
+pub fn canon(s: &[u8], prefix: u8) -> Option<u32> {
+    if s.len() < 2 || s.len() > 8 || s[0] != prefix || prefix == 0 || !(b'1'..=b'9').contains(&s[1]) {
+        return None;
+    }
+    let mut n = 0u32;
+    for &c in &s[1..] {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        n = n * 10 + (c - b'0') as u32;
+    }
+    (n < DMAX).then_some(n)
 }
 
 impl IdMap {
     pub fn with_capacity(n: usize) -> IdMap {
-        IdMap { packed: crate::keys::KeyMap::with_capacity(n), other: new_map(0) }
+        IdMap { packed: crate::keys::KeyMap::with_capacity(n), other: new_map(0), dprefix: 0, dense: Vec::new() }
+    }
+    /// v2: with a dense table for canonical `prefix` + number IDs.
+    pub fn with_dense(n: usize, prefix: u8) -> IdMap {
+        IdMap { dprefix: prefix, ..IdMap::with_capacity(n) }
+    }
+    pub fn dense_prefix(&self) -> u8 {
+        self.dprefix
+    }
+    /// v2: lookup of a canonical ID by its number (`canon`); only valid for numbers below DMAX.
+    #[inline(always)]
+    pub fn get_dense(&self, n: u32) -> Option<u32> {
+        match self.dense.get(n as usize) {
+            Some(&v) if v != 0 => Some(v - 1),
+            _ => None,
+        }
     }
     #[inline]
     pub fn get(&self, s: &[u8]) -> Option<u32> {
+        if let Some(n) = canon(s, self.dprefix) {
+            return self.get_dense(n);
+        }
         match pack9(s) {
             Some(k) if !s.is_empty() => self.packed.get_mixed(fmix(k), k).map(|v| v as u32),
             Some(_) => None,
@@ -145,7 +187,8 @@ impl IdMap {
     pub fn prefetch_packed(&self, m: u64) {
         self.packed.prefetch(m);
     }
-    /// RW15: lookup of a packed (non-empty) key `k` with mix `m`.
+    /// RW15: lookup of a packed (non-empty) key `k` with mix `m`. v2: callers route canonical
+    /// IDs (`canon`) to `get_dense` first; this table never holds them.
     #[inline(always)]
     pub fn get_packed(&self, m: u64, k: u64) -> Option<u32> {
         self.packed.get_mixed(m, k).map(|v| v as u32)
@@ -160,6 +203,15 @@ impl IdMap {
     }
     /// Insert unless the key is present (first occurrence wins; `s` non-empty).
     pub fn insert_first(&mut self, s: S, v: u32) {
+        if let Some(n) = canon(s, self.dprefix) {
+            if self.dense.len() <= n as usize {
+                self.dense.resize(n as usize + 1, 0);
+            }
+            if self.dense[n as usize] == 0 {
+                self.dense[n as usize] = v + 1;
+            }
+            return;
+        }
         match pack9(s) {
             Some(k) if !s.is_empty() => self.packed.insert_first(k, v as u64),
             _ => {
@@ -265,6 +317,44 @@ mod tests {
         assert_eq!(pack9(b"a\x80"), None);
         assert_eq!(pack9("é".as_bytes()), None);
     }
+    /// v2: the dense table routes by form and stays exact against a plain map.
+    #[test]
+    fn idmap_dense_exact() {
+        let mut x = 4u64;
+        let mut m = IdMap::with_dense(16, b'p');
+        let mut want: HashMap<Vec<u8>, u32> = HashMap::new();
+        let forms = |x: &mut u64| -> Vec<u8> {
+            let n = lcg(x) % 5_000_000;
+            match lcg(x) % 9 {
+                0 => format!("p0{n}"),
+                1 => format!("P{n}"),
+                2 => format!("p{n} "),
+                3 => format!("p{}", n * 1000),
+                4 => format!("q{n}"),
+                5 => "p".to_string(),
+                6 => format!("p{n}x"),
+                _ => format!("p{}", n % 60_000),
+            }
+            .into_bytes()
+        };
+        for i in 0..200_000u32 {
+            let k = forms(&mut x);
+            let ks: S = Box::leak(k.clone().into_boxed_slice());
+            m.insert_first(ks, i);
+            want.entry(k).or_insert(i);
+        }
+        for _ in 0..200_000 {
+            let k = forms(&mut x);
+            assert_eq!(m.get(&k), want.get(&k).copied(), "{:?}", String::from_utf8_lossy(&k));
+        }
+        for (k, v) in &want {
+            assert_eq!(m.get(k), Some(*v));
+        }
+        for (s, c) in [(&b"p1"[..], Some(1)), (b"p0", None), (b"p01", None), (b"p4194303", Some(4_194_303)), (b"p4194304", None), (b"p1234567", Some(1_234_567)), (b"p12345678", None)] {
+            assert_eq!(canon(s, b'p'), c, "{:?}", s);
+        }
+    }
+
     /// Exact semantics: case and space variants, long and non-ASCII keys, first wins.
     #[test]
     fn pmap_exact() {

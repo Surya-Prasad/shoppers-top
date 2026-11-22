@@ -215,6 +215,23 @@ pub fn parse_ref(b: &[u8]) -> Option<i64> {
     Some(days_from_civil(y, mo, d) * DAY + ((h * 60 + mi) * 60 + s) * SECOND - offset)
 }
 
+/// F1 text of epoch ms (tests only).
+#[cfg(test)]
+pub fn tests_f1(ms: i64) -> String {
+    let days = ms.div_euclid(DAY);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + (m <= 2) as i64;
+    let s = ms.rem_euclid(DAY) / 1000;
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", s / 3600, s / 60 % 60, s % 60)
+}
+
 /// Parse and check a half-open window `[lo, hi)`; BAD if either fails.
 #[inline]
 pub fn parse_in(b: &[u8], lo: i64, hi: i64) -> i64 {

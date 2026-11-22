@@ -167,6 +167,37 @@ unsafe fn id(p: *const u8, f: (u32, u32)) -> Option<u64> {
     unsafe { pack_at(p.add(f.0 as usize), n) }
 }
 
+/// v2: `ingest_ts` from an already parsed `ts` when both are F1 with the same date and hour
+/// (`YYYY-MM-DDTHH:` equal): only `MM:SS` of `ingest_ts` is checked and parsed, so the result
+/// equals `timefmt::parse(ingest_ts)`. None when the shortcut does not apply (the caller then
+/// runs the full parser).
+#[inline(always)]
+unsafe fn same_hour_f1(p: *const u8, t: (u32, u32), i: (u32, u32), ts: i64) -> Option<i64> {
+    if t.1 - t.0 != 20 || i.1 - i.0 != 20 {
+        return None;
+    }
+    let (tp, ip) = unsafe { (p.add(t.0 as usize), p.add(i.0 as usize)) };
+    // first 14 bytes equal: two overlapping 8-byte loads (bytes 0..8 and 6..14)
+    if unsafe { load64(tp) != load64(ip) || load64(tp.add(6)) != load64(ip.add(6)) } {
+        return None;
+    }
+    // ts must be F1 (a 20-byte ts can also be a 20-digit F3, which has no '-')
+    if unsafe { *tp.add(4) != b'-' || *ip.add(16) != b':' || *ip.add(19) != b'Z' } {
+        return None;
+    }
+    let d = |q: *const u8, k: usize| -> Option<i64> {
+        let (a, b) = unsafe { ((*q.add(k)).wrapping_sub(b'0'), (*q.add(k + 1)).wrapping_sub(b'0')) };
+        (a < 10 && b < 10).then_some((a * 10 + b) as i64)
+    };
+    let (im, is) = (d(ip, 14)?, d(ip, 17)?);
+    if im > 59 || is > 59 {
+        return None;
+    }
+    // ts is a valid F1 (parsed by the caller), so its MM and SS are valid digits
+    let (tm, tsec) = (d(tp, 14)?, d(tp, 17)?);
+    Some(ts + ((im - tm) * 60 + (is - tsec)) * 1000)
+}
+
 /// A fully valid event line in the documented column order, decoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ev {
@@ -176,6 +207,8 @@ pub struct Ev {
     pub ingest: i64,
     pub price: u32, // 0 for view/cart
     pub product: u64,
+    /// v2: `packed::canon(product, pprefix)` or 0 (not canonical)
+    pub pnum: u32,
 }
 
 /// Decode the events line at `p` (columns in the documented order). Some only for a line
@@ -183,7 +216,7 @@ pub struct Ev {
 /// product IDs, `ts` valid and in `[lo, hi)`, `ingest_ts` valid, exact event type, a valid
 /// price for a purchase, not late. Every other line is for the exact path.
 #[inline(always)]
-pub unsafe fn event(p: *const u8, lo: i64, hi: i64) -> Option<(usize, Ev)> {
+pub unsafe fn event(p: *const u8, lo: i64, hi: i64, pprefix: u8) -> Option<(usize, Ev)> {
     let (len, f) = unsafe { fields::<7>(p) }?;
     let eid = unsafe { id(p, f[0]) }?;
     let user = unsafe { id(p, f[1]) }?;
@@ -191,7 +224,7 @@ pub unsafe fn event(p: *const u8, lo: i64, hi: i64) -> Option<(usize, Ev)> {
     if ts < lo || ts >= hi {
         return None;
     }
-    let ingest = crate::timefmt::parse(unsafe { slice(p, f[3]) })?;
+    let ingest = unsafe { same_hour_f1(p, f[2], f[3], ts) }.or_else(|| crate::timefmt::parse(unsafe { slice(p, f[3]) }))?;
     let tl = f[4].1 - f[4].0;
     let tp = unsafe { p.add(f[4].0 as usize) };
     let purchase = if tl == 4 {
@@ -206,6 +239,18 @@ pub unsafe fn event(p: *const u8, lo: i64, hi: i64) -> Option<(usize, Ev)> {
         return None;
     };
     let product = unsafe { id(p, f[5]) }?;
+    // canonical product ID: prefix + 1..=7 digits without a leading zero (< DMAX = 2^22 holds
+    // for up to 6 digits; 7-digit numbers are checked)
+    let pn = (f[5].1 - f[5].0) as usize;
+    let pq = unsafe { p.add(f[5].0 as usize) };
+    let pnum = if (2..=8).contains(&pn) && pprefix != 0 && unsafe { *pq } == pprefix && unsafe { *pq.add(1) }.wrapping_sub(b'1') < 9 {
+        match unsafe { digits8(pq.add(1), pn - 1) } {
+            Some(v) if v < crate::packed::DMAX => v,
+            _ => 0,
+        }
+    } else {
+        0
+    };
     let price = if purchase {
         let n = (f[6].1 - f[6].0) as usize;
         if n == 0 || n > 8 {
@@ -222,7 +267,7 @@ pub unsafe fn event(p: *const u8, lo: i64, hi: i64) -> Option<(usize, Ev)> {
     if ingest.saturating_sub(ts) > crate::timefmt::DAY {
         return None;
     }
-    Some((len, Ev { eid, user, ts, ingest, price, product }))
+    Some((len, Ev { eid, user, ts, ingest, price, product, pnum }))
 }
 
 /// A fully valid click line in the documented column order, decoded.
@@ -314,6 +359,38 @@ mod tests {
         }
     }
 
+    /// The same-hour shortcut equals the full parser (random F1 pairs, mutated MM:SS, F3 ts).
+    #[test]
+    fn same_hour_matches_parse() {
+        let mut x = 8u64;
+        let alpha = b"0123456789:Zz \x7f";
+        for _ in 0..300_000 {
+            let base = 1_790_000_000_000i64 + (lcg(&mut x) as i64 % 2_000_000) * 1000;
+            let t = crate::timefmt::tests_f1(base);
+            let mut i = crate::timefmt::tests_f1(base + (lcg(&mut x) as i64 % 1200) * 1000).into_bytes();
+            if lcg(&mut x) % 4 == 0 {
+                let k = 11 + (lcg(&mut x) as usize) % 9;
+                i[k] = alpha[(lcg(&mut x) as usize) % alpha.len()];
+            }
+            let mut buf = t.clone().into_bytes();
+            buf.push(b',');
+            buf.extend_from_slice(&i);
+            buf.resize(buf.len() + 32, b'x');
+            let ts = crate::timefmt::parse(t.as_bytes()).unwrap();
+            if let Some(v) = unsafe { same_hour_f1(buf.as_ptr(), (0, 20), (21, 41), ts) } {
+                assert_eq!(Some(v), crate::timefmt::parse(&i), "{t} {:?}", String::from_utf8_lossy(&i));
+            }
+        }
+        // a 20-digit F3 ts with an ingest sharing its first 14 bytes
+        let (t, i) = (b"00001791071890000000", b"00001791071890:00:0Z");
+        let mut buf = t.to_vec();
+        buf.push(b',');
+        buf.extend_from_slice(i);
+        buf.resize(buf.len() + 32, b'x');
+        let ts = crate::timefmt::parse(t).unwrap();
+        assert_eq!(unsafe { same_hour_f1(buf.as_ptr(), (0, 20), (21, 41), ts) }, None);
+    }
+
     #[test]
     fn digits8_exact() {
         let mut x = 5u64;
@@ -398,7 +475,7 @@ mod tests {
         for _ in 0..300_000 {
             let line = crate::fast::tests_support::random_event_line(&mut x, lo);
             let buf = padded(&[line.as_slice(), b"\n"].concat());
-            let got = unsafe { event(buf.as_ptr(), lo, hi) };
+            let got = unsafe { event(buf.as_ptr(), lo, hi, b'p') };
             let f = split::<7>(&line);
             if let Some((l, ev)) = got {
                 accepted += 1;
@@ -407,6 +484,7 @@ mod tests {
                 assert_eq!(Some(ev.eid), pack9(f[0]).filter(|_| !f[0].is_empty()));
                 assert_eq!(Some(ev.user), pack9(f[1]).filter(|_| !f[1].is_empty()));
                 assert_eq!(Some(ev.product), pack9(f[5]).filter(|_| !f[5].is_empty()));
+                assert_eq!(ev.pnum, crate::packed::canon(f[5], b'p').unwrap_or(0), "{:?}", String::from_utf8_lossy(f[5]));
                 assert_eq!(Some(ev.ts), crate::timefmt::parse(f[2]));
                 assert!(ev.ts >= lo && ev.ts < hi);
                 assert_eq!(Some(ev.ingest), crate::timefmt::parse(f[3]));

@@ -353,10 +353,10 @@ fn experiment2(src: &[&'static Source], products: &IdMap, lo: i64, hi: i64) {
     let mut acc = 0u64;
     layer("fields only (cold)", &mut |p| unsafe { fast::fields::<7>(p) }.map(|(l, f)| { acc ^= f[3].0 as u64; l }));
     layer("fields only", &mut |p| unsafe { fast::fields::<7>(p) }.map(|(l, f)| { acc ^= f[3].0 as u64; l }));
-    layer("event decode", &mut |p| unsafe { fast::event(p, lo, hi) }.map(|(l, e)| { acc ^= e.eid ^ e.ts as u64; l }));
-    layer("+ product lookup", &mut |p| unsafe { fast::event(p, lo, hi) }.map(|(l, e)| { acc ^= products.get_packed(packed::fmix(e.product), e.product).unwrap_or(0) as u64; l }));
+    layer("event decode", &mut |p| unsafe { fast::event(p, lo, hi, b'p') }.map(|(l, e)| { acc ^= e.eid ^ e.ts as u64; l }));
+    layer("+ product lookup", &mut |p| unsafe { fast::event(p, lo, hi, b'p') }.map(|(l, e)| { acc ^= products.get_packed(packed::fmix(e.product), e.product).unwrap_or(0) as u64; l }));
     let mut parts: Vec<Vec<EvRec>> = (0..NB).map(|_| Vec::with_capacity(lines as usize / NB + 1024)).collect();
-    layer("+ push (preallocated)", &mut |p| unsafe { fast::event(p, lo, hi) }.map(|(l, e)| {
+    layer("+ push (preallocated)", &mut |p| unsafe { fast::event(p, lo, hi, b'p') }.map(|(l, e)| {
         parts[keys::part(e.eid, LOG_NB)].push(EvRec { eid: e.eid, rank: e.ingest as u64, person: e.user, ts: e.ts, price: e.price, cat: 0 }); l }));
     eprintln!("acc {acc} {}", parts.iter().map(Vec::len).sum::<usize>());
 }
@@ -523,7 +523,7 @@ fn load_products(src: &'static Source) -> (IdMap, Vec<S>) {
     for (i, c) in cats.iter().enumerate() {
         idx.insert(*c, i as u32);
     }
-    let mut products: IdMap = IdMap::with_capacity(rows.len());
+    let mut products: IdMap = IdMap::with_dense(rows.len(), b'p'); // v2: `p<number>` IDs by index
     for (p, c) in rows {
         products.insert_first(p, idx[c]);
     }
@@ -1205,11 +1205,17 @@ fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u
                 let mut s = 0usize;
                 while s + fast::SLACK <= len {
                     // SAFETY: s + SLACK <= len, so the decoder reads inside the chunk
-                    if let Some((l, ev)) = unsafe { fast::event(base.add(s), lo, hi) } {
+                    if let Some((l, ev)) = unsafe { fast::event(base.add(s), lo, hi, products.dense_prefix()) } {
                         sc.lines += 1;
-                        let m = packed::fmix(ev.product);
-                        products.prefetch_packed(m);
-                        sc.valid(EvRec { eid: ev.eid, rank: rank_of(Some(ev.ingest)), person: ev.user, ts: ev.ts, price: ev.price, cat: 0 }, ev.product, m);
+                        let r = EvRec { eid: ev.eid, rank: rank_of(Some(ev.ingest)), person: ev.user, ts: ev.ts, price: ev.price, cat: 0 };
+                        if ev.pnum != 0 {
+                            // v2: canonical product ID: direct index (no hash, no batch)
+                            sc.valid(EvRec { cat: products.get_dense(ev.pnum).unwrap_or(unknown_cat), ..r }, 0, 0);
+                        } else {
+                            let m = packed::fmix(ev.product);
+                            products.prefetch_packed(m);
+                            sc.valid(r, ev.product, m);
+                        }
                         s += l + 1;
                         continue;
                     }
@@ -1341,6 +1347,10 @@ impl<'a> EvScan<'a> {
                         r.ts = ts;
                         r.price = price;
                         let (pk, pm) = match pack9(f[5]) {
+                            _ if packed::canon(f[5], self.products.dense_prefix()).is_some() => {
+                                r.cat = self.products.get(f[5]).unwrap_or(self.unknown_cat);
+                                (0, 0)
+                            }
                             Some(k) => {
                                 let m = packed::fmix(k);
                                 self.products.prefetch_packed(m);
@@ -1715,7 +1725,7 @@ mod fast_scan_tests {
     fn events_fast_equals_exact() {
         let lo = timefmt::parse(b"2026-10-01T00:00:00Z").unwrap();
         let hi = lo + 14 * DAY;
-        let mut products = IdMap::with_capacity(100);
+        let mut products = IdMap::with_dense(100, b'p');
         for i in 0..50_000u32 {
             let s: S = Box::leak(format!("p{i}").into_bytes().into_boxed_slice());
             products.insert_first(s, i % 21);
