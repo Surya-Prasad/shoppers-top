@@ -1,5 +1,15 @@
 # v2 status (branch `opt/v2-fast`)
 
+## Final (2026-11-22 ~06:40 UTC)
+
+**Submit `298e7c47305fd0e363617a3a30c23cf8581e783f`** (`opt/v2-fast`, `docker/v3-noq`). Docker check PASS; all local gates
+plus an extra seed/size/thread-count sweep pass; vs `b9481b1` on the new generator ≈ **−71%** at 20M and 60M (`62c0789`,
+its parent, measured −71.5% / −71.1% on EPYC 9V45); vs `c48f601` (best before the THP change) −8.6% (7/7) / −3.3% (3/5).
+CI 20M ≈ 2.0 s on EPYC 9V74 → scorer estimate **≈ 1.4–1.6 s** (CI × ~0.75). Conservative alternative if the scorer is
+memory-tight on large inputs: `c48f601b2ddd6eefda6379963d7ae914ae0c1ca6` (no THP; Docker PASS). Details below under
+"Best submittable commit". The last six experiments (lock-free interner, AVX2 hex, quote mask bits, PGO, output
+parallelism, link pool) were neutral or slower, so the work stops here.
+
 Baseline for every comparison: `b9481b11a506d099ebe47963c927c8fe7bbba988` (1.92 s scored). `benchmarks/BEST` points at it.
 
 Gates run locally for every commit below: `cargo test --release`, 36 fixtures, dev answer MATCH, `tests/fuzz.py`
