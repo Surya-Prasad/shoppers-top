@@ -51,7 +51,7 @@ pub fn new_map<K, V>(cap: usize) -> Map<K, V> {
     Map::with_capacity_and_hasher(cap, table_state())
 }
 
-const LOG_NB: u32 = 8;
+const LOG_NB: u32 = 9;
 const NB: usize = 1 << LOG_NB;
 // NB: number of hash partitions; night-11 found 256 best (RW1 keeps it). Partitions take
 // the top LOG_NB bits of fmix(key) (keys::part), disjoint from table-slot bits.
