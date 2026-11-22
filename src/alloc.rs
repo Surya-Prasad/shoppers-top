@@ -157,9 +157,9 @@ pub fn map_huge(size: usize) -> Option<(*mut u8, usize)> {
         if tail > 0 {
             libc::munmap((p + len) as *mut libc::c_void, tail);
         }
-        // v3: no MADV_HUGEPAGE: under page-cache pressure it caused direct-compaction stalls
-        // (sys time 3.4 -> 9.6 s between identical runs); one mapping per source still saves
-        // the per-partition allocations
+        // v3c: MADV_HUGEPAGE again (re-measured on CI against c48f601; locally it once caused
+        // direct-compaction stalls under page-cache pressure)
+        libc::madvise(p as *mut libc::c_void, len, libc::MADV_HUGEPAGE);
         Some((p as *mut u8, len))
     }
     #[cfg(not(target_os = "linux"))]
