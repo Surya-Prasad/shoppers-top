@@ -45,7 +45,7 @@ the fast decoder, no THP advice) **~4.2 s**. All local gates re-run on regenerat
 | ClScan | `80c1ff3` | monomorphic clicks loop (no measured change locally) | vs b9481b1: **−15.9% (7/7) / −15.7% (5/5)** (EPYC 7763); Docker PASS |
 | NB 512 | `466f6a7` (exp/v2-nb512) | 512 hash partitions | vs 80c1ff3: **+5.2% (0/7)** / +0.5% (Xeon 6975P) — dropped |
 | P2c | `5306bd6` | bit filter of linked users (skip probes for unlinked) | vs 80c1ff3: −1.2% (6/7) / **+4.0% (0/5)** (Xeon 6973P) — reverted |
-| v3 long IDs | `3b0bd10` | sharded arena interner; fast decoder interns IDs > 9 bytes; Parted without THP advice | local new 20M: 11 s → 4.2 s; CI pending |
+| v3 long IDs | `3b0bd10` | sharded arena interner; fast decoder interns IDs > 9 bytes; Parted without THP advice | vs b9481b1 (new data): **−54.2% (7/7) / −57.1% (5/5)** (Xeon 6975P); Docker PASS |
 | v3 Parted | `d7cc29e` | per-source partition buffers on huge-page mappings | vs 599c093: −2.9% (7/7) / −5.0% (5/5) (EPYC 7763, I/O-bound runner); vs 1c0881a: **−3.5% (6/7) / −3.0% (4/5)** (EPYC 7763, 20M on tmpfs) — keep; RSS 60M 11.0 → 12.9 GB |
 | PBATCH 64 | `4ad18e2` (ab/v2-pb64) | prefetch batch 32 → 64 | vs e450f86: −0.9% (4/7) / **−2.3% (5/5)** (EPYC 9V45) — take |
 | CHUNK 2 MiB | `788ec62` (ab/v2-chunk2) | scan granule 4 → 2 MiB | vs e450f86: **+6.7% (0/7) / +8.2% (0/5)** (EPYC 9V74) — dropped |
@@ -60,13 +60,13 @@ Whole-branch checks vs b9481b1: `e450f86` **−17.8% (7/7) / −16.8% (5/5)** on
 
 ## Best submittable commit
 
-**`a02705ccf8d8bfff6a09f0311a7330018dfeb302`** (branch `opt/v2-fast`; also `docker/v2-a02705c`) = `e450f86` + prefetch
-batch 64. Evidence: CI gate PASS; vs b9481b1 **−17.0% (7/7) at 20M, −13.8% (5/5) at 60M** on EPYC 7763; same-runner vs
-`e450f86` −0.9% (4/7) / −2.3% (5/5) on EPYC 9V45; Docker check PASS (image builds in 120 s, 30 MB, uid 1000; 36/36
-fixtures and dev MATCH in the container with scorer flags). Local gates all pass (fuzz strict + default 200 each, 0
-failures; MATCH vs b9481b1 on 20M seed 11, 20M seed 5, 60M seed 11).
+**`3b0bd10b53239533a05be84ec766d3fca48f7744`** (branch `opt/v2-fast`; also `docker/v3-3b0bd10`): handles the new
+generator's long IDs. Evidence: CI gate PASS (fixtures, new dev answer, Parquet equal to b9481b1 at 20M and 60M);
+vs b9481b1 on the **new** generator **−54.2% (7/7) at 20M (6.402 → 2.934 s), −57.1% (5/5) at 60M (21.69 → 9.30 s)**
+on Xeon 6975P; Docker check PASS (image builds in 106 s, 30 MB, uid 1000; 36/36 fixtures and new dev MATCH in the
+container with scorer flags). Local gates all pass on regenerated data.
 
-Previous: `e450f86724aa71882be512bc7ae8ba39bc0fd221` (vs b9481b1 −17.8% / −16.8% on EPYC 7763, Docker PASS); `80c1ff330450e1638a7b29d438a37f71f3b385a9` (−15.9% / −15.7% vs b9481b1 on EPYC 7763, Docker PASS); before that `aead35696f173fa9ba4a2909a00bc01f823f7d0d` (−15.7% / −17.8% on EPYC 7763, Docker PASS).
+Previous (old generator only): `a02705ccf8d8bfff6a09f0311a7330018dfeb302` (−17.0% / −13.8% vs b9481b1 on EPYC 7763, Docker PASS); `e450f86724aa71882be512bc7ae8ba39bc0fd221` (vs b9481b1 −17.8% / −16.8% on EPYC 7763, Docker PASS); `80c1ff330450e1638a7b29d438a37f71f3b385a9` (−15.9% / −15.7% vs b9481b1 on EPYC 7763, Docker PASS); before that `aead35696f173fa9ba4a2909a00bc01f823f7d0d` (−15.7% / −17.8% on EPYC 7763, Docker PASS).
 
 ## Tried and dropped
 
