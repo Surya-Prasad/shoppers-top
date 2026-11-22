@@ -137,16 +137,24 @@ pub fn write_all(
     std::fs::create_dir_all(&ud).expect("mkdir user_daily");
     std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
 
-    // user_daily: split into ~ncpu files of similar size, written in parallel
+    // v3i: campaign_daily is written while the user_daily files are
+    rayon::join(|| write_users(&ud, &user_parts, cats, ncpu), || write_campaigns(&cd, camp, camp_ids, channels));
+}
+
+fn write_users(ud: &Path, user_parts: &[Vec<UserRow>], cats: &[S], ncpu: usize) {
+    // user_daily: split into ~2 ncpu files of similar size (v3i: 2x for load balance), written
+    // in parallel
     let total: usize = user_parts.iter().map(Vec::len).sum();
-    let nfiles = ncpu.clamp(1, 16).min(total.max(1));
+    let nfiles = (2 * ncpu).clamp(1, 16).min(total.max(1));
     let per = total.div_ceil(nfiles).max(1);
     let all: Vec<&UserRow> = user_parts.iter().flatten().collect();
     let groups: Vec<&[&UserRow]> = if all.is_empty() { vec![&all[..]] } else { all.chunks(per).collect() };
     groups.par_iter().enumerate().for_each(|(i, g)| {
-        write_batch(&ud, &format!("part-{i:05}.parquet"), user_batch(g, cats));
+        write_batch(ud, &format!("part-{i:05}.parquet"), user_batch(g, cats));
     });
+}
 
+fn write_campaigns(cd: &Path, camp: Map<(u32, i32), [u64; 4]>, camp_ids: &[S], channels: &[S]) {
     // campaign_daily: small, one file
     let n = camp.len();
     let mut ci = StringBuilder::with_capacity(n, n * 8);
@@ -176,5 +184,5 @@ pub fn write_all(
         Arc::new(c.finish()),
         Arc::new(e.finish()),
     ];
-    write_batch(&cd, "part-00000.parquet", RecordBatch::try_new(campaign_schema(), cols).expect("campaign batch"));
+    write_batch(cd, "part-00000.parquet", RecordBatch::try_new(campaign_schema(), cols).expect("campaign batch"));
 }
