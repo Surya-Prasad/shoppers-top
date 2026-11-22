@@ -26,6 +26,7 @@ CI runners vary a lot (EPYC 7763 / 9V45 / 9V74, Xeon 8370C / 6975P / 8573C), so 
 | P2c | `5306bd6` | bit filter of linked users (skip probes for unlinked) | vs 80c1ff3: −1.2% (6/7) / **+4.0% (0/5)** (Xeon 6973P) — reverted |
 | PBATCH 64 | `4ad18e2` (ab/v2-pb64) | prefetch batch 32 → 64 | vs e450f86: −0.9% (4/7) / **−2.3% (5/5)** (EPYC 9V45) — take |
 | CHUNK 2 MiB | `788ec62` (ab/v2-chunk2) | scan granule 4 → 2 MiB | vs e450f86: **+6.7% (0/7) / +8.2% (0/5)** (EPYC 9V74) — dropped |
+| P2d EvC | `0180390` (exp/v2-evc) | 16-byte deduped event layout, generic sessions | vs a02705c: −0.2% (4/7) / **+6.7% (2/5)** (EPYC 7763) — dropped |
 | PBATCH 128 | `8e3e842` (ab/v2-pb128) | prefetch batch 64 → 128 | vs a02705c: −0.2% (4/7) / +0.4% (1/5) (Xeon 6975P) — dropped |
 | 1 link thread | `039fd37` (ab/v2-lk1) | link pool ncpu/4 | vs e450f86: −0.0% (4/7) / −0.7% (4/5) (EPYC 7763) — neutral, keep ncpu/2 |
 | links-overlap | `e450f86` | links on own pool concurrent with the events scan; persons in dedup | vs 80c1ff3: **−3.9% (6/7) / −2.9% (4/5)** (EPYC 9V74); Docker PASS |
@@ -50,4 +51,6 @@ Previous: `e450f86724aa71882be512bc7ae8ba39bc0fd221` (vs b9481b1 −17.8% / −1
 - `exp/v2-direct-parquet` (`cd1f388`): hand-written PLAIN Parquet writer. Correct (reads back in parquet-rs,
   pyarrow, polars; MATCH), but files 3× larger and slower to write than Arrow's dictionary pages.
 - Two interleaved scan cursors per chunk (to overlap per-line latency): slower (twice the write streams).
+- Bulk newline index before per-line decode (`exp/v2-lineidx`, local): 4-thread scan 0.82–0.87 → 0.91–1.00 s; dropped.
+- No dictionary for `user_id` in the Arrow writer (local): no faster, files 32 → 37 MB; dropped.
 - 64-bit-half structural masks: −10% on the mask step only; not kept separately.
