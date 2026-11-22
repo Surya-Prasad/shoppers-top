@@ -109,16 +109,28 @@ struct Shard {
     // non-hex IDs, the stored bytes once). Hex-shaped IDs (one byte + 32 lowercase hex digits,
     // the generator's long IDs): (hi, lo, HEX | prefix << 32 | index + 1), matched by value.
     // Other IDs: (hash, bytes address, len << 32 | index + 1). c == 0 marks a free slot.
-    slots: Vec<(u64, u64, u64)>,
+    slots: &'static mut [(u64, u64, u64)], // v4: from the huge-page arena `slot_table`
     bytes: Vec<S>, // index -> bytes (in a leaked arena block), for bytes_of
     block: &'static mut [u8], // free tail of the current arena block
 }
 
 const HEX: u64 = 1 << 63;
 
+/// v4: a zeroed slot table of `cap` entries from one huge-page backed arena (never freed),
+/// so lookups across the 1024 shards do not miss the TLB. Falls back to the heap when full.
+fn slot_table(cap: usize) -> &'static mut [(u64, u64, u64)] {
+    static A: OnceLock<crate::alloc::Arena> = OnceLock::new();
+    let a = A.get_or_init(|| crate::alloc::Arena::new(1 << 30));
+    match a.take(cap * 24) {
+        // SAFETY: fresh, zeroed (anonymous mapping), 64-byte aligned, used by one shard only
+        Some(p) => unsafe { std::slice::from_raw_parts_mut(p as *mut (u64, u64, u64), cap) },
+        None => Box::leak(vec![(0, 0, 0); cap].into_boxed_slice()),
+    }
+}
+
 impl Shard {
     fn new() -> Shard {
-        Shard { slots: vec![(0, 0, 0); 16], bytes: Vec::new(), block: &mut [] }
+        Shard { slots: slot_table(16), bytes: Vec::new(), block: &mut [] }
     }
     fn copy(&mut self, s: S) -> S {
         if s.len() > BLOCK / 4 {
@@ -138,7 +150,7 @@ impl Shard {
     }
     fn grow(&mut self) {
         let cap = self.slots.len() * 2;
-        let old = std::mem::replace(&mut self.slots, vec![(0, 0, 0); cap]);
+        let old = std::mem::replace(&mut self.slots, slot_table(cap));
         for &e in old.iter() {
             if e.2 != 0 {
                 let mut j = (Self::slot_hash(&e) as usize) & (cap - 1);
@@ -148,8 +160,9 @@ impl Shard {
                 self.slots[j] = e;
             }
         }
-        // v4: lock-free readers may still probe the old table (published in MIRROR): keep it
-        std::mem::forget(old);
+        // v4: lock-free readers may still probe the old table (published in MIRROR): it stays
+        // (arena memory is never freed)
+        let _ = old;
     }
     fn insert_at(&mut self, j: usize, s: S, mk: impl FnOnce(S, u64) -> (u64, u64, u64)) -> u32 {
         let idx = self.bytes.len() as u32;
