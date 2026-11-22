@@ -6,6 +6,11 @@ Gates run locally for every commit below: `cargo test --release`, 36 fixtures, d
 strict + default (0 failures, 150–500 cases each), Parquet MATCH vs b9481b1 on 20M seed 11, 20M seed 5 and
 60M seed 11; plus the CI gate (unit tests, fixtures, dev, 20M/60M equal to the base) on every CI A/B.
 
+Caveat: one confirmation run of `a02705c` vs b9481b1 (Xeon 6973P, `ab/v2-final1`) came out +9.3% / +4.8%, but that
+runner was I/O-bound (base 8.3 s at 20M instead of ~2 s; 60M events scan 20.8 s while dedup/sessions ran at normal
+speed: input not in page cache). The scorer's page cache is warm, so this is not representative; more confirmation
+runs queued (`ab/v2-final2`, `ab/v2-final3`).
+
 CI runners vary a lot (EPYC 7763 / 9V45 / 9V74, Xeon 8370C / 6975P / 8573C), so only same-run pairs are compared.
 
 ## Steps
