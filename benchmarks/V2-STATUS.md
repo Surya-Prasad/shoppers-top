@@ -19,6 +19,17 @@ expensive file-mapping faults on these VMs; profiling). The harness now keeps on
 
 CI runners vary a lot (EPYC 7763 / 9V45 / 9V74, Xeon 8370C / 6975P / 8573C), so only same-run pairs are compared.
 
+## Re-evaluation (checked 2026-11-22 ~04:30 UTC)
+
+- `docs/rules.md` is updated to the official text: the only change is the generator paragraph (1 in 8 distinct
+  user/event/click IDs has a 32-character hex suffix; IDs pass a per-seed keyed bijection; treat IDs as opaque
+  variable-width strings). Event/click/session semantics are unchanged.
+- Scorer version `shopping-sessions-5`; practice runs are timed once (3 times, median, when under 20 s).
+- The leaderboard was re-scored on the new data: #1 "67" 0.5469 s, #2 ND 0.5528 s, #10 azing 0.6919 s, #50 1.0261 s
+  (it was 0.28 s at the top on the old data). Baseline 167.6 s.
+- Our estimate: CI 4-vCPU time × ~0.75 (the old CI→scorer ratio) ≈ **1.6–1.8 s** for the current head (CI 20M
+  ≈ 2.35 s on EPYC 9V74); b9481b1 on the new data is ~6.4–8.3 s on CI (≈ 5–6 s on the scorer, if the ratio holds).
+
 ## The generator changed (found 2026-11-22 ~04:00 UTC)
 
 The official generator.zip and dev-answer.zip were replaced. New version: user, event and click IDs come from a keyed
