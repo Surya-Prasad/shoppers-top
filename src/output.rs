@@ -55,6 +55,9 @@ fn props() -> WriterProperties {
         .set_compression(Compression::UNCOMPRESSED)
         .set_statistics_enabled(EnabledStatistics::None)
         .set_max_row_group_row_count(Some(1 << 20))
+        // v2: user_id is nearly unique; a dictionary attempt is wasted work (it falls back
+        // to PLAIN after the first 1 MB dictionary page anyway)
+        .set_column_dictionary_enabled(parquet::schema::types::ColumnPath::from("user_id"), false)
         .build()
 }
 

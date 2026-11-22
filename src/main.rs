@@ -272,13 +272,60 @@ fn main() {
     lap("clicks");
 
     // ---------------------------------------------------------------- events
-    let events_by_person = events_dedup(event_copies, unknown_cat, Some(&names), &stats);
+    // v2: the compact 16-byte event layout when every value fits it, else the 24-byte one
+    let ncamp = camp_ids.len();
+    let compact = fast_enabled() && we - ws <= u32::MAX as i64 && cat_names.len() <= 256;
+    let ctx = SessCtx { ncamp, ws, we, stats: &stats, unknown_cat, names: &names };
+    let (user_parts, camp_agg, freer) = if compact {
+        sessions_phase::<EvC>(event_copies, clicks_by_person, &ctx, &lap)
+    } else {
+        sessions_phase::<EvV>(event_copies, clicks_by_person, &ctx, &lap)
+    };
+
+    // ---------------------------------------------------------------- output
+    output::write_all(&out, user_parts, camp_agg, &cat_names, &camp_ids, &channels, ncpu);
+    lap("outputs written");
+    let _ = freer.join();
+
+    let json = stats.json();
+    eprint!("stats {json}");
+    if let Ok(p) = std::env::var("STATS_FILE") {
+        let _ = std::fs::write(p, &json);
+    }
+    // cheap self-check from rules.md: assists >= credited non-organic sessions
+    assert!(stats.get(K::AssistPairs) >= stats.get(K::CreditedSessions), "assist invariant violated");
+    let _ = unmapper.join();
+    lap("done");
+    // v2 P5: the outputs are complete and renamed into place; skip the destructors of the
+    // remaining tables (the kernel reclaims everything at exit anyway)
+    std::process::exit(0);
+}
+
+/// Shared inputs of the sessions phase.
+struct SessCtx<'a> {
+    ncamp: usize,
+    ws: i64,
+    we: i64,
+    stats: &'a Stats,
+    unknown_cat: u32,
+    names: &'a Names,
+}
+
+/// v2: events dedup + sessions + campaign/day aggregation, generic over the event layout.
+#[allow(clippy::type_complexity)]
+fn sessions_phase<V: EvLike>(
+    event_copies: ByPerson<EvRec>,
+    clicks_by_person: ByPerson<ClickV>,
+    cx: &SessCtx,
+    lap: &dyn Fn(&str),
+) -> (Vec<Vec<output::UserRow>>, Map<(u32, i32), [u64; 4]>, std::thread::JoinHandle<()>) {
+    let (ncamp, ws, we, stats, unknown_cat) = (cx.ncamp, cx.ws, cx.we, cx.stats, cx.unknown_cat);
+    let events_by_person: ByPerson<V> = events_dedup(event_copies, unknown_cat, Some(cx.names), ws, stats);
     lap("events");
 
     // ---------------------------------------------------------------- sessions
     // Night-01: campaign/day accumulators are a dense array per rayon fold (campaign
     // index, ORGANIC last; day offset from the first window day) instead of a hash map.
-    let ncamp = camp_ids.len();
     let day0 = ws.div_euclid(DAY) as i32;
     let ndays = ((we - 1).div_euclid(DAY) as i32 - day0 + 1).max(1) as usize;
     let dense_len = (ncamp + 1) * ndays;
@@ -294,7 +341,7 @@ fn main() {
                 if acc.0.is_empty() {
                     acc = (vec![[0u64; 3]; dense_len], vec![0u32; dense_len]);
                 }
-                rows.push(sessionize(b, &events_by_person, &clicks_by_person, ncamp, day0, ndays, &mut acc.0, &mut acc.1, &stats));
+                rows.push(sessionize(b, &events_by_person, &clicks_by_person, ncamp, day0, ndays, &mut acc.0, &mut acc.1, stats, ws));
                 (rows, acc)
             },
         )
@@ -326,24 +373,7 @@ fn main() {
         drop(events_by_person);
         drop(clicks_by_person);
     });
-
-    // ---------------------------------------------------------------- output
-    output::write_all(&out, user_parts, camp_agg, &cat_names, &camp_ids, &channels, ncpu);
-    lap("outputs written");
-    let _ = freer.join();
-
-    let json = stats.json();
-    eprint!("stats {json}");
-    if let Ok(p) = std::env::var("STATS_FILE") {
-        let _ = std::fs::write(p, &json);
-    }
-    // cheap self-check from rules.md: assists >= credited non-organic sessions
-    assert!(stats.get(K::AssistPairs) >= stats.get(K::CreditedSessions), "assist invariant violated");
-    let _ = unmapper.join();
-    lap("done");
-    // v2 P5: the outputs are complete and renamed into place; skip the destructors of the
-    // remaining tables (the kernel reclaims everything at exit anyway)
-    std::process::exit(0);
+    (user_parts, camp_agg, freer)
 }
 
 /// SS_EXP2=1: single-thread cost of the v2 fast-path layers (profiling only).
@@ -1189,6 +1219,84 @@ pub struct EvV {
     pub price: u32,
 }
 
+/// v2: a valid, deduplicated event as the sessions phase reads it. Two layouts share the
+/// code: `EvV` (any input) and the 16-byte `EvC`, used when every value fits it (event ts
+/// offsets from window_start below 2^32 ms and at most 256 categories; checked in `main`).
+pub trait EvLike: Copy + Send + Sync + 'static {
+    /// `base` is window_start (the compact layout stores ts - base).
+    fn make(person: u64, ts: i64, cat: u32, price: u32, base: i64) -> Self;
+    fn person(&self) -> u64;
+    fn ts(&self, base: i64) -> i64;
+    fn cat(&self) -> u32;
+    fn price(&self) -> u32;
+    /// Sort key: person, then ts (unsigned order = (person, ts) order).
+    fn key(&self) -> u128;
+}
+
+impl EvLike for EvV {
+    #[inline(always)]
+    fn make(person: u64, ts: i64, cat: u32, price: u32, _: i64) -> Self {
+        EvV { person, ts, cat, price }
+    }
+    #[inline(always)]
+    fn person(&self) -> u64 {
+        self.person
+    }
+    #[inline(always)]
+    fn ts(&self, _: i64) -> i64 {
+        self.ts
+    }
+    #[inline(always)]
+    fn cat(&self) -> u32 {
+        self.cat
+    }
+    #[inline(always)]
+    fn price(&self) -> u32 {
+        self.price
+    }
+    #[inline(always)]
+    fn key(&self) -> u128 {
+        ((self.person as u128) << 64) | ((self.ts as u64) ^ (1 << 63)) as u128
+    }
+}
+
+/// v2: compact deduplicated event (16 bytes): ts as an offset from window_start, price (< 2^24)
+/// and category index (< 256) in one word.
+#[derive(Clone, Copy)]
+pub struct EvC {
+    pub person: u64,
+    pub ts: u32,
+    pub pc: u32,
+}
+
+impl EvLike for EvC {
+    #[inline(always)]
+    fn make(person: u64, ts: i64, cat: u32, price: u32, base: i64) -> Self {
+        debug_assert!((0..=u32::MAX as i64).contains(&(ts - base)) && cat < 256 && price < 1 << 24);
+        EvC { person, ts: (ts - base) as u32, pc: price << 8 | cat }
+    }
+    #[inline(always)]
+    fn person(&self) -> u64 {
+        self.person
+    }
+    #[inline(always)]
+    fn ts(&self, base: i64) -> i64 {
+        base + self.ts as i64
+    }
+    #[inline(always)]
+    fn cat(&self) -> u32 {
+        self.pc & 0xff
+    }
+    #[inline(always)]
+    fn price(&self) -> u32 {
+        self.pc >> 8
+    }
+    #[inline(always)]
+    fn key(&self) -> u128 {
+        ((self.person as u128) << 64) | self.ts as u128
+    }
+}
+
 #[inline]
 fn parse_price(b: &[u8]) -> u32 {
     if b.is_empty() || !b.iter().all(u8::is_ascii_digit) {
@@ -1246,34 +1354,38 @@ fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u
         .map(|(order, chunk)| {
             let mut sc = EvScan::new(chunk.len(), products, unknown_cat, lo, hi, names);
             if fast_ok && is_identity(order) {
-                // v2 P1: shape-specialized fast path; every line it declines takes `exact`
+                // v2 P1: shape-specialized fast path; every line it declines takes `exact`.
+                // v2: line ends come from one bulk (vectorized) newline pass first, so each
+                // line's decode starts from a known offset instead of waiting on the previous
+                // line's newline search.
                 let len = chunk.len();
                 let base = chunk.as_ptr();
+                let ends: Vec<u32> = memchr::memchr_iter(b'\n', chunk).map(|i| i as u32).collect();
                 let mut s = 0usize;
-                while s + fast::SLACK <= len {
-                    // SAFETY: s + SLACK <= len, so the decoder reads inside the chunk
-                    if let Some((l, ev)) = unsafe { fast::event(base.add(s), lo, hi, products.dense_prefix()) } {
-                        sc.lines += 1;
-                        let r = EvRec { eid: ev.eid, rank: rank_of(Some(ev.ingest)), person: ev.user, ts: ev.ts, price: ev.price, cat: 0 };
-                        if ev.pnum != 0 {
-                            // v2: canonical product ID: direct index (no hash, no batch)
-                            sc.valid(EvRec { cat: products.get_dense(ev.pnum).unwrap_or(unknown_cat), ..r }, 0, 0);
-                        } else {
-                            let m = packed::fmix(ev.product);
-                            products.prefetch_packed(m);
-                            sc.valid(r, ev.product, m);
+                for &e in &ends {
+                    let e = e as usize;
+                    if s + fast::SLACK <= len {
+                        // SAFETY: s + SLACK <= len, so the decoder reads inside the chunk
+                        if let Some((_, ev)) = unsafe { fast::event(base.add(s), lo, hi, products.dense_prefix()) } {
+                            // (the decoder's line end is the first '\n' after s, i.e. e)
+                            sc.lines += 1;
+                            let r = EvRec { eid: ev.eid, rank: rank_of(Some(ev.ingest)), person: ev.user, ts: ev.ts, price: ev.price, cat: 0 };
+                            if ev.pnum != 0 {
+                                sc.valid(EvRec { cat: products.get_dense(ev.pnum).unwrap_or(unknown_cat), ..r }, 0, 0);
+                            } else {
+                                let m = packed::fmix(ev.product);
+                                products.prefetch_packed(m);
+                                sc.valid(r, ev.product, m);
+                            }
+                            s = e + 1;
+                            continue;
                         }
-                        s += l + 1;
-                        continue;
                     }
-                    let e = memchr::memchr(b'\n', &chunk[s..]).map_or(len, |i| s + i);
                     sc.exact(split::<7>(&chunk[s..e]), order);
                     s = e + 1;
                 }
-                while s < len {
-                    let e = memchr::memchr(b'\n', &chunk[s..]).map_or(len, |i| s + i);
-                    sc.exact(split::<7>(&chunk[s..e]), order);
-                    s = e + 1;
+                if s < len {
+                    sc.exact(split::<7>(&chunk[s..len]), order); // final line without '\n'
                 }
             } else {
                 for_each_record_bq::<7>(chunk, |rec| sc.exact(rec, order));
@@ -1434,19 +1546,19 @@ fn fast_enabled() -> bool {
 }
 
 /// RW31: event dedup + person resolution (batched) + repartition by person.
-fn events_dedup(by_eid: ByPerson<EvRec>, unknown_cat: u32, names: Option<&Names>, stats: &Stats) -> ByPerson<EvV> {
+fn events_dedup<V: EvLike>(by_eid: ByPerson<EvRec>, unknown_cat: u32, names: Option<&Names>, base: i64, stats: &Stats) -> ByPerson<V> {
     let mut st = Stage::start();
-    let out: Vec<Vec<Vec<EvV>>> = by_eid
+    let out: Vec<Vec<Vec<V>>> = by_eid
         .into_par_iter()
         .map(|parts| {
             let n: usize = parts.iter().map(Vec::len).sum();
             // rules.md, Events step 2: keep the copy with the smallest ingest_ts; A2: on a
             // tie the first copy stays (equal-ingest copies are promised identical)
-            let mut dst: Vec<Vec<EvV>> = (0..NB).map(|_| Vec::with_capacity(n / NB + n / NB / 8 + 32)).collect(); // v2: room for the spread (no regrowth)
+            let mut dst: Vec<Vec<V>> = (0..NB).map(|_| Vec::with_capacity(n / NB + n / NB / 8 + 32)).collect(); // v2: room for the spread (no regrowth)
             let mut c = [0u64; 8];
             let mut pb: PersonBatch<EvRec> = PersonBatch::new();
             let mut emit = |r: EvRec, person: u64| {
-                dst[keys::part(person, LOG_NB)].push(EvV { person, ts: r.ts, cat: r.cat, price: r.price });
+                dst[keys::part(person, LOG_NB)].push(V::make(person, r.ts, r.cat, r.price, base));
             };
             let kept = dedup(&parts, |r: &EvRec| r.eid, |a, b| a.rank < b.rank, |r| {
                 if r.person == keys::EMPTY {
@@ -1523,9 +1635,10 @@ fn bucket_sort<T: Copy>(parts: &[Vec<T>], n: usize, nbk: usize, bucket: impl Fn(
     (out, starts)
 }
 
-fn sessionize(
+#[allow(clippy::too_many_arguments)]
+fn sessionize<V: EvLike>(
     b: usize,
-    evs: &ByPerson<EvV>,
+    evs: &ByPerson<V>,
     cls: &ByPerson<ClickV>,
     ncamp: usize,
     day0: i32,
@@ -1533,6 +1646,7 @@ fn sessionize(
     camp: &mut [[u64; 3]],
     assist: &mut [u32],
     stats: &Stats,
+    tb: i64,
 ) -> Vec<output::UserRow> {
     // RW6: events and clicks are grouped by bucket (bits of fmix(person) below the
     // partition bits) with one counting-sort pass, then each small bucket is sorted by
@@ -1545,9 +1659,7 @@ fn sessionize(
     let bshift = 64 - LOG_NB - nbk.trailing_zeros();
     let bucket = |person: u64| -> usize { ((packed::fmix(person) >> bshift) as usize) & (nbk - 1) };
     // events sort on one u128 key: person, then ts (sign-flipped so unsigned order = signed)
-    let (ev, es) = bucket_sort(&evs[b], n, nbk, |e: &EvV| bucket(e.person), |v: &mut [EvV]| {
-        v.sort_unstable_by_key(|e| ((e.person as u128) << 64) | ((e.ts as u64) ^ (1 << 63)) as u128)
-    });
+    let (ev, es) = bucket_sort(&evs[b], n, nbk, |e: &V| bucket(e.person()), |v: &mut [V]| v.sort_unstable_by_key(|e| e.key()));
     // clicks: (person, ts asc, click_id desc in byte order), so the last click of a
     // window is the latest one with the byte-wise smallest click_id
     let (cl, cs) = bucket_sort(&cls[b], nc, nbk, |c: &ClickV| bucket(c.person), |v: &mut [ClickV]| {
@@ -1569,10 +1681,10 @@ fn sessionize(
     let mut i = es[bkt] as usize; // event cursor
     let mut j = cs[bkt] as usize; // click cursor (first click of current person)
     while i < e1 {
-        let p = ev[i].person;
+        let p = ev[i].person();
         persons += 1;
         let mut pe = i + 1;
-        while pe < e1 && ev[pe].person == p {
+        while pe < e1 && ev[pe].person() == p {
             pe += 1;
         }
         while j < c1 && cl[j].person < p {
@@ -1591,17 +1703,17 @@ fn sessionize(
         let mut k = i;
         while k < pe {
             // one session: [k, e); equal timestamps never split (gap 0)
-            let start = ev[k].ts;
+            let start = ev[k].ts(tb);
             let mut e = k + 1;
-            while e < pe && ev[e].ts - ev[e - 1].ts <= GAP {
+            while e < pe && ev[e].ts(tb) - ev[e - 1].ts(tb) <= GAP {
                 e += 1;
             }
             let day = start.div_euclid(DAY) as i32;
             let (mut rev, mut has_p) = (0u64, false);
             for x in &ev[k..e] {
-                if x.price > 0 {
+                if x.price() > 0 {
                     has_p = true;
-                    rev += x.price as u64;
+                    rev += x.price() as u64;
                 }
             }
             // attribution window: clicks with start - 7d <= ts <= start
@@ -1659,10 +1771,10 @@ fn sessionize(
             d_rev += rev;
             if has_p {
                 for x in &ev[k..e] {
-                    if x.price > 0 {
-                        match cat_rev.iter_mut().find(|c| c.0 == x.cat) {
-                            Some(c) => c.1 += x.price as u64,
-                            None => cat_rev.push((x.cat, x.price as u64)),
+                    if x.price() > 0 {
+                        match cat_rev.iter_mut().find(|c| c.0 == x.cat()) {
+                            Some(c) => c.1 += x.price() as u64,
+                            None => cat_rev.push((x.cat(), x.price() as u64)),
                         }
                     }
                 }
@@ -1893,5 +2005,61 @@ mod fast_click_tests {
             assert_eq!(a, b, "case {case}");
             assert_eq!(s1.json(), s2.json(), "case {case}");
         }
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+
+    /// v2: sessionize over the 16-byte layout equals the 24-byte layout (rows, campaign
+    /// accumulators, stats), with window-edge timestamps, 30-minute edges, max prices and
+    /// category 255.
+    #[test]
+    fn compact_layout_equals_wide() {
+        let ws = timefmt::parse(b"2028-02-20T00:00:00Z").unwrap();
+        let (day0, ndays, ncamp) = ((ws / DAY) as i32, 14usize, 40usize);
+        let mut x = 5u64;
+        let mut r = || {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x >> 33
+        };
+        for case in 0..10 {
+            let mut wide: Vec<EvV> = Vec::new();
+            for _ in 0..(r() % 30_000) {
+                let p = 1 + r() % (1 + r() % 2000);
+                let t = match r() % 10 {
+                    0 => ws,
+                    1 => ws + 14 * DAY - 1,
+                    _ => ws + (r() as i64 * 977) % (14 * DAY),
+                };
+                let t = if r() % 6 == 0 { t - t % GAP } else { t };
+                let price = match r() % 40 { 0 => 10_000_000, 1..=3 => 1 + (r() % 50_000) as u32, _ => 0 };
+                wide.push(EvV { person: p * 104729 + case, ts: t.max(ws), cat: if r() % 50 == 0 { 255 } else { (r() % 21) as u32 }, price });
+            }
+            let mut cl: Vec<ClickV> = Vec::new();
+            for _ in 0..(r() % 8_000) {
+                let p = 1 + r() % 2100;
+                cl.push(ClickV { person: p * 104729 + case, ts: ws - WEEK + (r() as i64 * 7907) % (21 * DAY), cid: 1 + r() % 300, camp: (r() % ncamp as u64) as u32 });
+            }
+            let comp: Vec<EvC> = wide.iter().map(|e| EvC::make(e.person, e.ts, e.cat, e.price, ws)).collect();
+            fn part<T: Clone>(v: Vec<T>) -> ByPerson<T> {
+                let mut a: ByPerson<T> = (0..NB).map(|_| Vec::new()).collect();
+                let h = v.len() / 3;
+                a[0] = vec![v[..h].to_vec(), v[h..].to_vec()];
+                a
+            }
+            let cls = part(cl);
+            fn run<V: EvLike>(evs: &ByPerson<V>, cls: &ByPerson<ClickV>, ncamp: usize, day0: i32, ndays: usize, ws: i64) -> (Vec<(u64, i32, u64, u64, u64, u32)>, Vec<[u64; 3]>, Vec<u32>, String) {
+                let (mut camp, mut assist) = (vec![[0u64; 3]; (ncamp + 1) * ndays], vec![0u32; (ncamp + 1) * ndays]);
+                let st = Stats::default();
+                let rows = sessionize(0, evs, cls, ncamp, day0, ndays, &mut camp, &mut assist, &st, ws);
+                let mut rows: Vec<_> = rows.iter().map(|u| (u.user, u.day, u.sessions, u.events, u.revenue, u.top)).collect();
+                rows.sort();
+                (rows, camp, assist, st.json())
+            }
+            assert!(run(&part(wide), &cls, ncamp, day0, ndays, ws) == run(&part(comp), &cls, ncamp, day0, ndays, ws), "case {case}");
+        }
+        assert_eq!(std::mem::size_of::<EvC>(), 16);
     }
 }
