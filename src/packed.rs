@@ -128,6 +128,9 @@ pub struct IdMap {
     // ID only in `packed`/`other`. The two key sets are disjoint, so lookups route by form.
     dprefix: u8,
     dense: Vec<u32>,
+    // v4: `dense` as bytes when every stored value + 1 fits (a 4x smaller, cache-resident
+    // table for the per-event product lookup); empty otherwise. Set by `compact_dense`.
+    dense8: Vec<u8>,
 }
 
 /// v2: numbers of canonical IDs kept in the dense table are below this.
@@ -151,11 +154,18 @@ pub fn canon(s: &[u8], prefix: u8) -> Option<u32> {
 
 impl IdMap {
     pub fn with_capacity(n: usize) -> IdMap {
-        IdMap { packed: crate::keys::KeyMap::with_capacity(n), other: new_map(0), dprefix: 0, dense: Vec::new() }
+        IdMap { packed: crate::keys::KeyMap::with_capacity(n), other: new_map(0), dprefix: 0, dense: Vec::new(), dense8: Vec::new() }
     }
     /// v2: with a dense table for canonical `prefix` + number IDs.
     pub fn with_dense(n: usize, prefix: u8) -> IdMap {
         IdMap { dprefix: prefix, ..IdMap::with_capacity(n) }
+    }
+    /// v4: build the byte copy of the dense table if every value + 1 is below 256 (call once
+    /// all inserts are done; later inserts would not reach it).
+    pub fn compact_dense(&mut self) {
+        if !self.dense.is_empty() && self.dense.iter().all(|&v| v <= 255) {
+            self.dense8 = self.dense.iter().map(|&v| v as u8).collect();
+        }
     }
     pub fn dense_prefix(&self) -> u8 {
         self.dprefix
@@ -163,6 +173,12 @@ impl IdMap {
     /// v2: lookup of a canonical ID by its number (`canon`); only valid for numbers below DMAX.
     #[inline(always)]
     pub fn get_dense(&self, n: u32) -> Option<u32> {
+        if !self.dense8.is_empty() {
+            return match self.dense8.get(n as usize) {
+                Some(&v) if v != 0 => Some(v as u32 - 1),
+                _ => None,
+            };
+        }
         match self.dense.get(n as usize) {
             Some(&v) if v != 0 => Some(v - 1),
             _ => None,
@@ -203,6 +219,7 @@ impl IdMap {
     }
     /// Insert unless the key is present (first occurrence wins; `s` non-empty).
     pub fn insert_first(&mut self, s: S, v: u32) {
+        self.dense8 = Vec::new(); // v4: the byte copy is rebuilt by `compact_dense` only
         if let Some(n) = canon(s, self.dprefix) {
             if self.dense.len() <= n as usize {
                 self.dense.resize(n as usize + 1, 0);

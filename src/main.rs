@@ -449,6 +449,7 @@ fn load_products(src: &'static Source) -> (IdMap, Vec<S>) {
     for (p, c) in rows {
         products.insert_first(p, idx[c]);
     }
+    products.compact_dense();
     (products, cats)
 }
 
