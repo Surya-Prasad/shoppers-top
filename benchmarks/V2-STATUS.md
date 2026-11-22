@@ -24,15 +24,16 @@ CI runners vary a lot (EPYC 7763 / 9V45 / 9V74, Xeon 8370C / 6975P / 8573C), so 
 | ClScan | `80c1ff3` | monomorphic clicks loop (no measured change locally) | vs b9481b1: **−15.9% (7/7) / −15.7% (5/5)** (EPYC 7763); Docker PASS |
 | NB 512 | `466f6a7` (exp/v2-nb512) | 512 hash partitions | vs 80c1ff3: **+5.2% (0/7)** / +0.5% (Xeon 6975P) — dropped |
 | P2c | `5306bd6` | bit filter of linked users (skip probes for unlinked) | vs 80c1ff3: −1.2% (6/7) / **+4.0% (0/5)** (Xeon 6973P) — reverted |
+| PBATCH 64 / CHUNK 2 MiB / 1 link thread | `ab/v2-pb64`, `ab/v2-chunk2`, `ab/v2-lk1` | parameter experiments | vs e450f86 pending |
 | links-overlap | `e450f86` | links on own pool concurrent with the events scan; persons in dedup | vs 80c1ff3: **−3.9% (6/7) / −2.9% (4/5)** (EPYC 9V74); Docker PASS |
 
-Whole-branch checks vs b9481b1: `9b850aa` **−14.5% (7/7) / −14.0% (5/5)** on EPYC 9V45; `537f83e` **−15.4% (7/7) / −12.9% (5/5)** on EPYC 7763; `571ea2e` −2.2% (6/7) / −12.4% (5/5) on Xeon 6975P; `70d5eef` −13.0% (7/7) /
+Whole-branch checks vs b9481b1: `e450f86` **−17.8% (7/7) / −16.8% (5/5)** on EPYC 7763; `9b850aa` **−14.5% (7/7) / −14.0% (5/5)** on EPYC 9V45; `537f83e` **−15.4% (7/7) / −12.9% (5/5)** on EPYC 7763; `571ea2e` −2.2% (6/7) / −12.4% (5/5) on Xeon 6975P; `70d5eef` −13.0% (7/7) /
 −11.5% (5/5) on EPYC 9V74 (both still contain the P3 regression).
 
 ## Best submittable commit
 
 **`e450f86724aa71882be512bc7ae8ba39bc0fd221`** (branch `opt/v2-fast`; also `docker/v2-e450f86`).
-Evidence: CI gate PASS; vs `80c1ff3` (itself −15.9% / −15.7% vs b9481b1 on EPYC 7763) **−3.9% (6/7) at 20M,
+Evidence: CI gate PASS; vs b9481b1 **−17.8% (7/7) at 20M, −16.8% (5/5) at 60M** on EPYC 7763; vs `80c1ff3` (itself −15.9% / −15.7% vs b9481b1 on EPYC 7763) **−3.9% (6/7) at 20M,
 −2.9% (4/5) at 60M** on EPYC 9V74; Docker check PASS (image builds in 101 s, 30 MB, uid 1000; 36/36 fixtures and dev
 MATCH in the container with scorer flags). Local gates all pass (fuzz strict + default 250 each, 0 failures; MATCH vs
 b9481b1 on 20M seed 11, 20M seed 5, 60M seed 11).
