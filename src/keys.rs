@@ -20,14 +20,84 @@ type S = &'static [u8];
 pub const INTERNED: u64 = 1 << 63;
 pub const EMPTY: u64 = 0;
 
-struct Interner {
-    map: Map<S, u64>,
-    bytes: Vec<S>,
+// v3: the interner is sharded (no global lock) and arena-backed (no allocation per ID).
+// Generated data since the 2026-11-22 generator update has 1 in 8 user, event and click IDs
+// of 33 bytes (a prefix and 32 hex digits), so interning is hot: millions of lookups.
+const SHARD_BITS: u32 = 10;
+const SHARDS: usize = 1 << SHARD_BITS;
+const BLOCK: usize = 1 << 20;
+
+struct Shard {
+    // open addressing: (hash, key index + 1); 0 = free
+    slots: Vec<(u64, u32)>,
+    bytes: Vec<S>, // index -> bytes (in a leaked arena block)
+    block: &'static mut [u8], // free tail of the current arena block
 }
 
-fn interner() -> &'static Mutex<Interner> {
-    static I: OnceLock<Mutex<Interner>> = OnceLock::new();
-    I.get_or_init(|| Mutex::new(Interner { map: new_map(16), bytes: Vec::new() }))
+impl Shard {
+    fn new() -> Shard {
+        Shard { slots: vec![(0, 0); 16], bytes: Vec::new(), block: &mut [] }
+    }
+    fn copy(&mut self, s: S) -> S {
+        if s.len() > BLOCK / 4 {
+            return Box::leak(s.to_vec().into_boxed_slice());
+        }
+        if s.len() > self.block.len() {
+            self.block = Box::leak(vec![0u8; BLOCK].into_boxed_slice());
+        }
+        let (dst, rest) = std::mem::take(&mut self.block).split_at_mut(s.len());
+        dst.copy_from_slice(s);
+        self.block = rest;
+        dst
+    }
+    fn grow(&mut self) {
+        let cap = self.slots.len() * 2;
+        let old = std::mem::replace(&mut self.slots, vec![(0, 0); cap]);
+        for (h, i) in old {
+            if i != 0 {
+                let mut j = (h as usize) & (cap - 1);
+                while self.slots[j].1 != 0 {
+                    j = (j + 1) & (cap - 1);
+                }
+                self.slots[j] = (h, i);
+            }
+        }
+    }
+    /// The index of `s` (hash `h`), inserting a copy if absent.
+    fn get_or_insert(&mut self, s: S, h: u64) -> u32 {
+        let mask = self.slots.len() - 1;
+        let mut j = (h as usize) & mask;
+        loop {
+            let (sh, si) = self.slots[j];
+            if si == 0 {
+                break;
+            }
+            if sh == h && self.bytes[(si - 1) as usize] == s {
+                return si - 1;
+            }
+            j = (j + 1) & mask;
+        }
+        let idx = self.bytes.len() as u32;
+        let c = self.copy(s);
+        self.bytes.push(c);
+        self.slots[j] = (h, idx + 1);
+        if self.bytes.len() * 2 > self.slots.len() {
+            self.grow();
+        }
+        idx
+    }
+}
+
+fn shards() -> &'static [Mutex<Shard>] {
+    static I: OnceLock<Vec<Mutex<Shard>>> = OnceLock::new();
+    I.get_or_init(|| (0..SHARDS).map(|_| Mutex::new(Shard::new())).collect())
+}
+
+/// Byte hash for the interner (shard = top bits, slot = low bits).
+#[inline]
+fn byte_hash(s: &[u8]) -> u64 {
+    use std::hash::BuildHasher;
+    crate::hashing::Seeded(0x2545_F491_4F6C_DD1D).hash_one(s)
 }
 
 /// The key of a non-empty ID (EMPTY for an empty one).
@@ -42,25 +112,20 @@ pub fn key_of(s: S) -> u64 {
     }
 }
 
+/// Key of an unpackable ID: INTERNED | shard << 32 | index in the shard.
 #[cold]
-fn intern(s: S) -> u64 {
-    let mut g = interner().lock().unwrap();
-    if let Some(&k) = g.map.get(s) {
-        return k;
-    }
-    let k = INTERNED | g.bytes.len() as u64;
-    // v2: own copy, so the input mappings can be released once the scans are done
-    let s: S = Box::leak(s.to_vec().into_boxed_slice());
-    g.bytes.push(s);
-    g.map.insert(s, k);
-    k
+pub fn intern(s: S) -> u64 {
+    let h = byte_hash(s);
+    let sh = (h >> (64 - SHARD_BITS)) as usize;
+    let idx = shards()[sh].lock().unwrap().get_or_insert(s, h);
+    INTERNED | (sh as u64) << 32 | idx as u64
 }
 
 /// The bytes of a key, into `buf` for packed keys.
 pub fn bytes_of(k: u64, buf: &mut [u8; 9]) -> &[u8] {
     if k & INTERNED != 0 {
-        let g = interner().lock().unwrap();
-        return g.bytes[(k & !INTERNED) as usize];
+        let sh = ((k >> 32) as usize) & (SHARDS - 1);
+        return shards()[sh].lock().unwrap().bytes[(k & 0xffff_ffff) as usize];
     }
     let mut n = 0;
     while n < 9 {
@@ -226,6 +291,57 @@ mod tests {
         assert!(keys.iter().all(|&k| k != EMPTY));
         // the same long ID interns to the same key
         assert_eq!(key_of(leak("abcdefghij")), key_of(leak("abcdefghij")));
+    }
+
+    /// v3: the sharded interner from many threads: equal keys iff equal bytes, bytes round-trip,
+    /// byte order via cmp_bytes, for 33-byte hex IDs, case variants, long and odd IDs.
+    #[test]
+    fn sharded_interner_exact_concurrent() {
+        let ids: Vec<S> = (0..60_000u64)
+            .map(|i| {
+                let s = match i % 5 {
+                    0 => format!("u{:016x}{:016x}", i.wrapping_mul(0x9E37_79B9_7F4A_7C15), i),
+                    1 => format!("U{:016x}{:016x}", i.wrapping_mul(0x9E37_79B9_7F4A_7C15), i),
+                    2 => format!("e{:032x}", i * 7),
+                    3 => format!("id-{i}-é"),
+                    _ => format!("k{}", i % 500), // packable, repeats
+                };
+                leak(&s)
+            })
+            .collect();
+        let keys: Vec<Vec<u64>> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..8)
+                .map(|t| {
+                    let ids = &ids;
+                    sc.spawn(move || {
+                        // every thread interns all IDs, in a different order
+                        let mut out = vec![0u64; ids.len()];
+                        for j in 0..ids.len() {
+                            let i = (j + t * 7919) % ids.len();
+                            out[i] = key_of(ids[i]);
+                        }
+                        out
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for t in 1..8 {
+            assert_eq!(keys[t], keys[0]);
+        }
+        let mut by_key: std::collections::HashMap<u64, S> = std::collections::HashMap::new();
+        for (i, &k) in keys[0].iter().enumerate() {
+            let mut b = [0u8; 9];
+            assert_eq!(bytes_of(k, &mut b), ids[i]);
+            if let Some(prev) = by_key.insert(k, ids[i]) {
+                assert_eq!(prev, ids[i], "two IDs share a key");
+            }
+        }
+        for w in keys[0].windows(2).take(5_000) {
+            let (mut a, mut b) = ([0u8; 9], [0u8; 9]);
+            let (x, y) = (bytes_of(w[0], &mut a).to_vec(), bytes_of(w[1], &mut b).to_vec());
+            assert_eq!(cmp_bytes(w[0], w[1]), x.cmp(&y));
+        }
     }
 
     #[test]

@@ -161,8 +161,13 @@ unsafe fn slice<'a>(p: *const u8, f: (u32, u32)) -> &'a [u8] {
 #[inline(always)]
 unsafe fn id(p: *const u8, f: (u32, u32)) -> Option<u64> {
     let n = (f.1 - f.0) as usize;
-    if n == 0 || n > 9 {
+    if n == 0 {
         return None;
+    }
+    if n > 9 {
+        // v3: long IDs (since the generator update, 1 in 8 IDs is a prefix + 32 hex digits)
+        // are interned: the same key `keys::key_of` gives (it copies the bytes)
+        return Some(crate::keys::intern(unsafe { slice(p, f) }));
     }
     unsafe { pack_at(p.add(f.0 as usize), n) }
 }
@@ -481,9 +486,12 @@ mod tests {
                 accepted += 1;
                 assert_eq!(l, line.len());
                 let f = f.expect("accepted a malformed line");
-                assert_eq!(Some(ev.eid), pack9(f[0]).filter(|_| !f[0].is_empty()));
-                assert_eq!(Some(ev.user), pack9(f[1]).filter(|_| !f[1].is_empty()));
-                assert_eq!(Some(ev.product), pack9(f[5]).filter(|_| !f[5].is_empty()));
+                let key = |x: &[u8]| -> Option<u64> {
+                    if x.is_empty() { None } else if x.len() > 9 { Some(crate::keys::intern(Box::leak(x.to_vec().into_boxed_slice()))) } else { pack9(x) }
+                };
+                assert_eq!(Some(ev.eid), key(f[0]));
+                assert_eq!(Some(ev.user), key(f[1]));
+                assert_eq!(Some(ev.product), key(f[5]));
                 assert_eq!(ev.pnum, crate::packed::canon(f[5], b'p').unwrap_or(0), "{:?}", String::from_utf8_lossy(f[5]));
                 assert_eq!(Some(ev.ts), crate::timefmt::parse(f[2]));
                 assert!(ev.ts >= lo && ev.ts < hi);
@@ -546,8 +554,9 @@ pub mod tests_support {
         let typ = pick(x, &["view", "view", "cart", "purchase", "purchase", "Purchase", "cart ", "", "views"]);
         let prod = if lcg(x) % 20 == 0 { pick(x, &["", "P12", "p1234567890", " p1"]).to_string() } else { format!("p{}", lcg(x) % 60000) };
         let price = pick(x, &["", "1000", "0250", "0", "10000000", "10000001", "12.5", "-5", "00000001", "123456789", "99"]);
-        let eid = if lcg(x) % 50 == 0 { pick(x, &["", "e1234567890", "é1"]).to_string() } else { b36(x, "e") };
-        let uid = if lcg(x) % 50 == 0 { pick(x, &["", " u1", "u1\r"]).to_string() } else { b36(x, "u") };
+        let hex = |x: &mut u64, pre: &str| -> String { format!("{pre}{:016x}{:016x}", lcg(x) << 31 | lcg(x), lcg(x) << 31 | lcg(x)) };
+        let eid = match lcg(x) % 50 { 0 => pick(x, &["", "e1234567890", "é1"]).to_string(), 1..=6 => hex(x, "e"), _ => b36(x, "e") };
+        let uid = match lcg(x) % 50 { 0 => pick(x, &["", " u1", "u1\r"]).to_string(), 1..=6 => hex(x, "u"), 7 => hex(x, "U"), _ => b36(x, "u") };
         let mut fields = vec![eid, uid, ts, ingest, typ.to_string(), prod, price.to_string()];
         if lcg(x) % 100 == 0 {
             fields.pop();
