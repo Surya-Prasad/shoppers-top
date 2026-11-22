@@ -615,7 +615,7 @@ impl<T: Copy> PersonBatch<T> {
 
 /// RW2: rows waiting for their person lookup; the table slots of a whole batch are
 /// prefetched before any lookup runs, so the cache misses overlap.
-const PBATCH: usize = 32;
+const PBATCH: usize = 64;
 pub struct Pending<T> {
     rows: Vec<(T, u64, u64)>, // (row, user key, mix)
 }
