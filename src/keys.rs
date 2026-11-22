@@ -185,6 +185,46 @@ fn hex_shape(s: &[u8]) -> Option<(u8, u64, u64)> {
     if s.len() != 33 {
         return None;
     }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        // SAFETY: s has 33 bytes, so the 32-byte load at s[1] is in bounds
+        unsafe { hex_shape_avx2(s) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    hex_shape_scalar(s)
+}
+
+/// v3f: AVX2 form of `hex_shape_scalar` (same result; tested): nibbles by range checks,
+/// pairs joined by one multiply-add, bytes packed and read big-endian.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn hex_shape_avx2(s: &[u8]) -> Option<(u8, u64, u64)> {
+    use std::arch::x86_64::*;
+    unsafe {
+        let v = _mm256_loadu_si256(s.as_ptr().add(1) as *const __m256i);
+        let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+        let a = _mm256_sub_epi8(v, _mm256_set1_epi8(b'a' as i8));
+        let is_d = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+        let is_a = _mm256_cmpeq_epi8(_mm256_min_epu8(a, _mm256_set1_epi8(5)), a);
+        if _mm256_movemask_epi8(_mm256_or_si256(is_d, is_a)) != -1 {
+            return None;
+        }
+        let nib = _mm256_blendv_epi8(_mm256_add_epi8(a, _mm256_set1_epi8(10)), d, is_d);
+        // each 16-bit lane: first nibble * 16 + second nibble
+        let pairs = _mm256_maddubs_epi16(nib, _mm256_set1_epi16(0x0110));
+        let packed = _mm256_packus_epi16(pairs, pairs);
+        let hi = _mm256_extract_epi64::<0>(packed) as u64;
+        let lo = _mm256_extract_epi64::<2>(packed) as u64;
+        Some((s[0], hi.swap_bytes(), lo.swap_bytes()))
+    }
+}
+
+#[cfg_attr(all(target_arch = "x86_64", target_feature = "avx2"), allow(dead_code))]
+#[inline]
+fn hex_shape_scalar(s: &[u8]) -> Option<(u8, u64, u64)> {
+    if s.len() != 33 {
+        return None;
+    }
     // branch-free: a table maps each byte to its nibble or 0x10 (not lowercase hex)
     static HEXV: [u8; 256] = {
         let mut t = [0x10u8; 256];
@@ -535,6 +575,35 @@ mod ptr_tests {
         }
         assert!(is_ptr(local_key(mk(ids[0]))) && !is_ptr(local_key(mk("short"))));
         assert_ne!(id_hash_key(local_key(mk(ids[0]))), EMPTY);
+    }
+}
+
+#[cfg(test)]
+mod hex_tests {
+    #[test]
+    fn hex_shape_matches_scalar() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        let alpha = b"0123456789abcdef";
+        for i in 0..200_000 {
+            let mut s = [0u8; 33];
+            s[0] = (next() % 256) as u8;
+            for c in s[1..].iter_mut() { *c = alpha[(next() % 16) as usize]; }
+            if i % 2 == 1 {
+                // one or more arbitrary bytes anywhere (all 256 values over the run)
+                for _ in 0..(1 + next() % 3) { let k = 1 + (next() % 32) as usize; s[k] = (next() % 256) as u8; }
+            }
+            assert_eq!(super::hex_shape(&s), super::hex_shape_scalar(&s), "{:?}", s);
+        }
+        // every byte value at every position
+        for k in 1..33 {
+            for b in 0..=255u8 {
+                let mut s = *b"u0123456789abcdef0123456789abcdef";
+                s[k] = b;
+                assert_eq!(super::hex_shape(&s), super::hex_shape_scalar(&s));
+            }
+        }
+        assert_eq!(super::hex_shape(b"u0123456789abcdef0123456789abcdef"), Some((b'u', 0x0123_4567_89ab_cdef, 0x0123_4567_89ab_cdef)));
     }
 }
 
