@@ -83,7 +83,9 @@ Whole-branch checks vs b9481b1: `e450f86` **−17.8% (7/7) / −16.8% (5/5)** on
 branch for lines without quotes (identical output by construction: every quote term is 0). Evidence: `ae7c7a6` (same
 change on 62c0789) vs `62c0789`: **−1.2% (7/7) / −3.8% (4/5)** (EPYC 7763, gate PASS); Docker check PASS (EPYC 9V74:
 image 105 s, 30 MB, uid 1000; 36/36 fixtures and dev MATCH in the container); local gates pass (tests, fixtures, dev,
-fuzz strict + default, MATCH vs b9481b1 at 20M seeds 11/5 and 60M).
+fuzz strict + default, MATCH vs b9481b1 at 20M seeds 11/5 and 60M). Extra exactness sweep (local, vs b9481b1): MATCH on 8 more
+seed/size mixes (seeds 2, 3, 21, 99, 12345, 7, 8, 77; 20K–12M events, 0–4M clicks, incl. no clicks and clicks > events);
+fuzz 4 × 1000 cases (seeds 101–203, strict and default), 0 failures; NCPU 1, 2, 3, 7, 16 all MATCH on 20M seed 5.
 
 Parent: **`62c0789a07146806e3d885f0af7afffe8eb2c6f3`** (branch `opt/v2-fast`; also `docker/v3-size`) = `b9d02ae` + scan partition
 buffers sized for the new line lengths (events ~82 B, clicks ~53 B; overflow still spills, so output cannot change).
