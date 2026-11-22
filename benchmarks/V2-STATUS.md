@@ -83,7 +83,8 @@ Whole-branch checks vs b9481b1: `e450f86` **−17.8% (7/7) / −16.8% (5/5)** on
 branch for lines without quotes (identical output by construction: every quote term is 0). Evidence: `ae7c7a6` (same
 change on 62c0789) vs `62c0789`: **−1.2% (7/7) / −3.8% (4/5)** (EPYC 7763, gate PASS); Docker check PASS (EPYC 9V74:
 image 105 s, 30 MB, uid 1000; 36/36 fixtures and dev MATCH in the container); local gates pass (tests, fixtures, dev,
-fuzz strict + default, MATCH vs b9481b1 at 20M seeds 11/5 and 60M). Extra exactness sweep (local, vs b9481b1): MATCH on 8 more
+fuzz strict + default, MATCH vs b9481b1 at 20M seeds 11/5 and 60M). Cumulative check: `298e7c4` vs `c48f601`
+(the best before THP) **−8.6% (7/7) / −3.3% (3/5)** (Xeon 8370C, gate PASS). Extra exactness sweep (local, vs b9481b1): MATCH on 8 more
 seed/size mixes (seeds 2, 3, 21, 99, 12345, 7, 8, 77; 20K–12M events, 0–4M clicks, incl. no clicks and clicks > events);
 fuzz 4 × 1000 cases (seeds 101–203, strict and default), 0 failures; NCPU 1, 2, 3, 7, 16 all MATCH on 20M seed 5.
 
@@ -111,6 +112,8 @@ Previous (old generator only): `a02705ccf8d8bfff6a09f0311a7330018dfeb302` (−17
 
 ## Tried and dropped
 
+- `ab/v3-lk1` (`86deacc`): link pool of ncpu/4 threads. CI vs 298e7c4 (Xeon 6975P): +0.8% (3/7) / −1.0% (3/5):
+  neutral, dropped.
 - `ab/v3-outpar` (`5a2dc02`): campaign_daily written alongside user_daily, 2 × ncpu user files. CI vs 298e7c4
   (Xeon 6975P): −0.8% (3/7) / −0.9% (3/5): neutral, dropped.
 - `ab/v3-pgo` (`b9dc99a`, Docker fix `ed18eed`): PGO from an instrumented rust 1.95 build on 20M data (sparse profile
