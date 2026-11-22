@@ -57,7 +57,7 @@ the fast decoder, no THP advice) **~4.2 s**. All local gates re-run on regenerat
 | NB 512 | `466f6a7` (exp/v2-nb512) | 512 hash partitions | vs 80c1ff3: **+5.2% (0/7)** / +0.5% (Xeon 6975P) — dropped |
 | P2c | `5306bd6` | bit filter of linked users (skip probes for unlinked) | vs 80c1ff3: −1.2% (6/7) / **+4.0% (0/5)** (Xeon 6973P) — reverted |
 | v3 THP again | `b9d02ae` (= `971ee32` on c48f601) | MADV_HUGEPAGE on Parted mappings again | `971ee32` vs c48f601: **−7.1% (7/7)** / +2.8% (1/5) (Xeon 6975P; 60M on disk near the 15 GB runner limit, RSS 12.25 → 13.54 GB; 20M RSS 4.20 → 5.15 GB) — confirm on Xeon 8573C: **−6.4% (7/7)** / +4.3% (1/5); Docker PASS; `b9d02ae` vs b9481b1 **−63.6% (7/7) / −63.2% (5/5)** (EPYC 7763) — kept for the scorer (warm cache, 20M-like) |
-| v3 no-quote fields | (cherry-pick of `ae7c7a6`) | `fields()` skips per-field quote checks when the line has no quote | `ae7c7a6` vs 62c0789: **−1.2% (7/7) / −3.8% (4/5)** (EPYC 7763) — keep |
+| v3 no-quote fields | `298e7c4` (= `ae7c7a6` on 62c0789) | `fields()` skips per-field quote checks when the line has no quote | `ae7c7a6` vs 62c0789: **−1.2% (7/7) / −3.8% (4/5)** (EPYC 7763) — keep; Docker PASS |
 | v3 buffer sizes | `62c0789` (= `9340397` on b9d02ae) | Parted sizes for the new line lengths | `9340397` vs b9d02ae: −0.3% (3/7) / **−3.3% (4/5)** (EPYC 9V74) — keep (less RSS); Docker PASS |
 | v3 EvRec hash | (cherry-pick of `22b466b`) | EvRec carries its dedup hash key (computed at scan) | `22b466b` vs 89c8210: **−4.4% (7/7) / −8.5% (5/5)** (EPYC 9V74) — keep; Docker PASS (`c48f601`) |
 | v3 hex LUT | `89c8210` | branch-free hex check in the interner | vs 2bd0fe0: **−2.8% (5/7) / −4.1% (4/5)** (EPYC 7763) — keep; vs b9481b1 −66.7% / −70.8% (Xeon 6973P); Docker PASS |
@@ -79,7 +79,13 @@ Whole-branch checks vs b9481b1: `e450f86` **−17.8% (7/7) / −16.8% (5/5)** on
 
 ## Best submittable commit
 
-**`62c0789a07146806e3d885f0af7afffe8eb2c6f3`** (branch `opt/v2-fast`; also `docker/v3-size`) = `b9d02ae` + scan partition
+**`298e7c47305fd0e363617a3a30c23cf8581e783f`** (branch `opt/v2-fast`; also `docker/v3-noq`) = `62c0789` + `fields()` fast
+branch for lines without quotes (identical output by construction: every quote term is 0). Evidence: `ae7c7a6` (same
+change on 62c0789) vs `62c0789`: **−1.2% (7/7) / −3.8% (4/5)** (EPYC 7763, gate PASS); Docker check PASS (EPYC 9V74:
+image 105 s, 30 MB, uid 1000; 36/36 fixtures and dev MATCH in the container); local gates pass (tests, fixtures, dev,
+fuzz strict + default, MATCH vs b9481b1 at 20M seeds 11/5 and 60M).
+
+Parent: **`62c0789a07146806e3d885f0af7afffe8eb2c6f3`** (branch `opt/v2-fast`; also `docker/v3-size`) = `b9d02ae` + scan partition
 buffers sized for the new line lengths (events ~82 B, clicks ~53 B; overflow still spills, so output cannot change).
 Evidence: `9340397` (same change on b9d02ae) vs `b9d02ae`: −0.3% (3/7) / **−3.3% (4/5)** (EPYC 9V74), RSS 5.15 → 5.01 /
 13.85 → 13.76 GB; vs b9481b1 **−71.5% (7/7) / −71.1% (5/5)** (EPYC 9V45); Docker check PASS (Xeon 8573C: image 129 s, 30 MB, uid 1000; 36/36 fixtures and dev MATCH in the
@@ -97,7 +103,7 @@ default, MATCH vs b9481b1 at 20M seeds 11/5 and 60M).
 If the scorer is believed to run large data under memory pressure, submit **`c48f601b2ddd6eefda6379963d7ae914ae0c1ca6`**
 instead (no THP; Docker PASS; −4.4% / −8.5% vs 89c8210 on EPYC 9V74).
 
-Fallbacks: `b9d02ae579ac4f2253fc83e16c4f1f2b61c6c14d` (Docker PASS); `c48f601b2ddd6eefda6379963d7ae914ae0c1ca6` (Docker PASS); `89c8210ae518d499bae3426f8e2b3940f8659944` (Docker PASS); `7256f585299799c1e44e925f945bc320c57bc557` (Docker PASS); `2fe13814b373bdebce90afa8b2fb968fde356ec5` (−61.9% / −67.7% vs b9481b1, Docker PASS); `3b0bd10b53239533a05be84ec766d3fca48f7744` (vs b9481b1 −54.2% / −57.1% on Xeon 6975P, Docker PASS).
+Fallbacks: `62c0789a07146806e3d885f0af7afffe8eb2c6f3` (Docker PASS); `b9d02ae579ac4f2253fc83e16c4f1f2b61c6c14d` (Docker PASS); `c48f601b2ddd6eefda6379963d7ae914ae0c1ca6` (Docker PASS); `89c8210ae518d499bae3426f8e2b3940f8659944` (Docker PASS); `7256f585299799c1e44e925f945bc320c57bc557` (Docker PASS); `2fe13814b373bdebce90afa8b2fb968fde356ec5` (−61.9% / −67.7% vs b9481b1, Docker PASS); `3b0bd10b53239533a05be84ec766d3fca48f7744` (vs b9481b1 −54.2% / −57.1% on Xeon 6975P, Docker PASS).
 
 Previous (old generator only): `a02705ccf8d8bfff6a09f0311a7330018dfeb302` (−17.0% / −13.8% vs b9481b1 on EPYC 7763, Docker PASS); `e450f86724aa71882be512bc7ae8ba39bc0fd221` (vs b9481b1 −17.8% / −16.8% on EPYC 7763, Docker PASS); `80c1ff330450e1638a7b29d438a37f71f3b385a9` (−15.9% / −15.7% vs b9481b1 on EPYC 7763, Docker PASS); before that `aead35696f173fa9ba4a2909a00bc01f823f7d0d` (−15.7% / −17.8% on EPYC 7763, Docker PASS).
 
