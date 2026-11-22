@@ -26,6 +26,7 @@ CI runners vary a lot (EPYC 7763 / 9V45 / 9V74, Xeon 8370C / 6975P / 8573C), so 
 | P2c | `5306bd6` | bit filter of linked users (skip probes for unlinked) | vs 80c1ff3: −1.2% (6/7) / **+4.0% (0/5)** (Xeon 6973P) — reverted |
 | PBATCH 64 | `4ad18e2` (ab/v2-pb64) | prefetch batch 32 → 64 | vs e450f86: −0.9% (4/7) / **−2.3% (5/5)** (EPYC 9V45) — take |
 | CHUNK 2 MiB | `788ec62` (ab/v2-chunk2) | scan granule 4 → 2 MiB | vs e450f86: **+6.7% (0/7) / +8.2% (0/5)** (EPYC 9V74) — dropped |
+| P2e hybrid | `33e6bad` (exp/v2-hybrid) | persons in the scan once links are published, flagged rest in dedup | vs a02705c: **+4.5% (0/7) / +2.8% (0/5)** (Xeon 6975P) — dropped |
 | P2d EvC | `0180390` (exp/v2-evc) | 16-byte deduped event layout, generic sessions | vs a02705c: −0.2% (4/7) / **+6.7% (2/5)** (EPYC 7763) — dropped |
 | PBATCH 128 | `8e3e842` (ab/v2-pb128) | prefetch batch 64 → 128 | vs a02705c: −0.2% (4/7) / +0.4% (1/5) (Xeon 6975P) — dropped |
 | 1 link thread | `039fd37` (ab/v2-lk1) | link pool ncpu/4 | vs e450f86: −0.0% (4/7) / −0.7% (4/5) (EPYC 7763) — neutral, keep ncpu/2 |
