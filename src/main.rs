@@ -977,9 +977,13 @@ fn dedup<T: Copy>(parts: &[&[T]], key: impl Fn(&T) -> u64, same: impl Fn(&T, &T)
         let slots = 1usize << bits;
         let mut cnt = vec![0u64; slots / 32]; // 32 two-bit counters per word
         let slot = |k: u64| -> usize { ((packed::fmix(k) >> 8) as usize) & (slots - 1) };
+        // v3: each row's slot is computed once (keys of pointer-keyed IDs hash bytes in the
+        // input mapping: a cache miss per call) and reused by the second pass
+        let mut si: Vec<u32> = Vec::with_capacity(n);
         for part in parts {
             for r in part.iter() {
                 let i = slot(key(r));
+                si.push(i as u32);
                 let (w, sh) = (i >> 5, (i & 31) * 2);
                 let c = (cnt[w] >> sh) & 3;
                 if c < 2 {
@@ -989,9 +993,11 @@ fn dedup<T: Copy>(parts: &[&[T]], key: impl Fn(&T) -> u64, same: impl Fn(&T, &T)
         }
         let mut rest: Vec<T> = Vec::new();
         let mut kept = 0usize;
+        let mut at = 0usize;
         for part in parts {
             for r in part.iter() {
-                let i = slot(key(r));
+                let i = si[at] as usize;
+                at += 1;
                 if (cnt[i >> 5] >> ((i & 31) * 2)) & 3 == 1 {
                     sink(r);
                     kept += 1;
