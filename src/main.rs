@@ -1034,6 +1034,7 @@ fn clicks_scan_items(items: &[([usize; 4], S)], campaigns: &IdMap, lo: i64, hi: 
     items
         .par_iter()
         .map(|(order, chunk)| {
+            alloc::populate_read(chunk);
             let mut sc = ClScan::new(chunk.len(), campaigns, lo, hi, names, arena);
             if fast_ok && is_identity(order) {
                 let len = chunk.len();
@@ -1246,6 +1247,7 @@ fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u
     items
         .par_iter()
         .map(|(order, chunk)| {
+            alloc::populate_read(chunk);
             let mut sc = EvScan::new(chunk.len(), products, unknown_cat, lo, hi, names, arena);
             if fast_ok && is_identity(order) {
                 // v2 P1: shape-specialized fast path; every line it declines takes `exact`
