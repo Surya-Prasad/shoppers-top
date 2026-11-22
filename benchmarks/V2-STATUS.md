@@ -8,8 +8,11 @@ strict + default (0 failures, 150–500 cases each), Parquet MATCH vs b9481b1 on
 
 Caveat: one confirmation run of `a02705c` vs b9481b1 (Xeon 6973P, `ab/v2-final1`) came out +9.3% / +4.8%, but that
 runner was I/O-bound (base 8.3 s at 20M instead of ~2 s; 60M events scan 20.8 s while dedup/sessions ran at normal
-speed: input not in page cache). The scorer's page cache is warm, so this is not representative; more confirmation
-runs queued (`ab/v2-final2`, `ab/v2-final3`).
+speed: input not in page cache). The scorer's page cache is warm, so this is not representative; two more confirmation
+runs (`ab/v2-final2`, `ab/v2-final3`, EPYC 9V74) were I/O-bound the same way (base ~6 s at 20M, ~22 s at 60M) and gave
++0.8% (3/7) / +2.9% (0/5) and +2.3% (1/7) / +2.0% (0/5). So: on warm page cache (all earlier runs, and the scorer per
+public probes) a02705c is 14–18% faster; when the input must be read from disk, it is ~1–9% slower than b9481b1
+(the parse savings vanish behind I/O). Since 02:00 UTC every CI runner has behaved this way.
 
 CI runners vary a lot (EPYC 7763 / 9V45 / 9V74, Xeon 8370C / 6975P / 8573C), so only same-run pairs are compared.
 
