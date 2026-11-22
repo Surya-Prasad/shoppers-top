@@ -233,14 +233,21 @@ fn main() {
     // pool starved the link tasks (RW31); running links first serialized their sequential
     // steps. Clicks are scanned once links are ready (they are partitioned by person there).
     let link_threads = (ncpu / 2).max(1);
-    let (names, event_copies) = std::thread::scope(|sc| {
+    // v2: chunks scanned after the links are published resolve their persons in the scan
+    // (cheap there, behind the scan's memory stalls); earlier ones flag their records for the
+    // events dedup (EvRec::cat bit UNRESOLVED).
+    let names_cell: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
+    let event_copies = std::thread::scope(|sc| {
         let h = sc.spawn(|| {
             let pool = rayon::ThreadPoolBuilder::new().num_threads(link_threads).build().expect("link pool");
-            pool.install(|| resolve_links(lk_src, &stats))
+            let n = pool.install(|| resolve_links(lk_src, &stats));
+            let _ = names_cell.set(n);
         });
-        let e = events_scan(ev_src, &products, unknown_cat, ws, we, None, &stats);
-        (h.join().expect("links thread"), e)
+        let e = events_scan(ev_src, &products, unknown_cat, ws, we, &names_cell, &stats);
+        h.join().expect("links thread");
+        e
     });
+    let names = names_cell.into_inner().expect("links resolved");
     let click_copies = clicks_scan(cl_src, &campaigns, ws - WEEK, we, &names, &stats);
     lap("links resolved + clicks/events scanned");
     if std::env::var("SS_EXP2").is_ok() {
@@ -272,7 +279,7 @@ fn main() {
     lap("clicks");
 
     // ---------------------------------------------------------------- events
-    let events_by_person = events_dedup(event_copies, unknown_cat, Some(&names), &stats);
+    let events_by_person = events_dedup(event_copies, unknown_cat, &names, &stats);
     lap("events");
 
     // ---------------------------------------------------------------- sessions
@@ -1227,7 +1234,7 @@ fn rank_of(ingest: Option<i64>) -> u64 {
 #[allow(clippy::too_many_arguments)]
 /// RW31: event scan. Valid copies carry their *user* key in `person`; persons are resolved
 /// in `events_dedup`, so this can run while links are still being resolved.
-fn events_scan(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: i64, hi: i64, names: Option<&Names>, stats: &Stats) -> ByPerson<EvRec> {
+fn events_scan(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: i64, hi: i64, names: &std::sync::OnceLock<Names>, stats: &Stats) -> ByPerson<EvRec> {
     const NAMES: [&str; 7] = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"];
     let mut st = Stage::start();
     let items = work_items::<7>(src, NAMES);
@@ -1240,11 +1247,11 @@ fn events_scan(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: 
 
 /// The per-chunk events scan (exact path, or v2 P1 fast path with exact fallback).
 #[allow(clippy::too_many_arguments)]
-fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u32, lo: i64, hi: i64, names: Option<&Names>, stats: &Stats, fast_ok: bool) -> Vec<Vec<Vec<EvRec>>> {
+fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u32, lo: i64, hi: i64, names: &std::sync::OnceLock<Names>, stats: &Stats, fast_ok: bool) -> Vec<Vec<Vec<EvRec>>> {
     items
         .par_iter()
         .map(|(order, chunk)| {
-            let mut sc = EvScan::new(chunk.len(), products, unknown_cat, lo, hi, names);
+            let mut sc = EvScan::new(chunk.len(), products, unknown_cat, lo, hi, names.get());
             if fast_ok && is_identity(order) {
                 // v2 P1: shape-specialized fast path; every line it declines takes `exact`
                 let len = chunk.len();
@@ -1349,6 +1356,9 @@ impl<'a> EvScan<'a> {
             if pk != 0 {
                 r.cat = self.products.get_packed(pm, pk).unwrap_or(self.unknown_cat);
             }
+            if self.names.is_none() {
+                r.cat |= UNRESOLVED; // `person` is still the user key
+            }
             self.put(r);
         }
         self.np = 0;
@@ -1434,7 +1444,10 @@ fn fast_enabled() -> bool {
 }
 
 /// RW31: event dedup + person resolution (batched) + repartition by person.
-fn events_dedup(by_eid: ByPerson<EvRec>, unknown_cat: u32, names: Option<&Names>, stats: &Stats) -> ByPerson<EvV> {
+/// v2: flag in `EvRec::cat` of a valid copy whose `person` is still the user key.
+const UNRESOLVED: u32 = 1 << 31;
+
+fn events_dedup(by_eid: ByPerson<EvRec>, unknown_cat: u32, names: &Names, stats: &Stats) -> ByPerson<EvV> {
     let mut st = Stage::start();
     let out: Vec<Vec<Vec<EvV>>> = by_eid
         .into_par_iter()
@@ -1453,17 +1466,17 @@ fn events_dedup(by_eid: ByPerson<EvRec>, unknown_cat: u32, names: Option<&Names>
                     c[r.price as usize] += 1;
                     return;
                 }
-                if r.cat == unknown_cat {
+                let cat = r.cat & !UNRESOLVED;
+                if cat == unknown_cat {
                     c[6] += 1;
                 }
-                match names {
-                    Some(n) => pb.push(n, *r, r.person, &mut emit), // the scan kept the user key
-                    None => emit(*r, r.person),                      // the scan resolved it
+                if r.cat & UNRESOLVED != 0 {
+                    pb.push(names, EvRec { cat, ..*r }, r.person, &mut emit); // user key: resolve now
+                } else {
+                    emit(*r, r.person); // the scan resolved it
                 }
             });
-            if let Some(n) = names {
-                pb.flush(n, &mut emit);
-            }
+            pb.flush(names, &mut emit);
             drop(emit);
             stats.add(K::EvDupCopies, (n - kept) as u64);
             for (k, i) in [(K::EvBadUser, 0), (K::EvBadTs, 1), (K::EvBadType, 2), (K::EvBadProduct, 3), (K::EvBadPrice, 4), (K::EvLate, 5), (K::EvUnknownProduct, 6)] {
@@ -1777,8 +1790,15 @@ mod dedup_tests {
 mod fast_scan_tests {
     use super::*;
 
+    fn ready_names() -> std::sync::OnceLock<Names> {
+        let c = std::sync::OnceLock::new();
+        let _ = c.set(Names::empty());
+        c
+    }
+    /// Records with the UNRESOLVED flag cleared (with no linked IDs a resolved person is the
+    /// user key, so both scans must then agree exactly).
     fn flat(v: Vec<Vec<Vec<EvRec>>>) -> Vec<Vec<(u64, u64, u64, i64, u32, u32)>> {
-        v.into_iter().map(|c| c.into_iter().flatten().map(|r| (r.eid, r.rank, r.person, r.ts, r.price, r.cat)).collect()).collect()
+        v.into_iter().map(|c| c.into_iter().flatten().map(|r| (r.eid, r.rank, r.person, r.ts, r.price, r.cat & !UNRESOLVED)).collect()).collect()
     }
 
     /// v2 P1: the events scan with the fast path gives exactly the records (same order, same
@@ -1816,8 +1836,8 @@ mod fast_scan_tests {
             let chunk: S = Box::leak(buf.into_boxed_slice());
             let items = vec![([0, 1, 2, 3, 4, 5, 6], chunk)];
             let (s1, s2) = (Stats::default(), Stats::default());
-            let a = flat(events_scan_items(&items, &products, 20, lo, hi, Some(&Names::empty()), &s1, true));
-            let b = flat(events_scan_items(&items, &products, 20, lo, hi, Some(&Names::empty()), &s2, false));
+            let a = flat(events_scan_items(&items, &products, 20, lo, hi, &ready_names(), &s1, true));
+            let b = flat(events_scan_items(&items, &products, 20, lo, hi, &std::sync::OnceLock::new(), &s2, false));
             assert_eq!(a, b, "case {case}");
             assert_eq!(s1.json(), s2.json(), "case {case}");
         }
