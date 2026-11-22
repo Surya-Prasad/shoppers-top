@@ -21,7 +21,7 @@ CI runners vary a lot (EPYC 7763 / 9V45 / 9V74, Xeon 8370C / 6975P / 8573C), so 
 | P2b | `70d5eef` | no click dedup (copies identical by rules.md) | vs 571ea2e: −1.6% (6/7) / −0.7% (3/5) (EPYC 9V74) — keep |
 | revert P3 | `537f83e` | back to RW6 sessions sort | vs 70d5eef: **−3.7% (7/7) / −3.6% (3/5)** (EPYC 9V74) |
 | P1c | `9b850aa` | dense product index, same-hour ingest shortcut | vs 537f83e: −0.3% (3/7) / **−5.2% (5/5)** (EPYC 7763) |
-| ClScan | `80c1ff3` | monomorphic clicks loop (no measured change locally) | head vs b9481b1 pending; Docker check pending |
+| ClScan | `80c1ff3` | monomorphic clicks loop (no measured change locally) | vs b9481b1: **−15.9% (7/7) / −15.7% (5/5)** (EPYC 7763); Docker PASS |
 | NB 512 | `466f6a7` (exp/v2-nb512) | 512 hash partitions | vs 80c1ff3: **+5.2% (0/7)** / +0.5% (Xeon 6975P) — dropped |
 | P2c | `5306bd6` | bit filter of linked users (skip probes for unlinked) | vs 80c1ff3 pending |
 
@@ -30,9 +30,13 @@ Whole-branch checks vs b9481b1: `9b850aa` **−14.5% (7/7) / −14.0% (5/5)** on
 
 ## Best submittable commit
 
-`aead35696f173fa9ba4a2909a00bc01f823f7d0d` (branch `opt/v2-fast` history; also `docker/v2-p1b`): CI gate PASS,
-−15.7% / −17.8% vs b9481b1 on EPYC 7763, Docker check PASS (image builds, 36/36 fixtures and dev MATCH in the
-container with scorer flags). To be replaced by a later head once its Docker check and A/B are in.
+**`80c1ff330450e1638a7b29d438a37f71f3b385a9`** (branch `opt/v2-fast` history; also `docker/v2-80c1ff3`).
+Evidence: CI gate PASS (unit tests, 36 fixtures, dev answer, Parquet equal to b9481b1 at 20M and 60M); vs b9481b1 on
+EPYC 7763 **−15.9% (7/7) at 20M, −15.7% (5/5) at 60M**; Docker check PASS (native x86 image build, 116 s, 30 MB,
+uid 1000; 36/36 fixtures and dev MATCH in the container with the scorer flags). Local gates: all pass (fuzz strict +
+default 0 failures; MATCH vs b9481b1 on 20M seed 11, 20M seed 5, 60M seed 11).
+
+Previous: `aead35696f173fa9ba4a2909a00bc01f823f7d0d` (−15.7% / −17.8% on EPYC 7763, Docker PASS).
 
 ## Tried and dropped
 
