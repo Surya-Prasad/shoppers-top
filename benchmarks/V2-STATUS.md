@@ -56,7 +56,7 @@ the fast decoder, no THP advice) **~4.2 s**. All local gates re-run on regenerat
 | ClScan | `80c1ff3` | monomorphic clicks loop (no measured change locally) | vs b9481b1: **−15.9% (7/7) / −15.7% (5/5)** (EPYC 7763); Docker PASS |
 | NB 512 | `466f6a7` (exp/v2-nb512) | 512 hash partitions | vs 80c1ff3: **+5.2% (0/7)** / +0.5% (Xeon 6975P) — dropped |
 | P2c | `5306bd6` | bit filter of linked users (skip probes for unlinked) | vs 80c1ff3: −1.2% (6/7) / **+4.0% (0/5)** (Xeon 6973P) — reverted |
-| v3 EvRec hash | (cherry-pick of `22b466b`) | EvRec carries its dedup hash key (computed at scan) | `22b466b` vs 89c8210: **−4.4% (7/7) / −8.5% (5/5)** (EPYC 9V74) — keep; Docker pending |
+| v3 EvRec hash | (cherry-pick of `22b466b`) | EvRec carries its dedup hash key (computed at scan) | `22b466b` vs 89c8210: **−4.4% (7/7) / −8.5% (5/5)** (EPYC 9V74) — keep; Docker PASS (`c48f601`) |
 | v3 hex LUT | `89c8210` | branch-free hex check in the interner | vs 2bd0fe0: **−2.8% (5/7) / −4.1% (4/5)** (EPYC 7763) — keep; vs b9481b1 −66.7% / −70.8% (Xeon 6973P); Docker PASS |
 | v3 interner slots | `2bd0fe0` | hex IDs matched by value in the slot, others by address (one line per lookup) | vs 7256f58: **−3.3% (7/7) / −4.6% (5/5)** (Xeon 6975P) — keep; vs b9481b1 −55.7% / −60.8% (EPYC 7763) |
 | v3 dedup slots once | `7256f58` | filter slot per row computed once | vs 2fe1381: **−5.5% (6/7) / −3.0% (5/5)** (EPYC 9V74) — keep; Docker PASS |
@@ -76,13 +76,13 @@ Whole-branch checks vs b9481b1: `e450f86` **−17.8% (7/7) / −16.8% (5/5)** on
 
 ## Best submittable commit
 
-**`89c8210ae518d499bae3426f8e2b3940f8659944`** (branch `opt/v2-fast`; also `docker/v3-89c8210`). Evidence: CI gate PASS;
-vs b9481b1 on the new generator **−66.7% (7/7) at 20M (8.33 → 2.77 s), −70.8% (5/5) at 60M (30.07 → 8.77 s)** on Xeon
-6973P; same-runner chain 7256f58 → 2bd0fe0 −3.3% / −4.6% → 89c8210 −2.8% / −4.1%; Docker check PASS (Xeon 6975P: image
-builds in 106 s, 30 MB, uid 1000; 36/36 fixtures and new dev MATCH in the container with scorer flags). Local gates pass.
-Next in line: `c48f601b2ddd6eefda6379963d7ae914ae0c1ca6` (+ EvRec hash, −4.4% / −8.5% vs 89c8210), Docker check pending.
+**`c48f601b2ddd6eefda6379963d7ae914ae0c1ca6`** (branch `opt/v2-fast`; also `docker/v3-c48f601`) = `89c8210` + EvRec dedup
+hash computed at scan. Evidence: same-runner vs `89c8210` **−4.4% (7/7) / −8.5% (5/5)** on EPYC 9V74 (gate PASS);
+`89c8210` vs b9481b1 on the new generator **−66.7% (7/7) / −70.8% (5/5)** on Xeon 6973P; Docker check PASS (EPYC 7763:
+image builds in 122 s, 30 MB, uid 1000; 36/36 fixtures and new dev MATCH in the container with scorer flags). Local
+gates pass (fixtures, new dev answer, fuzz strict + default, MATCH vs b9481b1 at 20M seeds 11/5 and 60M).
 
-Fallbacks: `7256f585299799c1e44e925f945bc320c57bc557` (Docker PASS); `2fe13814b373bdebce90afa8b2fb968fde356ec5` (−61.9% / −67.7% vs b9481b1, Docker PASS); `3b0bd10b53239533a05be84ec766d3fca48f7744` (vs b9481b1 −54.2% / −57.1% on Xeon 6975P, Docker PASS).
+Fallbacks: `89c8210ae518d499bae3426f8e2b3940f8659944` (Docker PASS); `7256f585299799c1e44e925f945bc320c57bc557` (Docker PASS); `2fe13814b373bdebce90afa8b2fb968fde356ec5` (−61.9% / −67.7% vs b9481b1, Docker PASS); `3b0bd10b53239533a05be84ec766d3fca48f7744` (vs b9481b1 −54.2% / −57.1% on Xeon 6975P, Docker PASS).
 
 Previous (old generator only): `a02705ccf8d8bfff6a09f0311a7330018dfeb302` (−17.0% / −13.8% vs b9481b1 on EPYC 7763, Docker PASS); `e450f86724aa71882be512bc7ae8ba39bc0fd221` (vs b9481b1 −17.8% / −16.8% on EPYC 7763, Docker PASS); `80c1ff330450e1638a7b29d438a37f71f3b385a9` (−15.9% / −15.7% vs b9481b1 on EPYC 7763, Docker PASS); before that `aead35696f173fa9ba4a2909a00bc01f823f7d0d` (−15.7% / −17.8% on EPYC 7763, Docker PASS).
 
@@ -95,4 +95,5 @@ Previous (old generator only): `a02705ccf8d8bfff6a09f0311a7330018dfeb302` (−17
 - Two interleaved scan cursors per chunk (to overlap per-line latency): slower (twice the write streams).
 - Bulk newline index before per-line decode (`exp/v2-lineidx`, local): 4-thread scan 0.82–0.87 → 0.91–1.00 s; dropped.
 - No dictionary for `user_id` in the Arrow writer (local): no faster, files 32 → 37 MB; dropped.
+- MAP_POPULATE on the partition buffers (local): 2.5 → 2.9 s (populates serially, slack included); dropped.
 - 64-bit-half structural masks: −10% on the mask step only; not kept separately.
