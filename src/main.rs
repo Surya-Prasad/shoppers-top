@@ -55,7 +55,7 @@ const LOG_NB: u32 = 8;
 const NB: usize = 1 << LOG_NB;
 // NB: number of hash partitions; night-11 found 256 best (RW1 keeps it). Partitions take
 // the top LOG_NB bits of fmix(key) (keys::part), disjoint from table-slot bits.
-const CHUNK: usize = 4 << 20; // scan granule, bytes
+const CHUNK: usize = 16 << 20; // scan granule, bytes
 const WIN: usize = 32 << 10; // v4: structural bitmap window (bench only)
 const PF_AHEAD: usize = 1024; // v4: input prefetch distance (bytes)
 const WEEK: i64 = 7 * DAY;
