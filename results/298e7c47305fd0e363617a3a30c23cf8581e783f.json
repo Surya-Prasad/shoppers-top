@@ -1,0 +1,59 @@
+{
+ "base": "c48f601b2ddd6eefda6379963d7ae914ae0c1ca6",
+ "cand": "298e7c47305fd0e363617a3a30c23cf8581e783f",
+ "gate": "pass",
+ "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz x 4",
+ "notes": "",
+ "sizes": {
+  "d20": {
+   "base": [
+    3.3669,
+    3.2111,
+    3.2507,
+    3.2364,
+    3.2054,
+    3.3508,
+    3.2567
+   ],
+   "cand": [
+    2.9279,
+    3.0065,
+    2.9466,
+    2.9762,
+    3.0104,
+    2.9052,
+    2.9718
+   ],
+   "base_median": 3.2507,
+   "cand_median": 2.9718,
+   "delta_pct": -8.58,
+   "cand_wins": 7,
+   "pairs": 7,
+   "base_rss_gb": 4.2,
+   "cand_rss_gb": 5.01
+  },
+  "d60": {
+   "base": [
+    10.4709,
+    10.4337,
+    10.3596,
+    10.7074,
+    10.5012
+   ],
+   "cand": [
+    11.8611,
+    10.6285,
+    10.1075,
+    10.1262,
+    9.6867
+   ],
+   "base_median": 10.4709,
+   "cand_median": 10.1262,
+   "delta_pct": -3.29,
+   "cand_wins": 3,
+   "pairs": 5,
+   "base_rss_gb": 12.25,
+   "cand_rss_gb": 13.64
+  }
+ }
+}
