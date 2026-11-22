@@ -41,9 +41,7 @@ BA=$(build "$BASE"); BB=$(build "$CAND")
 
 # ---- data ----
 "$GEN" --seed 1 --events 1000000 --clicks 250000 --output "$W/d1" >/dev/null
-"$GEN" --seed 11 --events "$EV20" --clicks $((EV20 / 4)) --output "$W/d20" >/dev/null
-"$GEN" --seed 11 --events "$EV60" --clicks $((EV60 / 4)) --output "$W/d60" >/dev/null
-log "data ready: $(du -sh "$W/d20" | cut -f1) / $(du -sh "$W/d60" | cut -f1); free disk $(df -Ph "$W" | awk 'NR==2{print $4}')"
+log "memory: $(free -g | awk '/^Mem:/{print $2" GB total, "$7" GB available"}')"
 
 run() { # bin data out -> prints "wall maxrss_kb rc"
   rm -rf "$3"
@@ -54,7 +52,7 @@ run() { # bin data out -> prints "wall maxrss_kb rc"
   echo "$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.4f", (b-a)/1e9}') $(tail -1 "$W/time.txt") $rc"
 }
 
-# ---- correctness gate ----
+# ---- correctness gate (unit tests, fixtures, dev answer) ----
 GATE=pass; NOTES=()
 ( cd "$REPO" && cargo test --release --locked -q >/dev/null 2>&1 ) || { GATE=fail; NOTES+=("unit tests failed"); }
 fx=$("$PY" scripts/run_fixtures.py fixtures -- "$BB" 2>&1 | tail -1) || true
@@ -62,19 +60,20 @@ fx=$("$PY" scripts/run_fixtures.py fixtures -- "$BB" 2>&1 | tail -1) || true
 read -r _ _ rc < <(run "$BB" "$W/d1" "$W/o-dev")
 dev=$("$PY" scripts/compare.py "$W/o-dev" "$ANS" 2>&1 | tail -1) || true
 [[ "$dev" == "MATCH" && "$rc" == 0 ]] || { GATE=fail; NOTES+=("dev answer: $dev (exit $rc)"); }
+
+# ---- per dataset: generate, compare A vs B, timed warm pairs, delete ----
+# One dataset on disk at a time, so it stays in the page cache (runs became I/O-bound with
+# both the 20M and 60M sets present on runners with less free memory).
+: > "$W/times.tsv"
 for d in d20 d60; do
+  ev=$EV20; n=$PAIRS20; [ $d = d60 ] && { ev=$EV60; n=$PAIRS60; }
+  "$GEN" --seed 11 --events "$ev" --clicks $((ev / 4)) --output "$W/$d" >/dev/null
+  log "$d ready: $(du -sh "$W/$d" | cut -f1); $(free -g | awk '/^Mem:/{print $7" GB available"}')"
   read -r _ _ ra < <(run "$BA" "$W/$d" "$W/oa-$d"); read -r _ _ rb < <(run "$BB" "$W/$d" "$W/ob-$d")
   eq=$("$PY" scripts/compare.py "$W/oa-$d" "$W/ob-$d" 2>&1 | tail -1) || true
   [[ "$eq" == "MATCH" && "$ra" == 0 && "$rb" == 0 ]] || { GATE=fail; NOTES+=("$d A vs B: $eq (exits $ra/$rb)"); }
   rm -rf "$W/oa-$d" "$W/ob-$d"
-done
-log "gate: $GATE ${NOTES[*]:-}"
-
-# ---- timing: interleaved warm pairs (the gate runs above warmed the page cache) ----
-: > "$W/times.tsv"
-if [ "$GATE" = pass ]; then
-  for d in d20 d60; do
-    n=$PAIRS20; [ $d = d60 ] && n=$PAIRS60
+  if [ "$GATE" = pass ]; then
     for i in $(seq 1 "$n"); do
       for side in A B; do
         bin=$BA; [ $side = B ] && bin=$BB
@@ -82,14 +81,12 @@ if [ "$GATE" = pass ]; then
         printf '%s\t%s\t%s\t%s\t%s\n' "$d" "$side" "$wall" "$rss" "$rc" >> "$W/times.tsv"
       done
     done
-  done
-fi
+  fi
+  [ $d = d60 ] || rm -rf "$W/$d"
+done
+log "gate: $GATE ${NOTES[*]:-}"
 grep -hE '^\[|^    ' "$W/o-t.log" 2>/dev/null | tail -30 > "$W/phases.txt" || true
-# x86 per-layer scan cost of the candidate (single thread, 20M), if it supports SS_EXP
-if [ "$GATE" = pass ]; then
-  { echo; echo "x86 single-thread scan layers (candidate, SS_EXP=1, d20):"
-    SS_EXP=1 DATA_DIR="$W/d20" OUTPUT_DIR="$W/o-exp" NCPU=1 timeout 300 "$BB" 2>&1 | grep -E 'ns/line|lines only' || true; } >> "$W/phases.txt"
-fi
+echo "runner memory: $(free -g | awk '/^Mem:/{print $2" GB total"}')" >> "$W/phases.txt"
 "$PY" benchmarks/ab_summary.py "$W/times.tsv" "$BASE" "$CAND" "$GATE" "$W/phases.txt" \
   "$(lscpu | sed -n 's/^Model name: *//p') x $NPROC" "${NOTES[*]:-}" "$T/result.md" "$T/result.json"
 cat "$T/result.md"
