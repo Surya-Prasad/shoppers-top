@@ -388,7 +388,7 @@ fn experiment2(src: &[&'static Source], products: &IdMap, lo: i64, hi: i64) {
     layer("+ product lookup", &mut |p| unsafe { fast::event(p, lo, hi, b'p') }.map(|(l, e)| { acc ^= products.get_packed(packed::fmix(e.product), e.product).unwrap_or(0) as u64; l }));
     let mut parts: Vec<Vec<EvRec>> = (0..NB).map(|_| Vec::with_capacity(lines as usize / NB + 1024)).collect();
     layer("+ push (preallocated)", &mut |p| unsafe { fast::event(p, lo, hi, b'p') }.map(|(l, e)| {
-        parts[keys::part(e.eid, LOG_NB)].push(EvRec { eid: e.eid, rank: e.ingest as u64, person: e.user, ts: e.ts, price: e.price, cat: 0 }); l }));
+        parts[keys::part(e.eid, LOG_NB)].push(EvRec { eid: e.eid, rank: e.ingest as u64, person: e.user, ts: e.ts, price: e.price, cat: 0, hk: 0 }); l }));
     eprintln!("acc {acc} {}", parts.iter().map(Vec::len).sum::<usize>());
 }
 
@@ -515,7 +515,7 @@ fn experiment(src: &[&'static Source], products: &IdMap, lo: i64, hi: i64, names
             if let Some(r) = rec {
                 let f = reorder(r, order);
                 let eid = key_of(f[0]);
-                let r = EvRec { eid, rank: rank_of(parse_ingest(f[3])), person: names.person(key_of(f[1])), ts: timefmt::parse_in(f[2], lo, hi),
+                let r = EvRec { eid, rank: rank_of(parse_ingest(f[3])), person: names.person(key_of(f[1])), ts: timefmt::parse_in(f[2], lo, hi), hk: 0,
                     price: parse_price(f[6]), cat: products.get(f[5]).unwrap_or(0) };
                 parts[keys::part(eid, LOG_NB)].push(r);
             }
@@ -1245,6 +1245,7 @@ struct EvRec {
     ts: i64,
     price: u32, // > 0 iff a valid purchase
     cat: u32,
+    hk: u64, // v3: keys::id_hash_key(eid), set by EvScan::put (bytes are hot there)
 }
 
 /// A valid, deduplicated event, partitioned by person (24 bytes).
@@ -1319,7 +1320,7 @@ fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u
                     // SAFETY: s + SLACK <= len, so the decoder reads inside the chunk
                     if let Some((l, ev)) = unsafe { fast::event(base.add(s), lo, hi, products.dense_prefix()) } {
                         sc.lines += 1;
-                        let r = EvRec { eid: ev.eid, rank: rank_of(Some(ev.ingest)), person: ev.user, ts: ev.ts, price: ev.price, cat: 0 };
+                        let r = EvRec { eid: ev.eid, rank: rank_of(Some(ev.ingest)), person: ev.user, ts: ev.ts, price: ev.price, cat: 0, hk: 0 };
                         if ev.pnum != 0 {
                             // v2: canonical product ID: direct index (no hash, no batch)
                             sc.valid(EvRec { cat: products.get_dense(ev.pnum).unwrap_or(unknown_cat), ..r }, 0, 0);
@@ -1368,7 +1369,7 @@ struct EvScan<'a> {
 
 impl<'a> EvScan<'a> {
     fn new(bytes: usize, products: &'a IdMap, unknown_cat: u32, lo: i64, hi: i64, names: Option<&'a Names>) -> Self {
-        const Z: EvRec = EvRec { eid: 0, rank: 0, person: 0, ts: 0, price: 0, cat: 0 };
+        const Z: EvRec = EvRec { eid: 0, rank: 0, person: 0, ts: 0, price: 0, cat: 0, hk: 0 };
         EvScan {
             parts: Parted::new(bytes / 60 / NB + 32), // v2: event lines ~67 B
             pend: [(Z, 0, 0, 0); PBATCH],
@@ -1384,8 +1385,9 @@ impl<'a> EvScan<'a> {
         }
     }
     #[inline(always)]
-    fn put(&mut self, r: EvRec) {
-        self.parts.push(keys::part(keys::id_hash_key(r.eid), LOG_NB), r);
+    fn put(&mut self, mut r: EvRec) {
+        r.hk = keys::id_hash_key(r.eid);
+        self.parts.push(keys::part(r.hk, LOG_NB), r);
     }
     #[inline(always)]
     fn valid(&mut self, r: EvRec, pk: u64, pm: u64) {
@@ -1440,7 +1442,7 @@ impl<'a> EvScan<'a> {
         }
         let eid = keys::local_key(f[0]); // v3: pointer key when long (dedup compares bytes)
         let ingest = parse_ingest(f[3]);
-        let mut r = EvRec { eid, rank: rank_of(ingest), person: keys::EMPTY, ts: 0, price: 0, cat: 0 };
+        let mut r = EvRec { eid, rank: rank_of(ingest), person: keys::EMPTY, ts: 0, price: 0, cat: 0, hk: 0 };
         // validation of this copy, in the order of rules.md (reason codes for stats)
         let typ = match f[4] {
             b"view" => T_VIEW,
@@ -1518,7 +1520,7 @@ fn events_dedup(by_eid: ByPerson<EvRec>, unknown_cat: u32, names: Option<&Names>
             let mut emit = |r: EvRec, person: u64| {
                 dst.push(keys::part(person, LOG_NB), EvV { person, ts: r.ts, cat: r.cat, price: r.price });
             };
-            let kept = dedup(&parts, |r: &EvRec| keys::id_hash_key(r.eid), |a, b| keys::same_id(a.eid, b.eid), |a, b| a.rank < b.rank, |r| {
+            let kept = dedup(&parts, |r: &EvRec| r.hk, |a, b| keys::same_id(a.eid, b.eid), |a, b| a.rank < b.rank, |r| {
                 if r.person == keys::EMPTY {
                     c[r.price as usize] += 1;
                     return;
@@ -1764,7 +1766,7 @@ mod layout {
     fn record_sizes() {
         eprintln!("EvRec={} EvV={} ClRec={} ClickV={}", std::mem::size_of::<super::EvRec>(),
             std::mem::size_of::<super::EvV>(), std::mem::size_of::<super::ClRec>(), std::mem::size_of::<super::ClickV>());
-        assert_eq!(std::mem::size_of::<super::EvRec>(), 40);
+        assert_eq!(std::mem::size_of::<super::EvRec>(), 48);
         assert_eq!(std::mem::size_of::<super::EvV>(), 24);
     }
 }
