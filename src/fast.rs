@@ -463,6 +463,7 @@ pub struct Cl {
     pub user: u64,
     pub camp: u64, // packed campaign ID (the caller looks it up; a miss goes to the exact path)
     pub ts: i64,
+    pub ulong: (u32, u32), // v4: user field span when longer than 9 bytes (`user` is then 0)
 }
 
 /// Decode the clicks line at `p`: packable non-empty click, user and campaign IDs, `ts`
@@ -471,13 +472,14 @@ pub struct Cl {
 pub unsafe fn click(p: *const u8, lo: i64, hi: i64) -> Option<(usize, Cl)> {
     let (len, f) = unsafe { fields::<4>(p) }?;
     let cid = unsafe { id_local(p, f[0]) }?;
-    let user = unsafe { id(p, f[1]) }?;
+    let un = (f[1].1 - f[1].0) as usize;
+    let (user, ulong) = if un > 9 { (0, f[1]) } else { (unsafe { id(p, f[1]) }?, (0, 0)) };
     let camp = unsafe { id(p, f[2]) }?;
     let ts = crate::timefmt::parse(unsafe { slice(p, f[3]) })?;
     if ts < lo || ts >= hi {
         return None;
     }
-    Some((len, Cl { cid, user, camp, ts }))
+    Some((len, Cl { cid, user, camp, ts, ulong }))
 }
 
 /// Run `fast` on each line of `chunk` that has `SLACK` bytes after its start, and `slow`

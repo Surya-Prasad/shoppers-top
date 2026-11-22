@@ -1044,6 +1044,11 @@ fn clicks_scan_items(items: &[([usize; 4], S)], campaigns: &IdMap, lo: i64, hi: 
                         if let Some((l, c)) = unsafe { fast::click(chunk.as_ptr().add(s), lo, hi) } {
                             if let Some(camp) = campaigns.get_packed(packed::fmix(c.camp), c.camp) {
                                 sc.lines += 1;
+                                if c.ulong.1 > 0 {
+                                    // v4: a long user ID is interned at the batch flush (hint now)
+                                    let u: S = &chunk[s + c.ulong.0 as usize..s + c.ulong.1 as usize];
+                                    sc.ul = (u, keys::hint(u));
+                                }
                                 sc.valid(c.cid, c.user, c.ts, camp);
                                 s += l + 1;
                                 continue;
@@ -1068,6 +1073,10 @@ struct ClScan<'a> {
     // valid copies waiting for their person: (click, user key, user mix); the person slots of a
     // whole batch are prefetched before any lookup runs
     pend: [(ClickV, u64); PBATCH],
+    // v4: long user IDs of the batch (sparse: (row index, bytes, hint)); `ul` is the next row's
+    pend_ul: [(usize, S, keys::Hint); PBATCH],
+    nul: usize,
+    ul: (S, keys::Hint),
     np: usize,
     campaigns: &'a IdMap,
     names: &'a Names,
@@ -1085,6 +1094,9 @@ impl<'a> ClScan<'a> {
         ClScan {
             parts: Parted::in_arena(cl_per(bytes), arena), // v3d: click lines ~53 B (generator 2026-11-22), ~15% room
             pend: [(Z, 0); PBATCH],
+            pend_ul: [(0, &[], keys::Hint::NONE); PBATCH],
+            nul: 0,
+            ul: (&[], keys::Hint::NONE),
             np: 0,
             campaigns,
             names,
@@ -1098,8 +1110,15 @@ impl<'a> ClScan<'a> {
     }
     #[inline(always)]
     fn valid(&mut self, cid: u64, user: u64, ts: i64, camp: u32) {
-        let um = packed::fmix(user);
-        self.names.prefetch(um);
+        let mut um = 0;
+        if self.ul.0.is_empty() {
+            um = packed::fmix(user);
+            self.names.prefetch(um);
+        } else {
+            self.pend_ul[self.nul] = (self.np, self.ul.0, self.ul.1);
+            self.nul += 1;
+            self.ul.0 = &[];
+        }
         // `person` holds the user key until the flush
         self.pend[self.np] = (ClickV { person: user, ts: (ts - self.lo) as u32, cid, camp }, um);
         self.np += 1;
@@ -1109,6 +1128,17 @@ impl<'a> ClScan<'a> {
     }
     #[inline]
     fn flush(&mut self) {
+        // v4: intern the batch's long users first and prefetch their name slots, so every
+        // lookup below finds its slot prefetched
+        for j in 0..self.nul {
+            let (i, u, h) = self.pend_ul[j];
+            let k = keys::intern_hinted(u, &h);
+            let m = packed::fmix(k);
+            self.names.prefetch(m);
+            self.pend[i].0.person = k;
+            self.pend[i].1 = m;
+        }
+        self.nul = 0;
         for i in 0..self.np {
             let (mut c, um) = self.pend[i];
             c.person = self.names.person_mixed(um, c.person);
