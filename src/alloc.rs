@@ -209,18 +209,3 @@ impl Arena {
         Some((self.base + o) as *mut u8)
     }
 }
-
-/// v4: map the page-cache pages of a mapped input range in one call (MADV_POPULATE_READ,
-/// Linux 5.14+) instead of one fault per fault-around block; errors (older kernels) are
-/// ignored, leaving ordinary faults. SS_NOPOP disables it.
-pub fn populate_read(s: &[u8]) {
-    const MADV_POPULATE_READ: libc::c_int = 22;
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if s.is_empty() || *OFF.get_or_init(|| std::env::var_os("SS_NOPOP").is_some()) {
-        return;
-    }
-    let a = s.as_ptr() as usize & !4095;
-    let e = s.as_ptr() as usize + s.len();
-    // SAFETY: advisory call on pages of a live read-only mapping
-    unsafe { libc::madvise(a as *mut libc::c_void, e - a, MADV_POPULATE_READ) };
-}
