@@ -232,7 +232,7 @@ fn main() {
     // user keys; persons are resolved in the events dedup) runs on the main pool. Sharing one
     // pool starved the link tasks (RW31); running links first serialized their sequential
     // steps. Clicks are scanned once links are ready (they are partitioned by person there).
-    let link_threads = (ncpu / 2).max(1);
+    let link_threads = (ncpu / 4).max(1);
     let (names, event_copies) = std::thread::scope(|sc| {
         let h = sc.spawn(|| {
             let pool = rayon::ThreadPoolBuilder::new().num_threads(link_threads).build().expect("link pool");
