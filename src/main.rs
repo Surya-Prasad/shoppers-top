@@ -1165,6 +1165,11 @@ fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u
                     if let Some((l, ev)) = unsafe { fast::event(base.add(s), lo, hi, products.dense_prefix()) } {
                         sc.lines += 1;
                         let r = EvRec { eid: ev.eid, rank: rank_of(Some(ev.ingest)), person: ev.user, hk: 0, ts: (ev.ts - lo) as u32, pc: ev.price };
+                        // v4: a long user ID is interned at the batch flush (lock and slot prefetched now)
+                        if ev.ulong.1 > 0 {
+                            let u: S = &chunk[s + ev.ulong.0 as usize..s + ev.ulong.1 as usize];
+                            sc.ul = (u, keys::hint(u));
+                        }
                         if ev.pnum != 0 {
                             // v2: canonical product ID: direct index (no hash, no batch)
                             sc.valid(EvRec { pc: r.pc | products.get_dense(ev.pnum).unwrap_or(unknown_cat) << 24, ..r }, 0, 0);
@@ -1199,6 +1204,9 @@ struct EvScan<'a> {
     // RW15/RW32: (row with its user key in `person`, product key or 0, product mix); the
     // product slots of a whole batch are prefetched before any lookup runs
     pend: [(EvRec, u64, u64, u64); PBATCH],
+    // v4: long user IDs of the batch (bytes, interner hint); `ul` is the next row's
+    pend_ul: [(S, keys::Hint); PBATCH],
+    ul: (S, keys::Hint),
     // None: persons are resolved later (events dedup); `person` keeps the user key
     names: Option<&'a Names>,
     np: usize,
@@ -1217,6 +1225,8 @@ impl<'a> EvScan<'a> {
         EvScan {
             parts: Parted::in_arena(ev_per(bytes), arena), // v3d: event lines ~82 B (generator 2026-11-22), ~14% room
             pend: [(Z, 0, 0, 0); PBATCH],
+            pend_ul: [(&[], keys::Hint::NONE); PBATCH],
+            ul: (&[], keys::Hint::NONE),
             names,
             np: 0,
             products,
@@ -1240,11 +1250,12 @@ impl<'a> EvScan<'a> {
         // v2: um = 0 (the mix of no valid key) marks "not linked" (filter bit clear)
         // um = 0 (the mix of no valid key) marks "no lookup" (persons resolved later)
         let mut um = 0;
-        if let Some(names) = self.names {
+        if let (Some(names), true) = (self.names, self.ul.0.is_empty()) {
             um = packed::fmix(r.person);
             names.prefetch(um);
         }
         self.pend[self.np] = (r, pk, pm, um);
+        self.pend_ul[self.np] = std::mem::replace(&mut self.ul, (&[], keys::Hint::NONE));
         self.np += 1;
         if self.np == PBATCH {
             self.flush();
@@ -1254,7 +1265,13 @@ impl<'a> EvScan<'a> {
     fn flush(&mut self) {
         for i in 0..self.np {
             let (mut r, pk, pm, um) = self.pend[i];
-            if um != 0 {
+            let (u, h) = self.pend_ul[i];
+            if !u.is_empty() {
+                r.person = keys::intern_hinted(u, &h);
+                if let Some(n) = self.names {
+                    r.person = n.person(r.person);
+                }
+            } else if um != 0 {
                 r.person = self.names.unwrap().person_mixed(um, r.person);
             }
             if pk != 0 {
@@ -1615,8 +1632,8 @@ mod layout {
     fn record_sizes() {
         eprintln!("EvRec={} EvV={} ClRec={} ClickV={}", std::mem::size_of::<super::EvRec>(),
             std::mem::size_of::<super::EvV>(), std::mem::size_of::<super::ClRec>(), std::mem::size_of::<super::ClickV>());
-        assert_eq!(std::mem::size_of::<super::EvRec>(), 48);
-        assert_eq!(std::mem::size_of::<super::EvV>(), 24);
+        assert_eq!(std::mem::size_of::<super::EvRec>(), 40);
+        assert_eq!(std::mem::size_of::<super::EvV>(), 16);
     }
 }
 
@@ -1808,7 +1825,7 @@ mod fast_click_tests {
             let chunk: S = Box::leak(buf.into_bytes().into_boxed_slice());
             let items = vec![([0, 1, 2, 3], chunk)];
             let (s1, s2) = (Stats::default(), Stats::default());
-            let f = |v: Vec<Parted<ClickV>>| -> Vec<Vec<(u64, u64, i64, u32)>> {
+            let f = |v: Vec<Parted<ClickV>>| -> Vec<Vec<(u64, u64, u32, u32)>> {
                 (0..NB).map(|p| slices(&v, p).into_iter().flatten().map(|r| (r.cid, r.person, r.ts, r.camp)).collect()).collect()
             };
             let a = f(clicks_scan_items(&items, &camps, lo - 7 * DAY, hi, &Names::empty(), &s1, true));

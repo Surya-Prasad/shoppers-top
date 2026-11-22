@@ -185,6 +185,39 @@ fn hex_shape(s: &[u8]) -> Option<(u8, u64, u64)> {
     if s.len() != 33 {
         return None;
     }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        return hex_shape_avx2(s);
+    }
+    #[allow(unreachable_code)]
+    hex_shape_scalar(s)
+}
+
+/// v4: AVX2 `hex_shape` (s.len() == 33): range checks, nibbles, then pairs to bytes.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+fn hex_shape_avx2(s: &[u8]) -> Option<(u8, u64, u64)> {
+    use std::arch::x86_64::*;
+    unsafe {
+        let v = _mm256_loadu_si256(s.as_ptr().add(1) as *const __m256i);
+        let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+        let l = _mm256_sub_epi8(v, _mm256_set1_epi8(b'a' as i8));
+        let is_d = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+        let is_l = _mm256_cmpeq_epi8(_mm256_min_epu8(l, _mm256_set1_epi8(5)), l);
+        if _mm256_movemask_epi8(_mm256_or_si256(is_d, is_l)) != -1 {
+            return None;
+        }
+        let nib = _mm256_blendv_epi8(_mm256_add_epi8(l, _mm256_set1_epi8(10)), d, is_d);
+        let w = _mm256_maddubs_epi16(nib, _mm256_set1_epi16(0x0110));
+        let p = _mm256_packus_epi16(w, w);
+        let hi = _mm256_extract_epi64::<0>(p) as u64;
+        let lo = _mm256_extract_epi64::<2>(p) as u64;
+        Some((s[0], hi.swap_bytes(), lo.swap_bytes()))
+    }
+}
+
+#[inline]
+fn hex_shape_scalar(s: &[u8]) -> Option<(u8, u64, u64)> {
     // branch-free: a table maps each byte to its nibble or 0x10 (not lowercase hex)
     static HEXV: [u8; 256] = {
         let mut t = [0x10u8; 256];
@@ -214,6 +247,63 @@ fn hex_shape(s: &[u8]) -> Option<(u8, u64, u64)> {
     (bad & 0x10 == 0).then_some((s[0], v[0], v[1]))
 }
 
+/// v4: per-shard (slots address | log2 capacity), published under the shard lock, so a
+/// lookup can prefetch its slot (and the lock) before taking the lock.
+static MIRROR: [std::sync::atomic::AtomicU64; SHARDS] = [const { std::sync::atomic::AtomicU64::new(0) }; SHARDS];
+
+#[inline]
+fn publish(sh: usize, g: &Shard) {
+    let v = (g.slots.as_ptr() as u64) << 6 | g.slots.len().trailing_zeros() as u64;
+    if MIRROR[sh].load(std::sync::atomic::Ordering::Relaxed) != v {
+        MIRROR[sh].store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// v4: a precomputed interner lookup (shape, hash, shard), with its lock and slot prefetched.
+#[derive(Clone, Copy)]
+pub struct Hint {
+    sh: u32,
+    prefix: u8,
+    hex: bool,
+    a: u64, // hi (hex) or byte hash
+    b: u64, // lo (hex)
+}
+
+impl Hint {
+    pub const NONE: Hint = Hint { sh: 0, prefix: 0, hex: false, a: 0, b: 0 };
+}
+
+/// Compute the lookup of the unpackable ID `s` and prefetch what it will touch.
+#[inline]
+pub fn hint(s: S) -> Hint {
+    let (h, hn) = if let Some((prefix, hi, lo)) = hex_shape(s) {
+        let hh = hex_hash(hi, lo);
+        let sh = (crate::packed::fmix(hh ^ prefix as u64) >> (64 - SHARD_BITS)) as u32;
+        (hh, Hint { sh, prefix, hex: true, a: hi, b: lo })
+    } else {
+        let h = byte_hash(s);
+        (h, Hint { sh: (h >> (64 - SHARD_BITS)) as u32, prefix: 0, hex: false, a: h, b: 0 })
+    };
+    let m = MIRROR[hn.sh as usize].load(std::sync::atomic::Ordering::Relaxed);
+    if m != 0 {
+        let base = m >> 6;
+        let mask = (1u64 << (m & 63)) - 1;
+        prefetch_read((base + (h & mask) * 24) as *const u8);
+    }
+    prefetch_read(&shards()[hn.sh as usize] as *const _ as *const u8);
+    hn
+}
+
+/// `intern(s)` with a hint from `hint(s)`.
+#[inline]
+pub fn intern_hinted(s: S, h: &Hint) -> u64 {
+    let sh = h.sh as usize;
+    let mut g = shards()[sh].lock().unwrap();
+    let idx = if h.hex { g.get_or_insert_hex(s, h.prefix, h.a, h.b) } else { g.get_or_insert(s, h.a) };
+    publish(sh, &g);
+    INTERNED | (sh as u64) << 32 | idx as u64
+}
+
 fn shards() -> &'static [Mutex<Shard>] {
     static I: OnceLock<Vec<Mutex<Shard>>> = OnceLock::new();
     I.get_or_init(|| (0..SHARDS).map(|_| Mutex::new(Shard::new())).collect())
@@ -239,16 +329,19 @@ pub fn key_of(s: S) -> u64 {
 }
 
 /// Key of an unpackable ID: INTERNED | shard << 32 | index in the shard.
-#[cold]
 pub fn intern(s: S) -> u64 {
     if let Some((prefix, hi, lo)) = hex_shape(s) {
         let sh = (crate::packed::fmix(hex_hash(hi, lo) ^ prefix as u64) >> (64 - SHARD_BITS)) as usize;
-        let idx = shards()[sh].lock().unwrap().get_or_insert_hex(s, prefix, hi, lo);
+        let mut g = shards()[sh].lock().unwrap();
+        let idx = g.get_or_insert_hex(s, prefix, hi, lo);
+        publish(sh, &g);
         return INTERNED | (sh as u64) << 32 | idx as u64;
     }
     let h = byte_hash(s);
     let sh = (h >> (64 - SHARD_BITS)) as usize;
-    let idx = shards()[sh].lock().unwrap().get_or_insert(s, h);
+    let mut g = shards()[sh].lock().unwrap();
+    let idx = g.get_or_insert(s, h);
+    publish(sh, &g);
     INTERNED | (sh as u64) << 32 | idx as u64
 }
 
@@ -397,6 +490,24 @@ impl KeyMap {
                 return None;
             }
             i = (i + 1) & self.mask;
+        }
+    }
+}
+
+#[cfg(test)]
+mod hex_tests {
+    #[test]
+    fn hex_shape_simd_matches_scalar() {
+        let mut x = 7u64;
+        let alpha = b"0123456789abcdefABCDEFgz/:`@\x00\x7f\xff";
+        for _ in 0..300_000 {
+            let mut v: Vec<u8> = (0..33).map(|_| { x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); b"0123456789abcdef"[(x >> 60) as usize] }).collect();
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            if x >> 62 == 0 {
+                let i = ((x >> 20) % 33) as usize;
+                v[i] = alpha[((x >> 40) as usize) % alpha.len()];
+            }
+            assert_eq!(super::hex_shape(&v), super::hex_shape_scalar(&v), "{v:?}");
         }
     }
 }

@@ -241,6 +241,9 @@ pub struct Ev {
     pub ts: i64,
     pub ingest: i64,
     pub price: u32, // 0 for view/cart
+    /// v4: user ID longer than 9 bytes: its (start, end) in the line and `user` = 0 (the
+    /// caller interns it, batched with prefetch); (0, 0) when `user` is the packed key
+    pub ulong: (u32, u32),
     pub product: u64,
     /// v2: `packed::canon(product, pprefix)` or 0 (not canonical)
     pub pnum: u32,
@@ -254,7 +257,8 @@ pub struct Ev {
 pub unsafe fn event(p: *const u8, lo: i64, hi: i64, pprefix: u8) -> Option<(usize, Ev)> {
     let (len, f) = unsafe { fields::<7>(p) }?;
     let eid = unsafe { id_local(p, f[0]) }?;
-    let user = unsafe { id(p, f[1]) }?;
+    let un = f[1].1 - f[1].0;
+    let (user, ulong) = if un > 9 { (0, f[1]) } else { (unsafe { id(p, f[1]) }?, (0, 0)) };
     let ts = crate::timefmt::parse(unsafe { slice(p, f[2]) })?;
     if ts < lo || ts >= hi {
         return None;
@@ -302,7 +306,7 @@ pub unsafe fn event(p: *const u8, lo: i64, hi: i64, pprefix: u8) -> Option<(usiz
     if ingest.saturating_sub(ts) > crate::timefmt::DAY {
         return None;
     }
-    Some((len, Ev { eid, user, ts, ingest, price, product, pnum }))
+    Some((len, Ev { eid, user, ts, ingest, price, ulong, product, pnum }))
 }
 
 /// A fully valid click line in the documented column order, decoded.
@@ -521,7 +525,8 @@ mod tests {
                 };
                 let lk = crate::keys::local_key(Box::leak(f[0].to_vec().into_boxed_slice()));
                 assert!(crate::keys::same_id(ev.eid, lk) && crate::keys::id_hash_key(ev.eid) == crate::keys::id_hash_key(lk));
-                assert_eq!(Some(ev.user), key(f[1]));
+                let user = if ev.ulong.1 > 0 { key(&buf[ev.ulong.0 as usize..ev.ulong.1 as usize]) } else { Some(ev.user) };
+                assert_eq!(user, key(f[1]));
                 assert_eq!(Some(ev.product), key(f[5]));
                 assert_eq!(ev.pnum, crate::packed::canon(f[5], b'p').unwrap_or(0), "{:?}", String::from_utf8_lossy(f[5]));
                 assert_eq!(Some(ev.ts), crate::timefmt::parse(f[2]));
