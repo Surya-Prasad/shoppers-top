@@ -1,0 +1,59 @@
+{
+ "base": "b9481b11a506d099ebe47963c927c8fe7bbba988",
+ "cand": "d7cc29e1423fa85d9aa229bc275ea2edde45d1e9",
+ "gate": "pass",
+ "cpu": "AMD EPYC 9V74 80-Core Processor x 4",
+ "notes": "",
+ "sizes": {
+  "d20": {
+   "base": [
+    6.2188,
+    6.3009,
+    6.2705,
+    6.5222,
+    6.3645,
+    6.1902,
+    6.5395
+   ],
+   "cand": [
+    6.3616,
+    6.3561,
+    6.4074,
+    6.4001,
+    6.6257,
+    6.226,
+    6.3358
+   ],
+   "base_median": 6.3009,
+   "cand_median": 6.3616,
+   "delta_pct": 0.96,
+   "cand_wins": 2,
+   "pairs": 7,
+   "base_rss_gb": 3.54,
+   "cand_rss_gb": 4.34
+  },
+  "d60": {
+   "base": [
+    24.6632,
+    24.2958,
+    25.2473,
+    25.7232,
+    24.0357
+   ],
+   "cand": [
+    24.1063,
+    24.355,
+    24.2456,
+    24.9679,
+    24.6309
+   ],
+   "base_median": 24.6632,
+   "cand_median": 24.355,
+   "delta_pct": -1.25,
+   "cand_wins": 3,
+   "pairs": 5,
+   "base_rss_gb": 10.63,
+   "cand_rss_gb": 12.9
+  }
+ }
+}
