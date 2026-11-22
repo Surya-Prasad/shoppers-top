@@ -137,3 +137,45 @@ mod tests {
         assert_eq!(w[(5 << 20) - 1], 7);
     }
 }
+/// v2: an anonymous, 2 MiB-aligned mapping of at least `size` bytes advised for transparent
+/// huge pages (`MADV_HUGEPAGE`), zero-filled by the kernel on first touch; returns
+/// (pointer, mapped length) or None. Off Linux: a zeroed system allocation.
+pub fn map_huge(size: usize) -> Option<(*mut u8, usize)> {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let len = size.max(1).div_ceil(HUGE) * HUGE;
+        let raw = libc::mmap(std::ptr::null_mut(), len + HUGE, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
+        if raw == libc::MAP_FAILED {
+            return None;
+        }
+        let a = raw as usize;
+        let p = (a + HUGE - 1) & !(HUGE - 1);
+        if p > a {
+            libc::munmap(raw, p - a);
+        }
+        let tail = a + len + HUGE - (p + len);
+        if tail > 0 {
+            libc::munmap((p + len) as *mut libc::c_void, tail);
+        }
+        libc::madvise(p as *mut libc::c_void, len, libc::MADV_HUGEPAGE);
+        Some((p as *mut u8, len))
+    }
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        let len = size.max(1).div_ceil(4096) * 4096;
+        let p = System.alloc_zeroed(Layout::from_size_align(len, 4096).ok()?);
+        (!p.is_null()).then_some((p, len))
+    }
+}
+
+/// Release a `map_huge` block.
+pub fn unmap_huge(p: *mut u8, len: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::munmap(p as *mut libc::c_void, len);
+    }
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        System.dealloc(p, Layout::from_size_align_unchecked(len, 4096));
+    }
+}
