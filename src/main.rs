@@ -485,6 +485,10 @@ const LINK_SEED: u64 = 0x1319_8A2E_0370_7344;
 /// byte-wise smallest member ID). Holds only IDs whose person differs from themselves.
 pub struct Names {
     parts: Vec<KeyMap>,
+    // v4: one-hash bitset over the mapped keys (~16 bits per key, L2-sized): a clear bit
+    // means "not linked to another name", so the lookup (a cache miss) is skipped
+    filt: Vec<u64>,
+    fmask: u64,
 }
 /// RW31: person resolution in dedup sinks, batched with prefetch: rows carry the user key
 /// in `person` until here; `emit(row, person)` gets the resolved person.
@@ -498,6 +502,9 @@ impl<T: Copy> PersonBatch<T> {
     #[inline]
     fn push(&mut self, names: &Names, row: T, user: u64, emit: &mut impl FnMut(T, u64)) {
         let m = packed::fmix(user);
+        if !names.maybe(m) {
+            return emit(row, user); // v4: not linked: no lookup, no batching
+        }
         names.prefetch(m);
         self.rows.push((row, user, m));
         if self.rows.len() == PBATCH {
@@ -526,6 +533,9 @@ impl<T: Copy> Pending<T> {
     #[inline]
     pub fn push(&mut self, names: &Names, row: T, user: u64, done: &mut impl FnMut(T, u64)) {
         let m = packed::fmix(user);
+        if !names.maybe(m) {
+            return done(row, user); // v4: not linked: no lookup, no batching
+        }
         names.prefetch(m);
         self.rows.push((row, user, m));
         if self.rows.len() == PBATCH {
@@ -544,20 +554,45 @@ impl Names {
     /// No linked IDs (every user is its own person).
     #[cfg(test)]
     pub fn empty() -> Names {
-        Names { parts: (0..NP).map(|_| KeyMap::with_capacity(0)).collect() }
+        Names { parts: (0..NP).map(|_| KeyMap::with_capacity(0)).collect(), filt: vec![0; 1], fmask: 63 }
+    }
+    /// v4: false if the key of mix `m` is surely not in the map.
+    #[inline(always)]
+    fn maybe(&self, m: u64) -> bool {
+        let i = (m >> 3) & self.fmask;
+        // SAFETY: i <= fmask < 64 * filt.len()
+        unsafe { *self.filt.get_unchecked((i >> 6) as usize) >> (i & 63) & 1 != 0 }
+    }
+    fn filter_of(keys: impl Iterator<Item = u64>, n: usize) -> (Vec<u64>, u64) {
+        let bits = (n * 16).next_power_of_two().max(64);
+        let mut f = vec![0u64; bits / 64];
+        let fmask = bits as u64 - 1;
+        for k in keys {
+            let i = (packed::fmix(k) >> 3) & fmask;
+            f[(i >> 6) as usize] |= 1 << (i & 63);
+        }
+        (f, fmask)
     }
     #[inline(always)]
     fn prefetch(&self, m: u64) {
-        self.parts[(m >> 40) as usize & (NP - 1)].prefetch(m);
+        if self.maybe(m) {
+            self.parts[(m >> 40) as usize & (NP - 1)].prefetch(m);
+        }
     }
     #[inline(always)]
     fn person_mixed(&self, m: u64, k: u64) -> u64 {
+        if !self.maybe(m) {
+            return k;
+        }
         self.parts[(m >> 40) as usize & (NP - 1)].get_mixed(m, k).unwrap_or(k)
     }
     /// The person key of a user key (EMPTY stays EMPTY).
     #[inline]
     pub fn person(&self, k: u64) -> u64 {
         let m = packed::fmix(k);
+        if !self.maybe(m) {
+            return k;
+        }
         match self.parts[(m >> 40) as usize & (NP - 1)].get_mixed(m, k) {
             Some(p) => p,
             None => k,
@@ -739,6 +774,8 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
         })
         .collect();
     let mut by_part: Vec<Vec<(u64, u64)>> = (0..NP).map(|_| Vec::new()).collect();
+    let n_mapped: usize = pairs.iter().map(Vec::len).sum();
+    let (filt, fmask) = Names::filter_of(pairs.iter().flatten().map(|&(k, _)| k), n_mapped);
     for v in pairs {
         for (k, nk) in v {
             by_part[(packed::fmix(k) >> 40) as usize & (NP - 1)].push((k, nk));
@@ -758,7 +795,7 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
     stats.add(K::LkIds, n as u64);
     stats.add(K::LkPeopleMultiId, multi);
     stats.add(K::LkLargestPerson, largest);
-    Names { parts }
+    Names { parts, filt, fmask }
 }
 
 // ====================================================================== clicks
