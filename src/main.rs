@@ -12,6 +12,7 @@
 #[allow(dead_code)]
 mod alloc;
 mod dialect;
+mod event_dedup;
 mod fast;
 mod hashing;
 mod keys;
@@ -56,7 +57,7 @@ const NB: usize = 1 << LOG_NB;
 // NB: number of hash partitions; night-11 found 256 best (RW1 keeps it). Partitions take
 // the top LOG_NB bits of fmix(key) (keys::part), disjoint from table-slot bits.
 const CHUNK: usize = 8 << 20; // scan granule, bytes
-const WIN: usize = 32 << 10; // v4: structural bitmap window (bench only)
+const WIN: usize = 32 << 10; // structural bitmap window
 const PF_AHEAD: usize = 1024; // v4: input prefetch distance (bytes)
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 30 * 60 * 1000;
@@ -235,6 +236,7 @@ fn main() {
     lap("reference tables");
 
     // v4: SS_BENCH=1: the events (and clicks) scan alone on one thread, ns per line (profiling only)
+    #[cfg(target_os = "linux")]
     if std::env::var_os("SS_BENCH").is_some() {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
         let st = Stats::default();
@@ -264,7 +266,7 @@ fn main() {
                         if s + 128 > wbase + bn {
                             wbase = s;
                             bn = (WIN + 256).min(c.len() - s);
-                            bm.build(unsafe { base.add(s) }, bn);
+                            bm.build(&c[s..s + bn]);
                         }
                         n += 1;
                         match unsafe { fast::fields_m::<7>(base.add(s), bm.get(s - wbase)) } {
@@ -276,8 +278,10 @@ fn main() {
                 eprintln!("bench layer fields_bm             {:>6.1} ns/line", t.elapsed().as_secs_f64() * 1e9 / n as f64);
                 let t = Instant::now();
                 for (_, c) in &items {
-                    bm.build(c.as_ptr(), c.len());
-                    acc ^= bm.get(100).0 as u64;
+                    if !c.is_empty() {
+                        bm.build(c);
+                        acc ^= unsafe { bm.get(0) }.0 as u64;
+                    }
                 }
                 eprintln!("bench layer build only            {:>6.1} ns/line", t.elapsed().as_secs_f64() * 1e9 / n as f64);
             }
@@ -829,13 +833,31 @@ impl<T: Copy> Parted<T> {
     }
     #[inline(always)]
     pub fn push(&mut self, p: usize, r: T) {
+        self.push_slot(p, r);
+    }
+    /// A stable index within the partition, including rows in its spill vector.
+    #[inline(always)]
+    fn push_slot(&mut self, p: usize, r: T) -> usize {
         let l = self.lens[p] as usize;
         if l < self.per {
             // SAFETY: p < NB and l < per, so the slot is inside the mapping
             unsafe { self.buf.add(p * self.per + l).write(r) };
             self.lens[p] = l as u32 + 1;
+            l
         } else {
-            self.spill[p].push(r);
+            let spill = &mut self.spill[p];
+            let i = self.per + spill.len();
+            spill.push(r);
+            i
+        }
+    }
+    #[inline(always)]
+    fn slot_mut(&mut self, p: usize, i: usize) -> &mut T {
+        if i < self.lens[p] as usize {
+            // SAFETY: the first lens[p] entries of this partition are initialized.
+            unsafe { &mut *self.buf.add(p * self.per + i) }
+        } else {
+            &mut self.spill[p][i - self.per]
         }
     }
     /// Partition p's rows: (slots, spill).
@@ -1243,6 +1265,7 @@ fn events_scan(src: &[&'static Source], products: &IdMap, unknown_cat: u32, lo: 
 #[allow(clippy::too_many_arguments)]
 fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u32, lo: i64, hi: i64, names: Option<&Names>, stats: &Stats, fast_ok: bool) -> Vec<Parted<EvRec>> {
     let arena = arena_for::<EvRec>(items.iter().map(|(_, c)| ev_per(c.len())));
+    let windowed = std::env::var_os("SS_LEGACY_SCAN").is_none();
     items
         .par_iter()
         .map(|(order, chunk)| {
@@ -1252,11 +1275,26 @@ fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u
                 let len = chunk.len();
                 let base = chunk.as_ptr();
                 let mut s = 0usize;
+                let mut bitmaps = windowed.then(fast::Bitmaps::new);
+                let (mut window_start, mut window_end) = (0, 0);
                 while s + fast::SLACK <= len {
                     // v4: software prefetch of the input ahead of the decoder
                     keys::prefetch_read(base.wrapping_add(s + PF_AHEAD));
                     // SAFETY: s + SLACK <= len, so the decoder reads inside the chunk
-                    if let Some((l, res)) = unsafe { fast::event2(base.add(s), lo, hi, products.dense_prefix()) } {
+                    let decoded = if let Some(masks) = &mut bitmaps {
+                        if s + 128 > window_end {
+                            window_start = s;
+                            window_end = (s + WIN + 128).min(len);
+                            masks.build(&chunk[window_start..window_end]);
+                        }
+                        // SAFETY: the window contains the start and all 128 mask bytes.
+                        // The loop also guarantees SLACK readable bytes for the decoder.
+                        unsafe { fast::event_any(base.add(s), masks.get(s - window_start), lo, hi, products.dense_prefix()) }
+                    } else {
+                        // SAFETY: the loop guarantees SLACK readable bytes from s.
+                        unsafe { fast::event2(base.add(s), lo, hi, products.dense_prefix()) }
+                    };
+                    if let Some((l, res)) = decoded {
                         sc.lines += 1;
                         let ev = match res {
                             Ok(ev) => ev,
@@ -1302,17 +1340,24 @@ fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u
 }
 
 /// One chunk's events scan state: partitions by event_id, the product-lookup batch, counters.
+#[derive(Clone, Copy)]
+struct EventLookup {
+    partition: usize,
+    slot: usize,
+    product: u64,
+    product_mix: u64,
+    user_mix: u64,
+    long_user: S,
+    hint: keys::Hint,
+}
+
 struct EvScan<'a> {
     parts: Parted<EvRec>,
-    // RW15/RW32: (row with its user key in `person`, product key or 0, product mix); the
-    // product slots of a whole batch are prefetched before any lookup runs
-    pend: [(EvRec, u64, u64, u64); PBATCH],
-    // v4: long user IDs of the batch (bytes, interner hint); `ul` is the next row's
-    pend_ul: [(S, keys::Hint); PBATCH],
+    // Rows already occupy their partition slots. Only deferred lookups are batched.
+    pend: Vec<EventLookup>,
     ul: (S, keys::Hint),
     // None: persons are resolved later (events dedup); `person` keeps the user key
     names: Option<&'a Names>,
-    np: usize,
     products: &'a IdMap,
     unknown_cat: u32,
     lo: i64,
@@ -1324,14 +1369,11 @@ struct EvScan<'a> {
 
 impl<'a> EvScan<'a> {
     fn new(bytes: usize, products: &'a IdMap, unknown_cat: u32, lo: i64, hi: i64, names: Option<&'a Names>, arena: &alloc::Arena) -> Self {
-        const Z: EvRec = EvRec { eid: 0, rank: 0, person: 0, hk: 0, ts: 0, pc: 0 };
         EvScan {
             parts: Parted::in_arena(ev_per(bytes), arena), // v3d: event lines ~82 B (generator 2026-11-22), ~14% room
-            pend: [(Z, 0, 0, 0); PBATCH],
-            pend_ul: [(&[], keys::Hint::NONE); PBATCH],
+            pend: Vec::with_capacity(PBATCH),
             ul: (&[], keys::Hint::NONE),
             names,
-            np: 0,
             products,
             unknown_cat,
             lo,
@@ -1347,42 +1389,43 @@ impl<'a> EvScan<'a> {
         self.parts.push(keys::part(r.hk, LOG_NB), r);
     }
     #[inline(always)]
-    fn valid(&mut self, r: EvRec, pk: u64, pm: u64) {
-        // v2: links are resolved before the scan, so the person lookup joins this batch
-        // (its slot prefetched now, read at flush); `r.person` holds the user key until then
-        // v2: um = 0 (the mix of no valid key) marks "not linked" (filter bit clear)
-        // um = 0 (the mix of no valid key) marks "no lookup" (persons resolved later)
+    fn valid(&mut self, mut r: EvRec, pk: u64, pm: u64) {
+        r.hk = keys::id_hash_key(r.eid);
+        let partition = keys::part(r.hk, LOG_NB);
+        let slot = self.parts.push_slot(partition, r);
+        if pk == 0 && self.names.is_none() && self.ul.0.is_empty() {
+            return;
+        }
+
         let mut um = 0;
         if let (Some(names), true) = (self.names, self.ul.0.is_empty()) {
             um = packed::fmix(r.person);
             names.prefetch(um);
         }
-        self.pend[self.np] = (r, pk, pm, um);
-        self.pend_ul[self.np] = std::mem::replace(&mut self.ul, (&[], keys::Hint::NONE));
-        self.np += 1;
-        if self.np == PBATCH {
+        let (long_user, hint) = std::mem::replace(&mut self.ul, (&[], keys::Hint::NONE));
+        self.pend.push(EventLookup {
+            partition, slot, product: pk, product_mix: pm, user_mix: um, long_user, hint,
+        });
+        if self.pend.len() == PBATCH {
             self.flush();
         }
     }
     #[inline]
     fn flush(&mut self) {
-        for i in 0..self.np {
-            let (mut r, pk, pm, um) = self.pend[i];
-            let (u, h) = self.pend_ul[i];
-            if !u.is_empty() {
-                r.person = keys::intern_hinted(u, &h);
+        for lookup in self.pend.drain(..) {
+            let row = self.parts.slot_mut(lookup.partition, lookup.slot);
+            if !lookup.long_user.is_empty() {
+                row.person = keys::intern_hinted(lookup.long_user, &lookup.hint);
                 if let Some(n) = self.names {
-                    r.person = n.person(r.person);
+                    row.person = n.person(row.person);
                 }
-            } else if um != 0 {
-                r.person = self.names.unwrap().person_mixed(um, r.person);
+            } else if lookup.user_mix != 0 {
+                row.person = self.names.unwrap().person_mixed(lookup.user_mix, row.person);
             }
-            if pk != 0 {
-                r.pc |= self.products.get_packed(pm, pk).unwrap_or(self.unknown_cat) << 24;
+            if lookup.product != 0 {
+                row.pc |= self.products.get_packed(lookup.product_mix, lookup.product).unwrap_or(self.unknown_cat) << 24;
             }
-            self.put(r);
         }
-        self.np = 0;
     }
     fn finish(mut self, stats: &Stats) -> Parted<EvRec> {
         self.flush();
@@ -1471,6 +1514,7 @@ static LATE_FREE: std::sync::Mutex<Vec<Box<dyn Send>>> = std::sync::Mutex::new(V
 
 fn events_dedup(by_eid: ByPerson<EvRec>, unknown_cat: u32, names: Option<&Names>, stats: &Stats) -> ByPerson<EvV> {
     let mut st = Stage::start();
+    let use_slot_index = std::env::var_os("SS_LEGACY_DEDUP").is_none();
     let dper = |n: usize| n / NB + n / NB / 8 + 32; // v2: room for the spread
     let ns: Vec<usize> = (0..NB).map(|p| by_eid.iter().map(|s| s.part(p).iter().map(|x| x.len()).sum::<usize>()).sum()).collect();
     let arena = arena_for::<EvV>(ns.iter().map(|&n| dper(n)));
@@ -1487,7 +1531,7 @@ fn events_dedup(by_eid: ByPerson<EvRec>, unknown_cat: u32, names: Option<&Names>
             let mut emit = |r: EvRec, person: u64| {
                 dst.push(keys::part(person, LOG_NB), EvV { person, ts: r.ts, pc: r.pc });
             };
-            let kept = dedup(&parts, |r: &EvRec| r.hk, |a, b| keys::same_id(a.eid, b.eid), |a, b| a.rank < b.rank, |r| {
+            let mut sink = |r: &EvRec| {
                 if r.person == keys::EMPTY {
                     c[r.pc as usize] += 1;
                     return;
@@ -1499,6 +1543,14 @@ fn events_dedup(by_eid: ByPerson<EvRec>, unknown_cat: u32, names: Option<&Names>
                     Some(n) => pb.push(n, *r, r.person, &mut emit), // the scan kept the user key
                     None => emit(*r, r.person),                      // the scan resolved it
                 }
+            };
+            let kept = if use_slot_index {
+                event_dedup::select(&parts, &mut sink)
+            } else {
+                None
+            };
+            let kept = kept.unwrap_or_else(|| {
+                dedup(&parts, |r: &EvRec| r.hk, |a, b| keys::same_id(a.eid, b.eid), |a, b| a.rank < b.rank, sink)
             });
             if let Some(n) = names {
                 pb.flush(n, &mut emit);

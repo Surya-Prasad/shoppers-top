@@ -339,7 +339,7 @@ const MB: usize = (WIN + OV) / 64;
 
 /// Bitmasks of `\n`, `,` and `"` for 64 bytes (bit i = byte i).
 #[inline(always)]
-fn masks64(p: &[u8; 64]) -> (u64, u64, u64) {
+pub(crate) fn masks64(p: &[u8; 64]) -> (u64, u64, u64) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         use std::arch::x86_64::*;

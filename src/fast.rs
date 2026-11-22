@@ -81,24 +81,25 @@ impl Bitmaps {
     pub fn new() -> Bitmaps {
         Bitmaps { nl: Vec::new(), c: Vec::new(), q: Vec::new() }
     }
-    /// Build the bitmaps of the `n` bytes at `p` (all readable). Bits past `n` are 0.
+    /// Build the bitmaps for a readable window. Bits past its end are zero.
     #[inline]
-    pub fn build(&mut self, p: *const u8, n: usize) {
+    pub fn build(&mut self, window: &[u8]) {
+        let n = window.len();
         let words = n.div_ceil(64) + 3; // +3: 128-bit reads at any offset < n stay inside
         for v in [&mut self.nl, &mut self.c, &mut self.q] {
-            v.clear();
             v.resize(words, 0);
+            v[n / 64..].fill(0);
         }
         let full = n / 64;
-        for w in 0..full {
-            let (a, b, c) = unsafe { masks64(p.add(64 * w)) };
+        let (blocks, tail) = window.as_chunks::<64>();
+        for (w, block) in blocks.iter().enumerate() {
+            let (a, b, c) = masks64(block);
             self.nl[w] = a;
             self.c[w] = b;
             self.q[w] = c;
         }
-        for i in 64 * full..n {
-            let b = unsafe { *p.add(i) };
-            let (w, bit) = (i / 64, 1u64 << (i % 64));
+        for (i, &b) in tail.iter().enumerate() {
+            let (w, bit) = (full, 1u64 << i);
             if b == b'\n' {
                 self.nl[w] |= bit;
             }
@@ -110,9 +111,11 @@ impl Bitmaps {
             }
         }
     }
-    /// The (newline, comma, quote) masks of the 128 bytes from byte offset `o` (< n).
+    /// The (newline, comma, quote) masks of the 128 bytes from byte offset `o`.
+    ///
+    /// The caller must pass an offset within the built window.
     #[inline(always)]
-    pub fn get(&self, o: usize) -> (u128, u128, u128) {
+    pub unsafe fn get(&self, o: usize) -> (u128, u128, u128) {
         let (w, sh) = (o / 64, (o % 64) as u32);
         let g = |v: &Vec<u64>| -> u128 {
             // SAFETY: w + 2 < words (build adds 3 spare words)
@@ -127,11 +130,12 @@ impl Bitmaps {
 
 /// Masks of `\n`, `,` and `"` over 64 bytes.
 #[inline(always)]
-unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
+fn masks64(block: &[u8; 64]) -> (u64, u64, u64) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     unsafe {
         use std::arch::x86_64::*;
         let (n, c, q) = (_mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'"' as i8));
+        let p = block.as_ptr();
         let v0 = _mm256_loadu_si256(p as *const __m256i);
         let v1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
         let m = |a: __m256i, b: __m256i, k: __m256i| -> u64 {
@@ -140,9 +144,8 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
         (m(v0, v1, n), m(v0, v1, c), m(v0, v1, q))
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-    unsafe {
-        let (a, b, c) = masks128(p);
-        (a as u64, b as u64, c as u64)
+    {
+        crate::dialect::masks64(block)
     }
 }
 
