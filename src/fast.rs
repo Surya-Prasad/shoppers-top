@@ -78,6 +78,23 @@ pub unsafe fn fields<const N: usize>(p: *const u8) -> Option<(usize, [(u32, u32)
     }
     let qn = (q & lm).count_ones();
     let mut out = [(0u32, 0u32); N];
+    if qn == 0 {
+        // v3e: no quote in the line (the usual case): fields are the spans between commas
+        // (the general loop below gives the same result: every q0 and q1 is 0)
+        let mut fs = 0u32;
+        for (j, o) in out.iter_mut().enumerate() {
+            let fe = if j + 1 < N {
+                let t = cm.trailing_zeros();
+                cm &= cm - 1;
+                t
+            } else {
+                e
+            };
+            *o = (fs, fe);
+            fs = fe + 1;
+        }
+        return Some((e as usize, out));
+    }
     let mut fs = 0u32;
     let mut qsum = 0u32;
     let mut ok = true;
