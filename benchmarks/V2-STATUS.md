@@ -111,6 +111,8 @@ Previous (old generator only): `a02705ccf8d8bfff6a09f0311a7330018dfeb302` (−17
 
 ## Tried and dropped
 
+- `ab/v3-qbits` (`065f8d1`): quote tests from the u128 quote mask instead of byte loads. CI vs 298e7c4 (EPYC 9V74):
+  +1.6% (1/7) / +4.8% (1/5): slower (variable u128 shifts), dropped.
 - `ab/v3-hexsimd` (`b742e85`): AVX2 hex-shape check in the interner (lookup 92 → 40 ns in the microbench). CI vs
   62c0789 (EPYC 9V74): −0.9% (5/7) / +1.0% (2/5): neutral, dropped.
 - `ab/v3-lf` (`1620872`): lock-free interner lookups (atomic slot tables; lock only to insert/grow). CI vs c48f601
