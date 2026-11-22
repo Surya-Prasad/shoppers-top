@@ -1,0 +1,5 @@
+# docker check of 7256f585299799c1e44e925f945bc320c57bc557 on Intel(R) Xeon(R) 6975P-C
+- image build: OK in 100s, size 29969901 bytes, user 1000:1000
+- fixtures in container: 36/36 fixtures passed
+- dev set in container: exit 0, 0.44 s, compare: MATCH
+- output files: 4 user_daily, 1 campaign_daily
