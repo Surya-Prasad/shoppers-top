@@ -45,7 +45,10 @@ the fast decoder, no THP advice) **~4.2 s**. All local gates re-run on regenerat
 | ClScan | `80c1ff3` | monomorphic clicks loop (no measured change locally) | vs b9481b1: **−15.9% (7/7) / −15.7% (5/5)** (EPYC 7763); Docker PASS |
 | NB 512 | `466f6a7` (exp/v2-nb512) | 512 hash partitions | vs 80c1ff3: **+5.2% (0/7)** / +0.5% (Xeon 6975P) — dropped |
 | P2c | `5306bd6` | bit filter of linked users (skip probes for unlinked) | vs 80c1ff3: −1.2% (6/7) / **+4.0% (0/5)** (Xeon 6973P) — reverted |
-| v3 long IDs | `3b0bd10` | sharded arena interner; fast decoder interns IDs > 9 bytes; Parted without THP advice | vs b9481b1 (new data): **−54.2% (7/7) / −57.1% (5/5)** (Xeon 6975P); Docker PASS |
+| v3 interner slots | `2bd0fe0` | hex IDs matched by value in the slot, others by address (one line per lookup) | vs 7256f58 pending (micro: lookup 280 → 136 ns) |
+| v3 dedup slots once | `7256f58` | filter slot per row computed once | vs 2fe1381 pending (local dedup 0.62 → 0.53 s) |
+| v3 pointer keys | `2fe1381` | long event/click IDs as pointer keys, no interning | vs 3b0bd10: −2.2% (6/7) / +1.2% (2/5) (Xeon 6975P; 60M input on disk); local −24%; Docker PASS |
+| v3 long IDs | `3b0bd10` | sharded arena interner; fast decoder interns IDs > 9 bytes; Parted without THP advice | vs b9481b1 (new data): **−54.2% (7/7) / −57.1% (5/5)** (Xeon 6975P); vs a02705c: **−52.0% / −56.3%** (EPYC 7763); Docker PASS |
 | v3 Parted | `d7cc29e` | per-source partition buffers on huge-page mappings | vs 599c093: −2.9% (7/7) / −5.0% (5/5) (EPYC 7763, I/O-bound runner); vs 1c0881a: **−3.5% (6/7) / −3.0% (4/5)** (EPYC 7763, 20M on tmpfs) — keep; RSS 60M 11.0 → 12.9 GB |
 | PBATCH 64 | `4ad18e2` (ab/v2-pb64) | prefetch batch 32 → 64 | vs e450f86: −0.9% (4/7) / **−2.3% (5/5)** (EPYC 9V45) — take |
 | CHUNK 2 MiB | `788ec62` (ab/v2-chunk2) | scan granule 4 → 2 MiB | vs e450f86: **+6.7% (0/7) / +8.2% (0/5)** (EPYC 9V74) — dropped |
