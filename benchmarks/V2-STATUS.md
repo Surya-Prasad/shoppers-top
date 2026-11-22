@@ -63,11 +63,13 @@ Whole-branch checks vs b9481b1: `e450f86` **−17.8% (7/7) / −16.8% (5/5)** on
 
 ## Best submittable commit
 
-**`3b0bd10b53239533a05be84ec766d3fca48f7744`** (branch `opt/v2-fast`; also `docker/v3-3b0bd10`): handles the new
-generator's long IDs. Evidence: CI gate PASS (fixtures, new dev answer, Parquet equal to b9481b1 at 20M and 60M);
-vs b9481b1 on the **new** generator **−54.2% (7/7) at 20M (6.402 → 2.934 s), −57.1% (5/5) at 60M (21.69 → 9.30 s)**
-on Xeon 6975P; Docker check PASS (image builds in 106 s, 30 MB, uid 1000; 36/36 fixtures and new dev MATCH in the
-container with scorer flags). Local gates all pass on regenerated data.
+**`2fe13814b373bdebce90afa8b2fb968fde356ec5`** (branch `opt/v2-fast`; also `docker/v3-2fe1381`): long-ID handling plus
+pointer keys for long event and click IDs. Evidence: CI gate PASS; vs b9481b1 on the new generator **−61.9% (7/7) at
+20M (6.753 → 2.572 s), −67.7% (5/5) at 60M (26.84 → 8.68 s)** on EPYC 9V45; same-runner vs `3b0bd10` −2.2% (6/7) /
++1.2% (2/5) on Xeon 6975P; Docker check PASS (image builds, 36/36 fixtures and new dev MATCH in the container with
+scorer flags). Local gates all pass on regenerated data.
+
+Fallback: `3b0bd10b53239533a05be84ec766d3fca48f7744` (vs b9481b1 −54.2% / −57.1% on Xeon 6975P, Docker PASS).
 
 Previous (old generator only): `a02705ccf8d8bfff6a09f0311a7330018dfeb302` (−17.0% / −13.8% vs b9481b1 on EPYC 7763, Docker PASS); `e450f86724aa71882be512bc7ae8ba39bc0fd221` (vs b9481b1 −17.8% / −16.8% on EPYC 7763, Docker PASS); `80c1ff330450e1638a7b29d438a37f71f3b385a9` (−15.9% / −15.7% vs b9481b1 on EPYC 7763, Docker PASS); before that `aead35696f173fa9ba4a2909a00bc01f823f7d0d` (−15.7% / −17.8% on EPYC 7763, Docker PASS).
 
