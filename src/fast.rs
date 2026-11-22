@@ -107,8 +107,9 @@ pub unsafe fn fields<const N: usize>(p: *const u8) -> Option<(usize, [(u32, u32)
             e
         };
         let l = fe - fs;
-        let q0 = (l > 0 && unsafe { *p.add(fs as usize) } == b'"') as u32;
-        let q1 = (l > 1 && unsafe { *p.add(fe as usize - 1) } == b'"') as u32;
+        // v3g: quote tests from the quote mask (bit i set iff byte i is '"'), not byte loads
+        let q0 = (l > 0) as u32 & (q >> fs) as u32 & 1;
+        let q1 = (l > 1) as u32 & (q >> (fe.max(1) - 1)) as u32 & 1;
         ok &= q0 == q1;
         qsum += q0 + q1;
         *o = (fs + q0, fe - q1);
