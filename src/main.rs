@@ -1157,7 +1157,7 @@ impl<'a> ClScan<'a> {
     fn new(bytes: usize, campaigns: &'a IdMap, lo: i64, hi: i64, names: &'a Names) -> Self {
         const Z: ClickV = ClickV { person: 0, ts: 0, cid: 0, camp: 0 };
         ClScan {
-            parts: Parted::new(bytes / 24 / NB + 32), // v2: clicks lines ~26 B
+            parts: Parted::new(bytes / 46 / NB + 32), // v3d: click lines ~53 B (generator 2026-11-22), ~15% room
             pend: [(Z, 0); PBATCH],
             np: 0,
             campaigns,
@@ -1371,7 +1371,7 @@ impl<'a> EvScan<'a> {
     fn new(bytes: usize, products: &'a IdMap, unknown_cat: u32, lo: i64, hi: i64, names: Option<&'a Names>) -> Self {
         const Z: EvRec = EvRec { eid: 0, rank: 0, person: 0, ts: 0, price: 0, cat: 0, hk: 0 };
         EvScan {
-            parts: Parted::new(bytes / 60 / NB + 32), // v2: event lines ~67 B
+            parts: Parted::new(bytes / 72 / NB + 32), // v3d: event lines ~82 B (generator 2026-11-22), ~14% room
             pend: [(Z, 0, 0, 0); PBATCH],
             names,
             np: 0,
