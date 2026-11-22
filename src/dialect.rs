@@ -28,7 +28,7 @@ impl Source {
         // mmap of a zero-length file is an error on Linux; an empty file has no rows.
         // v4: MAP_POPULATE maps every page-cache page up front (one call per file, files opened in
         // parallel) instead of ~one fault per 64 KiB during the scan
-        let pop = std::env::var_os("SS_NOPOP").is_none();
+        let pop = std::env::var_os("SS_POP").is_some();
         let map = if len == 0 {
             None
         } else if pop {
