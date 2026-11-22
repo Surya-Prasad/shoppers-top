@@ -388,6 +388,12 @@ pub fn key_of(s: S) -> u64 {
 /// Key of an unpackable ID: INTERNED | shard << 32 | index in the shard.
 pub fn intern(s: S) -> u64 {
     if let Some((prefix, hi, lo)) = hex_shape(s) {
+        // v4: the lock-free path first (most lookups are of IDs already interned)
+        let hh = hex_hash(hi, lo);
+        let sh = (crate::packed::fmix(hh ^ prefix as u64) >> (64 - SHARD_BITS)) as u32;
+        return intern_hinted(s, &Hint { sh, prefix, hex: true, a: hi, b: lo });
+    }
+    if let Some((prefix, hi, lo)) = hex_shape(s) {
         let sh = (crate::packed::fmix(hex_hash(hi, lo) ^ prefix as u64) >> (64 - SHARD_BITS)) as usize;
         let mut g = shards()[sh].lock().unwrap();
         let idx = g.get_or_insert_hex(s, prefix, hi, lo);

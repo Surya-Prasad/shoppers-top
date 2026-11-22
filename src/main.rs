@@ -465,6 +465,9 @@ fn load_campaigns(src: &'static Source) -> (IdMap, Vec<S>, Vec<S>) {
 
 /// Night-02: number of hash partitions for link IDs (interning and the name map).
 const LP: usize = 64;
+/// v4: partitions of the person-name map: few and large, so each table is huge-page backed
+/// (`alloc::HugeAlloc` maps >= 4 MiB allocations with MADV_HUGEPAGE): no TLB miss per lookup.
+const NP: usize = 4;
 const LINK_SEED: u64 = 0x1319_8A2E_0370_7344;
 
 /// Person keys of linked IDs, split into `LP` partitions so the tables build in parallel.
@@ -531,21 +534,21 @@ impl Names {
     /// No linked IDs (every user is its own person).
     #[cfg(test)]
     pub fn empty() -> Names {
-        Names { parts: (0..LP).map(|_| KeyMap::with_capacity(0)).collect() }
+        Names { parts: (0..NP).map(|_| KeyMap::with_capacity(0)).collect() }
     }
     #[inline(always)]
     fn prefetch(&self, m: u64) {
-        self.parts[(m >> 40) as usize & (LP - 1)].prefetch(m);
+        self.parts[(m >> 40) as usize & (NP - 1)].prefetch(m);
     }
     #[inline(always)]
     fn person_mixed(&self, m: u64, k: u64) -> u64 {
-        self.parts[(m >> 40) as usize & (LP - 1)].get_mixed(m, k).unwrap_or(k)
+        self.parts[(m >> 40) as usize & (NP - 1)].get_mixed(m, k).unwrap_or(k)
     }
     /// The person key of a user key (EMPTY stays EMPTY).
     #[inline]
     pub fn person(&self, k: u64) -> u64 {
         let m = packed::fmix(k);
-        match self.parts[(m >> 40) as usize & (LP - 1)].get_mixed(m, k) {
+        match self.parts[(m >> 40) as usize & (NP - 1)].get_mixed(m, k) {
             Some(p) => p,
             None => k,
         }
@@ -725,10 +728,10 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
             v
         })
         .collect();
-    let mut by_part: Vec<Vec<(u64, u64)>> = (0..LP).map(|_| Vec::new()).collect();
+    let mut by_part: Vec<Vec<(u64, u64)>> = (0..NP).map(|_| Vec::new()).collect();
     for v in pairs {
         for (k, nk) in v {
-            by_part[(packed::fmix(k) >> 40) as usize & (LP - 1)].push((k, nk));
+            by_part[(packed::fmix(k) >> 40) as usize & (NP - 1)].push((k, nk));
         }
     }
     let parts: Vec<KeyMap> = by_part
