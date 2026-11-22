@@ -46,7 +46,7 @@ the fast decoder, no THP advice) **~4.2 s**. All local gates re-run on regenerat
 | NB 512 | `466f6a7` (exp/v2-nb512) | 512 hash partitions | vs 80c1ff3: **+5.2% (0/7)** / +0.5% (Xeon 6975P) — dropped |
 | P2c | `5306bd6` | bit filter of linked users (skip probes for unlinked) | vs 80c1ff3: −1.2% (6/7) / **+4.0% (0/5)** (Xeon 6973P) — reverted |
 | v3 interner slots | `2bd0fe0` | hex IDs matched by value in the slot, others by address (one line per lookup) | vs 7256f58 pending (micro: lookup 280 → 136 ns) |
-| v3 dedup slots once | `7256f58` | filter slot per row computed once | vs 2fe1381: **−5.5% (6/7) / −3.0% (5/5)** (EPYC 9V74) — keep; Docker pending |
+| v3 dedup slots once | `7256f58` | filter slot per row computed once | vs 2fe1381: **−5.5% (6/7) / −3.0% (5/5)** (EPYC 9V74) — keep; Docker PASS |
 | v3 pointer keys | `2fe1381` | long event/click IDs as pointer keys, no interning | vs 3b0bd10: −2.2% (6/7) / +1.2% (2/5) (Xeon 6975P; 60M input on disk); local −24%; Docker PASS |
 | v3 long IDs | `3b0bd10` | sharded arena interner; fast decoder interns IDs > 9 bytes; Parted without THP advice | vs b9481b1 (new data): **−54.2% (7/7) / −57.1% (5/5)** (Xeon 6975P); vs a02705c: **−52.0% / −56.3%** (EPYC 7763); Docker PASS |
 | v3 Parted | `d7cc29e` | per-source partition buffers on huge-page mappings | vs 599c093: −2.9% (7/7) / −5.0% (5/5) (EPYC 7763, I/O-bound runner); vs 1c0881a: **−3.5% (6/7) / −3.0% (4/5)** (EPYC 7763, 20M on tmpfs) — keep; RSS 60M 11.0 → 12.9 GB |
@@ -63,13 +63,13 @@ Whole-branch checks vs b9481b1: `e450f86` **−17.8% (7/7) / −16.8% (5/5)** on
 
 ## Best submittable commit
 
-**`2fe13814b373bdebce90afa8b2fb968fde356ec5`** (branch `opt/v2-fast`; also `docker/v3-2fe1381`): long-ID handling plus
-pointer keys for long event and click IDs. Evidence: CI gate PASS; vs b9481b1 on the new generator **−61.9% (7/7) at
-20M (6.753 → 2.572 s), −67.7% (5/5) at 60M (26.84 → 8.68 s)** on EPYC 9V45; same-runner vs `3b0bd10` −2.2% (6/7) /
-+1.2% (2/5) on Xeon 6975P; Docker check PASS (image builds, 36/36 fixtures and new dev MATCH in the container with
-scorer flags). Local gates all pass on regenerated data.
+**`7256f585299799c1e44e925f945bc320c57bc557`** (branch `opt/v2-fast`; also `docker/v3-7256f58`) = `2fe1381` + dedup filter
+slots computed once. Evidence: CI gate PASS; same-runner vs `2fe1381` **−5.5% (6/7) / −3.0% (5/5)** on EPYC 9V74, and
+`2fe1381` vs b9481b1 on the new generator is **−61.9% (7/7) / −67.7% (5/5)** (EPYC 9V45); Docker check PASS (Xeon
+6975P: image builds in 100 s, 30 MB, uid 1000; 36/36 fixtures and new dev MATCH in the container with scorer flags).
+Local gates pass (fixtures, dev, fuzz strict + default 150 each, MATCH vs b9481b1 at 20M seed 11/5 and 60M).
 
-Fallback: `3b0bd10b53239533a05be84ec766d3fca48f7744` (vs b9481b1 −54.2% / −57.1% on Xeon 6975P, Docker PASS).
+Fallbacks: `2fe13814b373bdebce90afa8b2fb968fde356ec5` (−61.9% / −67.7% vs b9481b1, Docker PASS); `3b0bd10b53239533a05be84ec766d3fca48f7744` (vs b9481b1 −54.2% / −57.1% on Xeon 6975P, Docker PASS).
 
 Previous (old generator only): `a02705ccf8d8bfff6a09f0311a7330018dfeb302` (−17.0% / −13.8% vs b9481b1 on EPYC 7763, Docker PASS); `e450f86724aa71882be512bc7ae8ba39bc0fd221` (vs b9481b1 −17.8% / −16.8% on EPYC 7763, Docker PASS); `80c1ff330450e1638a7b29d438a37f71f3b385a9` (−15.9% / −15.7% vs b9481b1 on EPYC 7763, Docker PASS); before that `aead35696f173fa9ba4a2909a00bc01f823f7d0d` (−15.7% / −17.8% on EPYC 7763, Docker PASS).
 
