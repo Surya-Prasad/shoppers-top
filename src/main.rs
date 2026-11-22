@@ -314,15 +314,19 @@ fn main() {
     // pool starved the link tasks (RW31); running links first serialized their sequential
     // steps. Clicks are scanned once links are ready (they are partitioned by person there).
     let link_threads = (ncpu / 2).max(1);
-    let (names, event_copies) = std::thread::scope(|sc| {
+    // v4: the clicks scan follows the links on their pool, overlapping the events scan's tail
+    let ((names, click_copies), event_copies) = std::thread::scope(|sc| {
         let h = sc.spawn(|| {
             let pool = rayon::ThreadPoolBuilder::new().num_threads(link_threads).build().expect("link pool");
-            pool.install(|| resolve_links(lk_src, &stats))
+            pool.install(|| {
+                let names = resolve_links(lk_src, &stats);
+                let cl = clicks_scan(cl_src, &campaigns, ws - WEEK, we, &names, &stats);
+                (names, cl)
+            })
         });
         let e = events_scan(ev_src, &products, unknown_cat, ws, we, None, &stats);
         (h.join().expect("links thread"), e)
     });
-    let click_copies = clicks_scan(cl_src, &campaigns, ws - WEEK, we, &names, &stats);
     lap("links resolved + clicks/events scanned");
 
     // v2: nothing reads the events/clicks/links mappings after the scans (records hold keys;
