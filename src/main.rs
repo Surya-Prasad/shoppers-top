@@ -363,23 +363,22 @@ fn main() {
     // separate per-fold arrays: ~104M assist increments at 60M hit a ~112 KB array that
     // stays in L2 instead of a ~900 KB array of 32-byte cells.
     type Acc = (Vec<[u64; 3]>, Vec<u32>);
-    // v4: a fixed number of blocks, one accumulator each (rayon's fold made one per split,
-    // each a fresh ~1 MB allocation)
-    let nblk = (ncpu * 4).min(NB);
-    let folded: Vec<(Vec<Vec<output::UserRow>>, Acc)> = (0..nblk)
+    // v4: partitions are scheduled one at a time (no idle tail of fixed blocks) and each
+    // pool thread adds into its own accumulator (uncontended lock), merged once at the end
+    let nacc = rayon::current_num_threads().max(1);
+    let accs: Vec<std::sync::Mutex<Option<Acc>>> = (0..nacc).map(|_| std::sync::Mutex::new(None)).collect();
+    let user_parts: Vec<Vec<output::UserRow>> = (0..NB)
         .into_par_iter()
-        .map(|k| {
-            let mut acc: Acc = (vec![[0u64; 3]; dense_len], vec![0u32; dense_len]);
-            let rows: Vec<Vec<output::UserRow>> = (k * NB / nblk..(k + 1) * NB / nblk)
-                .map(|b| sessionize(b, &events_by_person, &clicks_by_person, ncamp, day0, ndays, &mut acc.0, &mut acc.1, &stats, ws))
-                .collect();
-            (rows, acc)
+        .with_max_len(1)
+        .map(|b| {
+            let t = rayon::current_thread_index().unwrap_or(0) % nacc;
+            let mut g = accs[t].lock().unwrap();
+            let acc = g.get_or_insert_with(|| (vec![[0u64; 3]; dense_len], vec![0u32; dense_len]));
+            sessionize(b, &events_by_person, &clicks_by_person, ncamp, day0, ndays, &mut acc.0, &mut acc.1, &stats, ws)
         })
         .collect();
     let mut dense = vec![[0u64; 4]; dense_len];
-    let mut user_parts = Vec::with_capacity(NB);
-    for (rows, (cred, assist)) in folded {
-        user_parts.extend(rows);
+    for (cred, assist) in accs.into_iter().filter_map(|m| m.into_inner().unwrap()) {
         for ((d, c), a) in dense.iter_mut().zip(cred.iter()).zip(assist.iter()) {
             d[0] += c[0];
             d[1] += c[1];
