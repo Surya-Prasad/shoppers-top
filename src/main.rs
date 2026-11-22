@@ -56,6 +56,7 @@ const NB: usize = 1 << LOG_NB;
 // NB: number of hash partitions; night-11 found 256 best (RW1 keeps it). Partitions take
 // the top LOG_NB bits of fmix(key) (keys::part), disjoint from table-slot bits.
 const CHUNK: usize = 4 << 20; // scan granule, bytes
+const WIN: usize = 32 << 10; // v4: structural bitmap window (bench only)
 const PF_AHEAD: usize = 1024; // v4: input prefetch distance (bytes)
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 30 * 60 * 1000;
@@ -222,6 +223,76 @@ fn main() {
     let (campaigns, channels, camp_ids) = load_campaigns(camp_src);
     let unknown_cat = cat_names.iter().position(|c| *c == b"unknown").expect("unknown category") as u32;
     lap("reference tables");
+
+    // v4: SS_BENCH=1: the events (and clicks) scan alone on one thread, ns per line (profiling only)
+    if std::env::var_os("SS_BENCH").is_some() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let st = Stats::default();
+        {
+            const NAMES: [&str; 7] = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"];
+            let items = work_items::<7>(ev_src, NAMES);
+            let mut acc = 0u64;
+            let mut layer = |name: &str, f: &mut dyn FnMut(*const u8) -> Option<usize>| {
+                let t = Instant::now();
+                let mut n = 0u64;
+                for (_, c) in &items {
+                    fast::for_each_line_fast(c, |p| { n += 1; f(p) }, |_| {});
+                }
+                eprintln!("bench layer {name:<20} {:>6.1} ns/line", t.elapsed().as_secs_f64() * 1e9 / n as f64);
+            };
+            layer("fields", &mut |p| unsafe { fast::fields::<7>(p) }.map(|(l, f)| { acc ^= f[3].0 as u64; l }));
+            layer("fields", &mut |p| unsafe { fast::fields::<7>(p) }.map(|(l, f)| { acc ^= f[3].0 as u64; l }));
+            {
+                let t = Instant::now();
+                let mut n = 0u64;
+                let mut bm = fast::Bitmaps::new();
+                for (_, c) in &items {
+                    let base = c.as_ptr();
+                    let (mut wbase, mut bn) = (0usize, 0usize);
+                    let mut s = 0usize;
+                    while s + fast::SLACK <= c.len() {
+                        if s + 128 > wbase + bn {
+                            wbase = s;
+                            bn = (WIN + 256).min(c.len() - s);
+                            bm.build(unsafe { base.add(s) }, bn);
+                        }
+                        n += 1;
+                        match unsafe { fast::fields_m::<7>(base.add(s), bm.get(s - wbase)) } {
+                            Some((l, f)) => { acc ^= f[3].0 as u64; s += l + 1; }
+                            None => { s += memchr::memchr(b'\n', &c[s..]).map_or(c.len() - s, |i| i + 1); }
+                        }
+                    }
+                }
+                eprintln!("bench layer fields_bm             {:>6.1} ns/line", t.elapsed().as_secs_f64() * 1e9 / n as f64);
+                let t = Instant::now();
+                for (_, c) in &items {
+                    bm.build(c.as_ptr(), c.len());
+                    acc ^= bm.get(100).0 as u64;
+                }
+                eprintln!("bench layer build only            {:>6.1} ns/line", t.elapsed().as_secs_f64() * 1e9 / n as f64);
+            }
+            layer("event", &mut |p| unsafe { fast::event(p, ws, we, b'p') }.map(|(l, e)| { acc ^= e.eid ^ e.ts as u64 ^ e.user; l }));
+            layer("ts only", &mut |p| unsafe { fast::fields::<7>(p) }.map(|(l, f)| { acc ^= timefmt::parse(unsafe { std::slice::from_raw_parts(p.add(f[2].0 as usize), (f[2].1 - f[2].0) as usize) }).unwrap_or(0) as u64; l }));
+            eprintln!("{acc}");
+        }
+        for rep in 0..2 {
+            let t = Instant::now();
+            let (e, ut, stt) = pool.install(|| {
+                let ru = |w: &mut libc::rusage| unsafe { libc::getrusage(libc::RUSAGE_THREAD, w) };
+                let mut a: libc::rusage = unsafe { std::mem::zeroed() };
+                let mut b: libc::rusage = unsafe { std::mem::zeroed() };
+                ru(&mut a);
+                let e = events_scan(ev_src, &products, unknown_cat, ws, we, None, &st);
+                ru(&mut b);
+                let tv = |x: libc::timeval| x.tv_sec as f64 + x.tv_usec as f64 * 1e-6;
+                (e, tv(b.ru_utime) - tv(a.ru_utime), tv(b.ru_stime) - tv(a.ru_stime))
+            });
+            let lines = (st.get(K::EvLines) / (rep + 1)) as f64;
+            eprintln!("bench events scan: wall {:.1} user {:.1} sys {:.1} ns/line", t.elapsed().as_secs_f64() * 1e9 / lines, ut * 1e9 / lines, stt * 1e9 / lines);
+            std::mem::forget(e);
+        }
+        std::process::exit(0);
+    }
 
     // ---------------------------------------------------------------- identity
     // RW31: links resolve while clicks and events are scanned (the scans carry user keys;

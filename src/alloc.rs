@@ -159,7 +159,9 @@ pub fn map_huge(size: usize) -> Option<(*mut u8, usize)> {
         }
         // v3c: MADV_HUGEPAGE again (re-measured on CI against c48f601; locally it once caused
         // direct-compaction stalls under page-cache pressure)
-        libc::madvise(p as *mut libc::c_void, len, libc::MADV_HUGEPAGE);
+        if std::env::var_os("SS_NOTHP").is_none() {
+            libc::madvise(p as *mut libc::c_void, len, libc::MADV_HUGEPAGE);
+        }
         Some((p as *mut u8, len))
     }
     #[cfg(not(target_os = "linux"))]

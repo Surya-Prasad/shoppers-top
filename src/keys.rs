@@ -63,7 +63,31 @@ pub fn local_key(s: S) -> u64 {
 /// longer than 9 bytes always gives a pointer key, unless it did not fit one, then interned).
 #[inline]
 pub fn id_hash_key(k: u64) -> u64 {
-    if is_ptr(k) { byte_hash(ptr_bytes(k)) | 1 } else { k }
+    if is_ptr(k) { ptr_hash(ptr_bytes(k)) | 1 } else { k }
+}
+
+/// v4: hash of a pointer key's bytes (len >= 1) from direct word loads (an overlapping last
+/// word), no copy into a buffer (that cost a store-forwarding stall per call).
+#[inline]
+fn ptr_hash(s: &[u8]) -> u64 {
+    let n = s.len();
+    let ld = |i: usize| -> u64 { u64::from_le_bytes(s[i..i + 8].try_into().unwrap()) };
+    let mut h = 0x2545_F491_4F6C_DD1Du64 ^ n as u64;
+    if n >= 8 {
+        let mut i = 0;
+        while i + 8 < n {
+            h = crate::packed::fmix(h ^ ld(i));
+            i += 8;
+        }
+        h = crate::packed::fmix(h ^ ld(n - 8));
+    } else {
+        let mut v = 0u64;
+        for (j, &b) in s.iter().enumerate() {
+            v |= (b as u64) << (8 * j);
+        }
+        h = crate::packed::fmix(h ^ v);
+    }
+    h
 }
 
 /// v3: equal IDs (any key kinds produced by `local_key` for the same input).
@@ -115,7 +139,7 @@ impl Shard {
     fn grow(&mut self) {
         let cap = self.slots.len() * 2;
         let old = std::mem::replace(&mut self.slots, vec![(0, 0, 0); cap]);
-        for e in old {
+        for &e in old.iter() {
             if e.2 != 0 {
                 let mut j = (Self::slot_hash(&e) as usize) & (cap - 1);
                 while self.slots[j].2 != 0 {
@@ -124,12 +148,21 @@ impl Shard {
                 self.slots[j] = e;
             }
         }
+        // v4: lock-free readers may still probe the old table (published in MIRROR): keep it
+        std::mem::forget(old);
     }
     fn insert_at(&mut self, j: usize, s: S, mk: impl FnOnce(S, u64) -> (u64, u64, u64)) -> u32 {
         let idx = self.bytes.len() as u32;
         let c = self.copy(s);
         self.bytes.push(c);
-        self.slots[j] = mk(c, idx as u64 + 1);
+        let e = mk(c, idx as u64 + 1);
+        // v4: the tag word last (release), so a lock-free reader that sees it sees the entry
+        let sp = &mut self.slots[j] as *mut (u64, u64, u64) as *mut u64;
+        unsafe {
+            std::sync::atomic::AtomicU64::from_ptr(sp).store(e.0, std::sync::atomic::Ordering::Relaxed);
+            std::sync::atomic::AtomicU64::from_ptr(sp.add(1)).store(e.1, std::sync::atomic::Ordering::Relaxed);
+            std::sync::atomic::AtomicU64::from_ptr(sp.add(2)).store(e.2, std::sync::atomic::Ordering::Release);
+        }
         if self.bytes.len() * 2 > self.slots.len() {
             self.grow();
         }
@@ -255,7 +288,7 @@ static MIRROR: [std::sync::atomic::AtomicU64; SHARDS] = [const { std::sync::atom
 fn publish(sh: usize, g: &Shard) {
     let v = (g.slots.as_ptr() as u64) << 6 | g.slots.len().trailing_zeros() as u64;
     if MIRROR[sh].load(std::sync::atomic::Ordering::Relaxed) != v {
-        MIRROR[sh].store(v, std::sync::atomic::Ordering::Relaxed);
+        MIRROR[sh].store(v, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -298,6 +331,30 @@ pub fn hint(s: S) -> Hint {
 #[inline]
 pub fn intern_hinted(s: S, h: &Hint) -> u64 {
     let sh = h.sh as usize;
+    // v4: lock-free lookup of an already interned hex ID (entries are immutable once tagged;
+    // tables are never freed); a miss takes the lock and re-checks
+    if h.hex {
+        use std::sync::atomic::{AtomicU64, Ordering::{Acquire, Relaxed}};
+        let m = MIRROR[sh].load(Acquire);
+        if m != 0 {
+            let base = (m >> 6) as *mut u64;
+            let mask = (1usize << (m & 63)) - 1;
+            let tag = HEX | (h.prefix as u64) << 32;
+            let mut j = (hex_hash(h.a, h.b) as usize) & mask;
+            loop {
+                // SAFETY: j <= mask, inside a live (possibly old, leaked) table of mask + 1 slots
+                let sp = unsafe { base.add(3 * j) };
+                let c = unsafe { AtomicU64::from_ptr(sp.add(2)) }.load(Acquire);
+                if c == 0 {
+                    break;
+                }
+                if c & !0xffff_ffff == tag && unsafe { AtomicU64::from_ptr(sp) }.load(Relaxed) == h.a && unsafe { AtomicU64::from_ptr(sp.add(1)) }.load(Relaxed) == h.b {
+                    return INTERNED | (sh as u64) << 32 | ((c as u32) - 1) as u64;
+                }
+                j = (j + 1) & mask;
+            }
+        }
+    }
     let mut g = shards()[sh].lock().unwrap();
     let idx = if h.hex { g.get_or_insert_hex(s, h.prefix, h.a, h.b) } else { g.get_or_insert(s, h.a) };
     publish(sh, &g);
