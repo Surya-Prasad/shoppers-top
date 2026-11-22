@@ -280,6 +280,13 @@ fn main() {
                 }
                 eprintln!("bench layer build only            {:>6.1} ns/line", t.elapsed().as_secs_f64() * 1e9 / n as f64);
             }
+            {
+                let (mut tot, mut dec, mut long) = (0u64, 0u64, 0u64);
+                for (_, c) in &items {
+                    fast::for_each_line_fast(c, |p| { tot += 1; unsafe { fast::event2(p, ws, we, b'p') }.map(|(l, _)| l) }, |line| { dec += 1; if line.len() > 127 { long += 1; } });
+                }
+                eprintln!("bench declined {dec} of {tot} ({:.2}%), {long} longer than 127 bytes", 100.0 * dec as f64 / tot as f64);
+            }
             layer("event", &mut |p| unsafe { fast::event(p, ws, we, b'p') }.map(|(l, e)| { acc ^= e.eid ^ e.ts as u64 ^ e.user; l }));
             layer("ts only", &mut |p| unsafe { fast::fields::<7>(p) }.map(|(l, f)| { acc ^= timefmt::parse(unsafe { std::slice::from_raw_parts(p.add(f[2].0 as usize), (f[2].1 - f[2].0) as usize) }).unwrap_or(0) as u64; l }));
             eprintln!("{acc}");
@@ -1043,6 +1050,10 @@ fn clicks_scan_items(items: &[([usize; 4], S)], campaigns: &IdMap, lo: i64, hi: 
                         if let Some((l, c)) = unsafe { fast::click(chunk.as_ptr().add(s), lo, hi) } {
                             if let Some(camp) = campaigns.get_packed(packed::fmix(c.camp), c.camp) {
                                 sc.lines += 1;
+                                if c.ulong.1 > 0 {
+                                    let u: S = &chunk[s + c.ulong.0 as usize..s + c.ulong.1 as usize];
+                                    sc.ul = (u, keys::hint(u));
+                                }
                                 sc.valid(c.cid, c.user, c.ts, camp);
                                 s += l + 1;
                                 continue;
@@ -1067,6 +1078,9 @@ struct ClScan<'a> {
     // valid copies waiting for their person: (click, user key, user mix); the person slots of a
     // whole batch are prefetched before any lookup runs
     pend: [(ClickV, u64); PBATCH],
+    // v4: long user IDs of the batch, interned at the flush (set by the fast path via `ul`)
+    pend_ul: [(S, keys::Hint); PBATCH],
+    ul: (S, keys::Hint),
     np: usize,
     campaigns: &'a IdMap,
     names: &'a Names,
@@ -1084,6 +1098,8 @@ impl<'a> ClScan<'a> {
         ClScan {
             parts: Parted::in_arena(cl_per(bytes), arena), // v3d: click lines ~53 B (generator 2026-11-22), ~15% room
             pend: [(Z, 0); PBATCH],
+            pend_ul: [(&[], keys::Hint::NONE); PBATCH],
+            ul: (&[], keys::Hint::NONE),
             np: 0,
             campaigns,
             names,
@@ -1097,10 +1113,14 @@ impl<'a> ClScan<'a> {
     }
     #[inline(always)]
     fn valid(&mut self, cid: u64, user: u64, ts: i64, camp: u32) {
-        let um = packed::fmix(user);
-        self.names.prefetch(um);
+        let mut um = 0;
+        if self.ul.0.is_empty() {
+            um = packed::fmix(user);
+            self.names.prefetch(um);
+        }
         // `person` holds the user key until the flush
         self.pend[self.np] = (ClickV { person: user, ts: (ts - self.lo) as u32, cid, camp }, um);
+        self.pend_ul[self.np] = std::mem::replace(&mut self.ul, (&[], keys::Hint::NONE));
         self.np += 1;
         if self.np == PBATCH {
             self.flush();
@@ -1110,7 +1130,8 @@ impl<'a> ClScan<'a> {
     fn flush(&mut self) {
         for i in 0..self.np {
             let (mut c, um) = self.pend[i];
-            c.person = self.names.person_mixed(um, c.person);
+            let (u, h) = self.pend_ul[i];
+            c.person = if u.is_empty() { self.names.person_mixed(um, c.person) } else { self.names.person(keys::intern_hinted(u, &h)) };
             self.parts.push(keys::part(c.person, LOG_NB), c);
         }
         self.np = 0;
