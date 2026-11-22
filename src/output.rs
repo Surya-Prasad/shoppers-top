@@ -139,7 +139,7 @@ pub fn write_all(
 
     // user_daily: split into ~ncpu files of similar size, written in parallel
     let total: usize = user_parts.iter().map(Vec::len).sum();
-    let nfiles = ncpu.clamp(1, 16).min(total.max(1));
+    let nfiles = (2 * ncpu).clamp(1, 32).min(total.max(1)); // v4: 2 per thread (balance)
     let per = total.div_ceil(nfiles).max(1);
     let all: Vec<&UserRow> = user_parts.iter().flatten().collect();
     let groups: Vec<&[&UserRow]> = if all.is_empty() { vec![&all[..]] } else { all.chunks(per).collect() };
