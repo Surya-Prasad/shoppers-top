@@ -575,6 +575,10 @@ const LINK_SEED: u64 = 0x1319_8A2E_0370_7344;
 /// byte-wise smallest member ID). Holds only IDs whose person differs from themselves.
 pub struct Names {
     parts: Vec<KeyMap>,
+    // v2: one bit per hash slot, set for every key in `parts` (no false negatives); a clear
+    // bit means "not linked: the person is the user itself" without probing the big table
+    filter: Vec<u64>,
+    fmask: u64,
 }
 /// RW31: person resolution in dedup sinks, batched with prefetch: rows carry the user key
 /// in `person` until here; `emit(row, person)` gets the resolved person.
@@ -634,7 +638,13 @@ impl Names {
     /// No linked IDs (every user is its own person).
     #[cfg(test)]
     pub fn empty() -> Names {
-        Names { parts: (0..LP).map(|_| KeyMap::with_capacity(0)).collect() }
+        Names { parts: (0..LP).map(|_| KeyMap::with_capacity(0)).collect(), filter: vec![0; 1], fmask: 63 }
+    }
+    /// v2: false only for keys that are certainly not in the table.
+    #[inline(always)]
+    fn maybe_linked(&self, m: u64) -> bool {
+        let b = (m >> 20) & self.fmask;
+        (self.filter[(b >> 6) as usize] >> (b & 63)) & 1 != 0
     }
     #[inline(always)]
     fn prefetch(&self, m: u64) {
@@ -834,6 +844,7 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
             by_part[(packed::fmix(k) >> 40) as usize & (LP - 1)].push((k, nk));
         }
     }
+    let by_part_keys: Vec<Vec<u64>> = by_part.par_iter().map(|v| v.iter().map(|x| x.0).collect()).collect();
     let parts: Vec<KeyMap> = by_part
         .into_par_iter()
         .map(|v| {
@@ -848,7 +859,17 @@ fn resolve_links(src: &[&'static Source], stats: &Stats) -> Names {
     stats.add(K::LkIds, n as u64);
     stats.add(K::LkPeopleMultiId, multi);
     stats.add(K::LkLargestPerson, largest);
-    Names { parts }
+    let total: usize = parts.iter().map(KeyMap::len).sum();
+    let fbits = (total * 8).next_power_of_two().max(64);
+    let mut filter = vec![0u64; fbits / 64];
+    let fmask = (fbits - 1) as u64;
+    for v in &by_part_keys {
+        for &k in v {
+            let b = (packed::fmix(k) >> 20) & fmask;
+            filter[(b >> 6) as usize] |= 1 << (b & 63);
+        }
+    }
+    Names { parts, filter, fmask }
 }
 
 // ====================================================================== clicks
@@ -1094,8 +1115,13 @@ impl<'a> ClScan<'a> {
     }
     #[inline(always)]
     fn valid(&mut self, cid: u64, user: u64, ts: i64, camp: u32) {
-        let um = packed::fmix(user);
-        self.names.prefetch(um);
+        // v2: um = 0 (the mix of no valid key) marks "not linked" (filter bit clear)
+        let mut um = packed::fmix(user);
+        if self.names.maybe_linked(um) {
+            self.names.prefetch(um);
+        } else {
+            um = 0;
+        }
         // `person` holds the user key until the flush
         self.pend[self.np] = (ClickV { person: user, ts, cid, camp }, um);
         self.np += 1;
@@ -1107,7 +1133,9 @@ impl<'a> ClScan<'a> {
     fn flush(&mut self) {
         for i in 0..self.np {
             let (mut c, um) = self.pend[i];
-            c.person = self.names.person_mixed(um, c.person);
+            if um != 0 {
+                c.person = self.names.person_mixed(um, c.person);
+            }
             self.parts[keys::part(c.person, LOG_NB)].push(c);
         }
         self.np = 0;
@@ -1314,8 +1342,13 @@ impl<'a> EvScan<'a> {
     fn valid(&mut self, r: EvRec, pk: u64, pm: u64) {
         // v2: links are resolved before the scan, so the person lookup joins this batch
         // (its slot prefetched now, read at flush); `r.person` holds the user key until then
-        let um = packed::fmix(r.person);
-        self.names.prefetch(um);
+        // v2: um = 0 (the mix of no valid key) marks "not linked" (filter bit clear)
+        let mut um = packed::fmix(r.person);
+        if self.names.maybe_linked(um) {
+            self.names.prefetch(um);
+        } else {
+            um = 0;
+        }
         self.pend[self.np] = (r, pk, pm, um);
         self.np += 1;
         if self.np == PBATCH {
@@ -1326,7 +1359,9 @@ impl<'a> EvScan<'a> {
     fn flush(&mut self) {
         for i in 0..self.np {
             let (mut r, pk, pm, um) = self.pend[i];
-            r.person = self.names.person_mixed(um, r.person);
+            if um != 0 {
+                r.person = self.names.person_mixed(um, r.person);
+            }
             if pk != 0 {
                 r.cat = self.products.get_packed(pm, pk).unwrap_or(self.unknown_cat);
             }
