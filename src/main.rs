@@ -56,6 +56,7 @@ const NB: usize = 1 << LOG_NB;
 // NB: number of hash partitions; night-11 found 256 best (RW1 keeps it). Partitions take
 // the top LOG_NB bits of fmix(key) (keys::part), disjoint from table-slot bits.
 const CHUNK: usize = 4 << 20; // scan granule, bytes
+const PF_AHEAD: usize = 1024; // v4: input prefetch distance (bytes)
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 30 * 60 * 1000;
 pub const ORGANIC: u32 = u32::MAX;
@@ -281,18 +282,18 @@ fn main() {
     // separate per-fold arrays: ~104M assist increments at 60M hit a ~112 KB array that
     // stays in L2 instead of a ~900 KB array of 32-byte cells.
     type Acc = (Vec<[u64; 3]>, Vec<u32>);
-    let folded: Vec<(Vec<Vec<output::UserRow>>, Acc)> = (0..NB)
+    // v4: a fixed number of blocks, one accumulator each (rayon's fold made one per split,
+    // each a fresh ~1 MB allocation)
+    let nblk = (ncpu * 4).min(NB);
+    let folded: Vec<(Vec<Vec<output::UserRow>>, Acc)> = (0..nblk)
         .into_par_iter()
-        .fold(
-            || (Vec::new(), (Vec::new(), Vec::new())),
-            |(mut rows, mut acc): (Vec<Vec<output::UserRow>>, Acc), b| {
-                if acc.0.is_empty() {
-                    acc = (vec![[0u64; 3]; dense_len], vec![0u32; dense_len]);
-                }
-                rows.push(sessionize(b, &events_by_person, &clicks_by_person, ncamp, day0, ndays, &mut acc.0, &mut acc.1, &stats, ws));
-                (rows, acc)
-            },
-        )
+        .map(|k| {
+            let mut acc: Acc = (vec![[0u64; 3]; dense_len], vec![0u32; dense_len]);
+            let rows: Vec<Vec<output::UserRow>> = (k * NB / nblk..(k + 1) * NB / nblk)
+                .map(|b| sessionize(b, &events_by_person, &clicks_by_person, ncamp, day0, ndays, &mut acc.0, &mut acc.1, &stats, ws))
+                .collect();
+            (rows, acc)
+        })
         .collect();
     let mut dense = vec![[0u64; 4]; dense_len];
     let mut user_parts = Vec::with_capacity(NB);
@@ -799,6 +800,10 @@ fn slices<T: Copy>(v: &[Parted<T>], p: usize) -> Vec<&[T]> {
 /// about `SUB` copies (more hash bits), so each dedup table (~2*SUB slots) stays in L2.
 /// Stability keeps scan order inside a sub-bucket, so ties still go to the first copy.
 const SUB: usize = 8192;
+thread_local! {
+    /// v4: per-thread singleton-filter buffers (counters, slot of each row), reused
+    static DEDUP_BUF: std::cell::RefCell<(Vec<u64>, Vec<u32>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
 fn dedup<T: Copy>(parts: &[&[T]], key: impl Fn(&T) -> u64, same: impl Fn(&T, &T) -> bool, better: impl Fn(&T, &T) -> bool, mut sink: impl FnMut(&T)) -> usize {
     let n: usize = parts.iter().map(|x| x.len()).sum();
     // RW26: singleton filter. 2-bit saturating counters (0, 1, 2 = "two or more") over
@@ -808,11 +813,14 @@ fn dedup<T: Copy>(parts: &[&[T]], key: impl Fn(&T) -> u64, same: impl Fn(&T, &T)
     if n > 2 * SUB {
         let bits = (n * 8).next_power_of_two().trailing_zeros();
         let slots = 1usize << bits;
-        let mut cnt = vec![0u64; slots / 32]; // 32 two-bit counters per word
+        let (mut cnt, mut si) = DEDUP_BUF.with(|b| std::mem::take(&mut *b.borrow_mut()));
+        cnt.clear();
+        cnt.resize(slots / 32, 0); // 32 two-bit counters per word
         let slot = |k: u64| -> usize { ((packed::fmix(k) >> 8) as usize) & (slots - 1) };
         // v3: each row's slot is computed once (keys of pointer-keyed IDs hash bytes in the
         // input mapping: a cache miss per call) and reused by the second pass
-        let mut si: Vec<u32> = Vec::with_capacity(n);
+        si.clear();
+        si.reserve(n);
         for part in parts {
             for r in part.iter() {
                 let i = slot(key(r));
@@ -839,7 +847,7 @@ fn dedup<T: Copy>(parts: &[&[T]], key: impl Fn(&T) -> u64, same: impl Fn(&T, &T)
                 }
             }
         }
-        drop(cnt);
+        DEDUP_BUF.with(|b| *b.borrow_mut() = (cnt, si));
         // the exact pass runs once over the leftovers (never the filter again)
         return kept + dedup_exact(&[&rest[..]], key, same, better, sink);
     }
@@ -1161,6 +1169,8 @@ fn events_scan_items(items: &[([usize; 7], S)], products: &IdMap, unknown_cat: u
                 let base = chunk.as_ptr();
                 let mut s = 0usize;
                 while s + fast::SLACK <= len {
+                    // v4: software prefetch of the input ahead of the decoder
+                    keys::prefetch_read(base.wrapping_add(s + PF_AHEAD));
                     // SAFETY: s + SLACK <= len, so the decoder reads inside the chunk
                     if let Some((l, ev)) = unsafe { fast::event(base.add(s), lo, hi, products.dense_prefix()) } {
                         sc.lines += 1;
@@ -1425,9 +1435,11 @@ const T_BAD: u8 = 3;
 
 /// RW6: counting sort of the rows of all `parts` into `nbk` buckets, then sort each bucket
 /// with `cmp`. The result is ordered by (bucket, cmp).
-fn bucket_sort<T: Copy>(parts: &[&[T]], n: usize, nbk: usize, bucket: impl Fn(&T) -> usize, sort: impl Fn(&mut [T])) -> (Vec<T>, Vec<u32>) {
+fn bucket_sort<T: Copy>(parts: &[&[T]], n: usize, nbk: usize, bucket: impl Fn(&T) -> usize, sort: impl Fn(&mut [T]), out: &mut Vec<T>, bk: &mut Vec<u32>) -> Vec<u32> {
     // RW27: each row's bucket is computed once (kept in `bk`) and reused for placement
-    let mut bk: Vec<u32> = Vec::with_capacity(n);
+    // v4: `out` and `bk` are per-thread buffers reused across partitions (no fresh pages)
+    bk.clear();
+    bk.reserve(n);
     let mut cnt = vec![0u32; nbk + 1];
     for part in parts {
         for r in part.iter() {
@@ -1440,7 +1452,8 @@ fn bucket_sort<T: Copy>(parts: &[&[T]], n: usize, nbk: usize, bucket: impl Fn(&T
         cnt[i] += cnt[i - 1];
     }
     let starts = cnt.clone();
-    let mut out: Vec<T> = Vec::with_capacity(n);
+    out.clear();
+    out.reserve(n);
     let spare = out.spare_capacity_mut();
     let mut idx = 0usize;
     for part in parts {
@@ -1456,7 +1469,12 @@ fn bucket_sort<T: Copy>(parts: &[&[T]], n: usize, nbk: usize, bucket: impl Fn(&T
     for k in 0..nbk {
         sort(&mut out[starts[k] as usize..starts[k + 1] as usize]);
     }
-    (out, starts)
+    starts
+}
+
+thread_local! {
+    /// v4: per-thread sessionize buffers (events, clicks, bucket ids), reused across partitions
+    static SESS_BUF: std::cell::RefCell<(Vec<EvV>, Vec<ClickV>, Vec<u32>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
 }
 
 fn sessionize(
@@ -1484,14 +1502,16 @@ fn sessionize(
     let bshift = 64 - LOG_NB - nbk.trailing_zeros();
     let bucket = |person: u64| -> usize { ((packed::fmix(person) >> bshift) as usize) & (nbk - 1) };
     // events sort on one u128 key: person, then ts (sign-flipped so unsigned order = signed)
-    let (ev, es) = bucket_sort(&evs_b, n, nbk, |e: &EvV| bucket(e.person), |v: &mut [EvV]| {
+    let bufs = SESS_BUF.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let (mut ev, mut cl, mut bk) = bufs;
+    let es = bucket_sort(&evs_b, n, nbk, |e: &EvV| bucket(e.person), |v: &mut [EvV]| {
         v.sort_unstable_by_key(|e| ((e.person as u128) << 32) | e.ts as u128)
-    });
+    }, &mut ev, &mut bk);
     // clicks: (person, ts asc, click_id desc in byte order), so the last click of a
     // window is the latest one with the byte-wise smallest click_id
-    let (cl, cs) = bucket_sort(&cls_b, nc, nbk, |c: &ClickV| bucket(c.person), |v: &mut [ClickV]| {
+    let cs = bucket_sort(&cls_b, nc, nbk, |c: &ClickV| bucket(c.person), |v: &mut [ClickV]| {
         v.sort_unstable_by(|x, y| (x.person, x.ts).cmp(&(y.person, y.ts)).then_with(|| keys::cmp_bytes(y.cid, x.cid)))
-    });
+    }, &mut cl, &mut bk);
 
     let mut rows: Vec<output::UserRow> = Vec::with_capacity(n / 8 + 16);
     // sliding-window distinct-campaign set: count per campaign + list of active ones
@@ -1618,6 +1638,7 @@ fn sessionize(
         j = pc;
     }
     }
+    SESS_BUF.with(|b| *b.borrow_mut() = (ev, cl, bk));
     stats.add(K::Sessions, sessions_total);
     stats.add(K::CreditedSessions, credited);
     stats.add(K::AssistPairs, assists);

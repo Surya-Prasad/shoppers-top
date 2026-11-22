@@ -26,7 +26,16 @@ impl Source {
         let file = File::open(path)?;
         let len = file.metadata()?.len();
         // mmap of a zero-length file is an error on Linux; an empty file has no rows.
-        let map = if len == 0 { None } else { Some(unsafe { Mmap::map(&file)? }) };
+        // v4: MAP_POPULATE maps every page-cache page up front (one call per file, files opened in
+        // parallel) instead of ~one fault per 64 KiB during the scan
+        let pop = std::env::var_os("SS_NOPOP").is_none();
+        let map = if len == 0 {
+            None
+        } else if pop {
+            Some(unsafe { memmap2::MmapOptions::new().populate().map(&file)? })
+        } else {
+            Some(unsafe { Mmap::map(&file)? })
+        };
         if let Some(m) = &map {
             let _ = m.advise(memmap2::Advice::Sequential);
         }
