@@ -255,8 +255,19 @@ fn main() {
     // v2: nothing reads the events/clicks/links mappings after the scans (records hold keys;
     // interned IDs own copies; products/campaigns stay mapped for output names), so they
     // are unmapped in the background instead of during process teardown.
+
+    // ---------------------------------------------------------------- clicks
+    let clicks_by_person = click_copies; // v2 P2: no click dedup (see clicks_scan_items)
+    lap("clicks");
+
+    // ---------------------------------------------------------------- events
+    let events_by_person = events_dedup(event_copies, unknown_cat, Some(&names), &stats);
+    lap("events");
+    // v3: event and link files are unmapped once the events dedup is done (pointer keys of
+    // long event IDs read them until then); click files stay mapped to the end (pointer keys
+    // of long click IDs break ties in the sessions).
     let unmapper = {
-        let spans: Vec<(usize, usize)> = all[2..].iter().map(|s| (s.bytes().as_ptr() as usize, s.bytes().len())).collect();
+        let spans: Vec<(usize, usize)> = ev_src.iter().chain(lk_src.iter()).map(|s| (s.bytes().as_ptr() as usize, s.bytes().len())).collect();
         std::thread::spawn(move || {
             for (p, l) in spans {
                 if l > 0 {
@@ -266,14 +277,6 @@ fn main() {
             }
         })
     };
-
-    // ---------------------------------------------------------------- clicks
-    let clicks_by_person = click_copies; // v2 P2: no click dedup (see clicks_scan_items)
-    lap("clicks");
-
-    // ---------------------------------------------------------------- events
-    let events_by_person = events_dedup(event_copies, unknown_cat, Some(&names), &stats);
-    lap("events");
 
     // ---------------------------------------------------------------- sessions
     // Night-01: campaign/day accumulators are a dense array per rayon fold (campaign
@@ -963,7 +966,7 @@ fn slices<T: Copy>(v: &[Parted<T>], p: usize) -> Vec<&[T]> {
 /// about `SUB` copies (more hash bits), so each dedup table (~2*SUB slots) stays in L2.
 /// Stability keeps scan order inside a sub-bucket, so ties still go to the first copy.
 const SUB: usize = 8192;
-fn dedup<T: Copy>(parts: &[&[T]], key: impl Fn(&T) -> u64, better: impl Fn(&T, &T) -> bool, mut sink: impl FnMut(&T)) -> usize {
+fn dedup<T: Copy>(parts: &[&[T]], key: impl Fn(&T) -> u64, same: impl Fn(&T, &T) -> bool, better: impl Fn(&T, &T) -> bool, mut sink: impl FnMut(&T)) -> usize {
     let n: usize = parts.iter().map(|x| x.len()).sum();
     // RW26: singleton filter. 2-bit saturating counters (0, 1, 2 = "two or more") over
     // ~8n hash slots. A row whose slot counted exactly 1 is the only copy of its key, so it
@@ -999,13 +1002,13 @@ fn dedup<T: Copy>(parts: &[&[T]], key: impl Fn(&T) -> u64, better: impl Fn(&T, &
         }
         drop(cnt);
         // the exact pass runs once over the leftovers (never the filter again)
-        return kept + dedup_exact(&[&rest[..]], key, better, sink);
+        return kept + dedup_exact(&[&rest[..]], key, same, better, sink);
     }
-    dedup_exact(parts, key, better, sink)
+    dedup_exact(parts, key, same, better, sink)
 }
 
 /// The exact dedup (RW13): stable counting sort into L2-sized sub-buckets, one table each.
-fn dedup_exact<T: Copy>(parts: &[&[T]], key: impl Fn(&T) -> u64, better: impl Fn(&T, &T) -> bool, mut sink: impl FnMut(&T)) -> usize {
+fn dedup_exact<T: Copy>(parts: &[&[T]], key: impl Fn(&T) -> u64, same: impl Fn(&T, &T) -> bool, better: impl Fn(&T, &T) -> bool, mut sink: impl FnMut(&T)) -> usize {
     let n: usize = parts.iter().map(|x| x.len()).sum();
     {
     let sbits = if n <= 2 * SUB { 0 } else { (n / SUB).next_power_of_two().trailing_zeros() };
@@ -1058,7 +1061,8 @@ fn dedup_exact<T: Copy>(parts: &[&[T]], key: impl Fn(&T) -> u64, better: impl Fn
                     used += 1;
                     break;
                 }
-                if s.0 == k {
+                // v3: equal keys of pointer-keyed IDs are confirmed byte by byte (`same`)
+                if s.0 == k && same(r, &rows[s.1 as usize]) {
                     if better(r, &rows[s.1 as usize]) {
                         s.1 = ri as u32;
                     }
@@ -1203,7 +1207,7 @@ impl<'a> ClScan<'a> {
             self.noid += 1;
             return;
         }
-        let cid = key_of(f[0]);
+        let cid = keys::local_key(f[0]); // v3: pointer key when long (byte-order ties only)
         if f[1].is_empty() {
             self.why[1] += 1;
             return;
@@ -1375,7 +1379,7 @@ impl<'a> EvScan<'a> {
     }
     #[inline(always)]
     fn put(&mut self, r: EvRec) {
-        self.parts.push(keys::part(r.eid, LOG_NB), r);
+        self.parts.push(keys::part(keys::id_hash_key(r.eid), LOG_NB), r);
     }
     #[inline(always)]
     fn valid(&mut self, r: EvRec, pk: u64, pm: u64) {
@@ -1428,7 +1432,7 @@ impl<'a> EvScan<'a> {
             self.noid += 1;
             return;
         }
-        let eid = key_of(f[0]);
+        let eid = keys::local_key(f[0]); // v3: pointer key when long (dedup compares bytes)
         let ingest = parse_ingest(f[3]);
         let mut r = EvRec { eid, rank: rank_of(ingest), person: keys::EMPTY, ts: 0, price: 0, cat: 0 };
         // validation of this copy, in the order of rules.md (reason codes for stats)
@@ -1508,7 +1512,7 @@ fn events_dedup(by_eid: ByPerson<EvRec>, unknown_cat: u32, names: Option<&Names>
             let mut emit = |r: EvRec, person: u64| {
                 dst.push(keys::part(person, LOG_NB), EvV { person, ts: r.ts, cat: r.cat, price: r.price });
             };
-            let kept = dedup(&parts, |r: &EvRec| r.eid, |a, b| a.rank < b.rank, |r| {
+            let kept = dedup(&parts, |r: &EvRec| keys::id_hash_key(r.eid), |a, b| keys::same_id(a.eid, b.eid), |a, b| a.rank < b.rank, |r| {
                 if r.person == keys::EMPTY {
                     c[r.price as usize] += 1;
                     return;
@@ -1819,7 +1823,7 @@ mod dedup_tests {
             }
             let mut got: Vec<(u64, u64, u32)> = Vec::new();
             let sl: Vec<&[(u64, u64, u32)]> = parts.iter().map(|v| &v[..]).collect();
-            let kept = super::dedup(&sl, |r| r.0, |a, b| a.1 < b.1, |r| got.push(*r));
+            let kept = super::dedup(&sl, |r| r.0, |a, b| a.0 == b.0, |a, b| a.1 < b.1, |r| got.push(*r));
             let mut want: std::collections::HashMap<u64, (u64, u64, u32)> = std::collections::HashMap::new();
             for p in &parts {
                 for r in p {

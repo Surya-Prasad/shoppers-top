@@ -18,6 +18,59 @@ use crate::{Map, new_map};
 type S = &'static [u8];
 
 pub const INTERNED: u64 = 1 << 63;
+/// v3: pointer keys, INTERNED | PTR_BIT | len << 47 | address: an ID kept as its location in
+/// a still-mapped input file, for IDs that only need equality by bytes (`same_bytes`) or byte
+/// order (`cmp_bytes`), never global identity: event IDs (dedup) and click IDs (tie-breaks).
+/// Two pointer keys of equal IDs differ; compare them with `same_bytes`.
+pub const PTR_BIT: u64 = 1 << 62;
+const PTR_ADDR: u64 = (1 << 47) - 1;
+
+/// The pointer key of `s` (callers keep its mapping alive while the key is used), or None
+/// when the address or length does not fit (the caller then uses `key_of`).
+#[inline]
+pub fn ptr_key(s: S) -> Option<u64> {
+    let a = s.as_ptr() as u64;
+    (a <= PTR_ADDR && s.len() < (1 << 14) && !s.is_empty()).then_some(INTERNED | PTR_BIT | (s.len() as u64) << 47 | a)
+}
+
+#[inline(always)]
+pub fn is_ptr(k: u64) -> bool {
+    k & (INTERNED | PTR_BIT) == INTERNED | PTR_BIT
+}
+
+#[inline(always)]
+fn ptr_bytes(k: u64) -> S {
+    // SAFETY: ptr_key built k from a live 'static slice; its mapping is kept while k is used
+    unsafe { std::slice::from_raw_parts((k & PTR_ADDR) as *const u8, ((k >> 47) & ((1 << 14) - 1)) as usize) }
+}
+
+/// v3: the key of an ID that needs only byte equality/order: packed when it packs, a pointer
+/// key when it is longer than 9 bytes, else interned.
+#[inline]
+pub fn local_key(s: S) -> u64 {
+    if s.is_empty() {
+        return EMPTY;
+    }
+    match pack9(s) {
+        Some(k) => k,
+        None if s.len() > 9 => ptr_key(s).unwrap_or_else(|| intern(s)),
+        None => intern(s),
+    }
+}
+
+/// v3: a hash of the ID behind a key that equal IDs share whatever their key kind: the key
+/// itself for packed/interned keys, a hash of the bytes for pointer keys (an ID has one kind:
+/// longer than 9 bytes always gives a pointer key, unless it did not fit one, then interned).
+#[inline]
+pub fn id_hash_key(k: u64) -> u64 {
+    if is_ptr(k) { byte_hash(ptr_bytes(k)) | 1 } else { k }
+}
+
+/// v3: equal IDs (any key kinds produced by `local_key` for the same input).
+#[inline]
+pub fn same_id(a: u64, b: u64) -> bool {
+    a == b || (is_ptr(a) && is_ptr(b) && ptr_bytes(a) == ptr_bytes(b))
+}
 pub const EMPTY: u64 = 0;
 
 // v3: the interner is sharded (no global lock) and arena-backed (no allocation per ID).
@@ -123,6 +176,9 @@ pub fn intern(s: S) -> u64 {
 
 /// The bytes of a key, into `buf` for packed keys.
 pub fn bytes_of(k: u64, buf: &mut [u8; 9]) -> &[u8] {
+    if is_ptr(k) {
+        return ptr_bytes(k);
+    }
     if k & INTERNED != 0 {
         let sh = ((k >> 32) as usize) & (SHARDS - 1);
         return shards()[sh].lock().unwrap().bytes[(k & 0xffff_ffff) as usize];
@@ -375,5 +431,31 @@ mod tests {
         }
         let (mn, mx) = (*b.iter().min().unwrap(), *b.iter().max().unwrap());
         assert!(mn > 1_700 && mx < 2_300, "{mn} {mx}");
+    }
+}
+
+#[cfg(test)]
+mod ptr_tests {
+    use super::*;
+    /// v3: pointer keys: equal bytes in different buffers are the same ID with the same hash
+    /// key; different bytes are different; byte order and bytes_of follow the bytes.
+    #[test]
+    fn ptr_keys_exact() {
+        let mk = |s: &str| -> S { Box::leak(s.as_bytes().to_vec().into_boxed_slice()) };
+        let ids = ["e0123456789abcdef0123456789abcdef", "e0123456789abcdef0123456789abcdee", "E0123456789ABCDEF0123456789ABCDEF", "k_long_click_id_1", "short"];
+        for a in ids {
+            for b in ids {
+                let (ka, kb) = (local_key(mk(a)), local_key(mk(b)));
+                assert_eq!(same_id(ka, kb), a == b, "{a} {b}");
+                if a == b {
+                    assert_eq!(id_hash_key(ka), id_hash_key(kb));
+                }
+                assert_eq!(cmp_bytes(ka, kb), a.as_bytes().cmp(b.as_bytes()), "{a} {b}");
+                let mut buf = [0u8; 9];
+                assert_eq!(bytes_of(ka, &mut buf), a.as_bytes());
+            }
+        }
+        assert!(is_ptr(local_key(mk(ids[0]))) && !is_ptr(local_key(mk("short"))));
+        assert_ne!(id_hash_key(local_key(mk(ids[0]))), EMPTY);
     }
 }

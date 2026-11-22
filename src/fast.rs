@@ -172,6 +172,19 @@ unsafe fn id(p: *const u8, f: (u32, u32)) -> Option<u64> {
     unsafe { pack_at(p.add(f.0 as usize), n) }
 }
 
+/// v3: `keys::local_key` of a non-empty ID field (pointer key when longer than 9 bytes).
+#[inline(always)]
+unsafe fn id_local(p: *const u8, f: (u32, u32)) -> Option<u64> {
+    let n = (f.1 - f.0) as usize;
+    if n == 0 {
+        return None;
+    }
+    if n > 9 {
+        return Some(crate::keys::local_key(unsafe { slice(p, f) }));
+    }
+    unsafe { pack_at(p.add(f.0 as usize), n) }
+}
+
 /// v2: `ingest_ts` from an already parsed `ts` when both are F1 with the same date and hour
 /// (`YYYY-MM-DDTHH:` equal): only `MM:SS` of `ingest_ts` is checked and parsed, so the result
 /// equals `timefmt::parse(ingest_ts)`. None when the shortcut does not apply (the caller then
@@ -223,7 +236,7 @@ pub struct Ev {
 #[inline(always)]
 pub unsafe fn event(p: *const u8, lo: i64, hi: i64, pprefix: u8) -> Option<(usize, Ev)> {
     let (len, f) = unsafe { fields::<7>(p) }?;
-    let eid = unsafe { id(p, f[0]) }?;
+    let eid = unsafe { id_local(p, f[0]) }?;
     let user = unsafe { id(p, f[1]) }?;
     let ts = crate::timefmt::parse(unsafe { slice(p, f[2]) })?;
     if ts < lo || ts >= hi {
@@ -289,7 +302,7 @@ pub struct Cl {
 #[inline(always)]
 pub unsafe fn click(p: *const u8, lo: i64, hi: i64) -> Option<(usize, Cl)> {
     let (len, f) = unsafe { fields::<4>(p) }?;
-    let cid = unsafe { id(p, f[0]) }?;
+    let cid = unsafe { id_local(p, f[0]) }?;
     let user = unsafe { id(p, f[1]) }?;
     let camp = unsafe { id(p, f[2]) }?;
     let ts = crate::timefmt::parse(unsafe { slice(p, f[3]) })?;
@@ -489,7 +502,8 @@ mod tests {
                 let key = |x: &[u8]| -> Option<u64> {
                     if x.is_empty() { None } else if x.len() > 9 { Some(crate::keys::intern(Box::leak(x.to_vec().into_boxed_slice()))) } else { pack9(x) }
                 };
-                assert_eq!(Some(ev.eid), key(f[0]));
+                let lk = crate::keys::local_key(Box::leak(f[0].to_vec().into_boxed_slice()));
+                assert!(crate::keys::same_id(ev.eid, lk) && crate::keys::id_hash_key(ev.eid) == crate::keys::id_hash_key(lk));
                 assert_eq!(Some(ev.user), key(f[1]));
                 assert_eq!(Some(ev.product), key(f[5]));
                 assert_eq!(ev.pnum, crate::packed::canon(f[5], b'p').unwrap_or(0), "{:?}", String::from_utf8_lossy(f[5]));
