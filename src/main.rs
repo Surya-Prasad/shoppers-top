@@ -1308,7 +1308,9 @@ struct EvScan<'a> {
     // product slots of a whole batch are prefetched before any lookup runs
     pend: [(EvRec, u64, u64, u64); PBATCH],
     // v4: long user IDs of the batch (bytes, interner hint); `ul` is the next row's
-    pend_ul: [(S, keys::Hint); PBATCH],
+    // (sparse: only rows with a long user, as (row index in the batch, bytes, hint))
+    pend_ul: [(usize, S, keys::Hint); PBATCH],
+    nul: usize,
     ul: (S, keys::Hint),
     // None: persons are resolved later (events dedup); `person` keeps the user key
     names: Option<&'a Names>,
@@ -1328,7 +1330,8 @@ impl<'a> EvScan<'a> {
         EvScan {
             parts: Parted::in_arena(ev_per(bytes), arena), // v3d: event lines ~82 B (generator 2026-11-22), ~14% room
             pend: [(Z, 0, 0, 0); PBATCH],
-            pend_ul: [(&[], keys::Hint::NONE); PBATCH],
+            pend_ul: [(0, &[], keys::Hint::NONE); PBATCH],
+            nul: 0,
             ul: (&[], keys::Hint::NONE),
             names,
             np: 0,
@@ -1358,7 +1361,11 @@ impl<'a> EvScan<'a> {
             names.prefetch(um);
         }
         self.pend[self.np] = (r, pk, pm, um);
-        self.pend_ul[self.np] = std::mem::replace(&mut self.ul, (&[], keys::Hint::NONE));
+        if !self.ul.0.is_empty() {
+            self.pend_ul[self.nul] = (self.np, self.ul.0, self.ul.1);
+            self.nul += 1;
+            self.ul.0 = &[];
+        }
         self.np += 1;
         if self.np == PBATCH {
             self.flush();
@@ -1366,10 +1373,12 @@ impl<'a> EvScan<'a> {
     }
     #[inline]
     fn flush(&mut self) {
+        let mut j = 0usize;
         for i in 0..self.np {
             let (mut r, pk, pm, um) = self.pend[i];
-            let (u, h) = self.pend_ul[i];
-            if !u.is_empty() {
+            if j < self.nul && self.pend_ul[j].0 == i {
+                let (_, u, h) = self.pend_ul[j];
+                j += 1;
                 r.person = keys::intern_hinted(u, &h);
                 if let Some(n) = self.names {
                     r.person = n.person(r.person);
@@ -1383,6 +1392,7 @@ impl<'a> EvScan<'a> {
             self.put(r);
         }
         self.np = 0;
+        self.nul = 0;
     }
     fn finish(mut self, stats: &Stats) -> Parted<EvRec> {
         self.flush();
