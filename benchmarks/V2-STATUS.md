@@ -19,6 +19,16 @@ expensive file-mapping faults on these VMs; profiling). The harness now keeps on
 
 CI runners vary a lot (EPYC 7763 / 9V45 / 9V74, Xeon 8370C / 6975P / 8573C), so only same-run pairs are compared.
 
+## The generator changed (found 2026-11-22 ~04:00 UTC)
+
+The official generator.zip and dev-answer.zip were replaced. New version: user, event and click IDs come from a keyed
+Feistel bijection and **1 in 8 IDs is the prefix plus 32 lowercase hex digits** (33 bytes) instead of base 36.
+Those IDs do not pack into u64 keys, so every engine built on that assumption (b9481b1 and all v2 commits up to
+`d7cc29e`) sends them through one global `Mutex` interner, and the v2 fast decoder declined every line with a long ID.
+That, not the CI runners, is why every A/B since ~02:00 UTC ran ~3x slower (profile: `keys::intern` 11% plus ~20%
+mutex/futex). Local, new 20M seed 11: b9481b1 **~11 s**, a02705c ~11 s, `3b0bd10` (sharded arena interner, long IDs in
+the fast decoder, no THP advice) **~4.2 s**. All local gates re-run on regenerated data (new dev answer MATCH).
+
 ## Steps
 
 | Step | Commit | What | CI A/B (20M / 60M), same runner |
@@ -35,6 +45,7 @@ CI runners vary a lot (EPYC 7763 / 9V45 / 9V74, Xeon 8370C / 6975P / 8573C), so 
 | ClScan | `80c1ff3` | monomorphic clicks loop (no measured change locally) | vs b9481b1: **−15.9% (7/7) / −15.7% (5/5)** (EPYC 7763); Docker PASS |
 | NB 512 | `466f6a7` (exp/v2-nb512) | 512 hash partitions | vs 80c1ff3: **+5.2% (0/7)** / +0.5% (Xeon 6975P) — dropped |
 | P2c | `5306bd6` | bit filter of linked users (skip probes for unlinked) | vs 80c1ff3: −1.2% (6/7) / **+4.0% (0/5)** (Xeon 6973P) — reverted |
+| v3 long IDs | `3b0bd10` | sharded arena interner; fast decoder interns IDs > 9 bytes; Parted without THP advice | local new 20M: 11 s → 4.2 s; CI pending |
 | v3 Parted | `d7cc29e` | per-source partition buffers on huge-page mappings | vs 599c093: −2.9% (7/7) / −5.0% (5/5) (EPYC 7763, I/O-bound runner); vs 1c0881a: **−3.5% (6/7) / −3.0% (4/5)** (EPYC 7763, 20M on tmpfs) — keep; RSS 60M 11.0 → 12.9 GB |
 | PBATCH 64 | `4ad18e2` (ab/v2-pb64) | prefetch batch 32 → 64 | vs e450f86: −0.9% (4/7) / **−2.3% (5/5)** (EPYC 9V45) — take |
 | CHUNK 2 MiB | `788ec62` (ab/v2-chunk2) | scan granule 4 → 2 MiB | vs e450f86: **+6.7% (0/7) / +8.2% (0/5)** (EPYC 9V74) — dropped |
