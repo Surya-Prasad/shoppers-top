@@ -1,0 +1,5 @@
+# docker check of 80c1ff330450e1638a7b29d438a37f71f3b385a9 on AMD EPYC 7763 64-Core Processor
+- image build: OK in 116s, size 29960581 bytes, user 1000:1000
+- fixtures in container: 36/36 fixtures passed
+- dev set in container: exit 0, 0.55 s, compare: MATCH
+- output files: 4 user_daily, 1 campaign_daily
