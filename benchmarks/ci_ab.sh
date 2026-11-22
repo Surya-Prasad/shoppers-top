@@ -67,7 +67,16 @@ dev=$("$PY" scripts/compare.py "$W/o-dev" "$ANS" 2>&1 | tail -1) || true
 : > "$W/times.tsv"
 for d in d20 d60; do
   ev=$EV20; n=$PAIRS20; [ $d = d60 ] && { ev=$EV60; n=$PAIRS60; }
-  "$GEN" --seed 11 --events "$ev" --clicks $((ev / 4)) --output "$W/$d" >/dev/null
+  # The 20M set goes to RAM-backed /dev/shm when it fits (runners no longer keep the input in
+  # the page cache between runs); the 60M set (5.3 GB + ~11 GB process) would not fit in RAM.
+  if [ $d = d20 ] && [ -d /dev/shm ] && [ "$(df -Pk /dev/shm | awk 'NR==2{print $4}')" -gt 4000000 ]; then
+    mkdir -p /dev/shm/ab && rm -rf "$W/$d" && ln -s /dev/shm/ab/$d "$W/$d"
+    "$GEN" --seed 11 --events "$ev" --clicks $((ev / 4)) --output /dev/shm/ab/$d >/dev/null
+    echo "$d input: /dev/shm (tmpfs)" >> "$W/where.txt"
+  else
+    "$GEN" --seed 11 --events "$ev" --clicks $((ev / 4)) --output "$W/$d" >/dev/null
+    echo "$d input: disk ($W)" >> "$W/where.txt"
+  fi
   log "$d ready: $(du -sh "$W/$d" | cut -f1); $(free -g | awk '/^Mem:/{print $7" GB available"}')"
   read -r _ _ ra < <(run "$BA" "$W/$d" "$W/oa-$d"); read -r _ _ rb < <(run "$BB" "$W/$d" "$W/ob-$d")
   eq=$("$PY" scripts/compare.py "$W/oa-$d" "$W/ob-$d" 2>&1 | tail -1) || true
@@ -82,11 +91,12 @@ for d in d20 d60; do
       done
     done
   fi
-  [ $d = d60 ] || rm -rf "$W/$d"
+  [ $d = d60 ] || rm -rf "$W/$d" /dev/shm/ab/$d
 done
 log "gate: $GATE ${NOTES[*]:-}"
 grep -hE '^\[|^    ' "$W/o-t.log" 2>/dev/null | tail -30 > "$W/phases.txt" || true
 echo "runner memory: $(free -g | awk '/^Mem:/{print $2" GB total"}')" >> "$W/phases.txt"
+cat "$W/where.txt" >> "$W/phases.txt" 2>/dev/null || true
 "$PY" benchmarks/ab_summary.py "$W/times.tsv" "$BASE" "$CAND" "$GATE" "$W/phases.txt" \
   "$(lscpu | sed -n 's/^Model name: *//p') x $NPROC" "${NOTES[*]:-}" "$T/result.md" "$T/result.json"
 cat "$T/result.md"
