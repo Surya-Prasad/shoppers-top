@@ -1,59 +1,59 @@
 {
- "base": "537f83e7adce001ffafb0451028b24dc9a3ffeec",
+ "base": "b9481b11a506d099ebe47963c927c8fe7bbba988",
  "cand": "9b850aa78f07ba6362fd5a5bdbba4345a48e23d4",
  "gate": "pass",
- "cpu": "AMD EPYC 7763 64-Core Processor x 4",
+ "cpu": "AMD EPYC 9V45 96-Core Processor x 4",
  "notes": "",
  "sizes": {
   "d20": {
    "base": [
-    2.4188,
-    2.4599,
-    2.4094,
-    2.4584,
-    2.4296,
-    2.4082,
-    2.3988
+    2.169,
+    2.1424,
+    2.1051,
+    2.1992,
+    2.1834,
+    2.2143,
+    2.3137
    ],
    "cand": [
-    2.4217,
-    2.4279,
-    2.4125,
-    2.3767,
-    2.3979,
-    2.427,
-    2.4059
+    1.8281,
+    1.8662,
+    1.8657,
+    1.8279,
+    1.9269,
+    1.9588,
+    1.9158
    ],
-   "base_median": 2.4188,
-   "cand_median": 2.4125,
-   "delta_pct": -0.26,
-   "cand_wins": 3,
+   "base_median": 2.1834,
+   "cand_median": 1.8662,
+   "delta_pct": -14.53,
+   "cand_wins": 7,
    "pairs": 7,
-   "base_rss_gb": 3.12,
+   "base_rss_gb": 3.43,
    "cand_rss_gb": 3.12
   },
   "d60": {
    "base": [
-    8.097,
-    7.3265,
-    7.7111,
-    7.2358,
-    7.7361
+    6.6413,
+    6.5276,
+    6.0201,
+    6.1748,
+    6.3408
    ],
    "cand": [
-    7.3685,
-    7.2597,
-    7.3117,
-    7.1314,
-    7.5335
+    5.4528,
+    5.6248,
+    5.5907,
+    5.3511,
+    5.4262
    ],
-   "base_median": 7.7111,
-   "cand_median": 7.3117,
-   "delta_pct": -5.18,
+   "base_median": 6.3408,
+   "cand_median": 5.4528,
+   "delta_pct": -14.0,
    "cand_wins": 5,
    "pairs": 5,
-   "base_rss_gb": 9.33,
-   "cand_rss_gb": 9.34
+   "base_rss_gb": 10.22,
+   "cand_rss_gb": 9.35
   }
  }
 }
