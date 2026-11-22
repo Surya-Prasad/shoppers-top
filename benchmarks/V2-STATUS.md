@@ -26,7 +26,7 @@ CI runners vary a lot (EPYC 7763 / 9V45 / 9V74, Xeon 8370C / 6975P / 8573C), so 
 | P2c | `5306bd6` | bit filter of linked users (skip probes for unlinked) | vs 80c1ff3: −1.2% (6/7) / **+4.0% (0/5)** (Xeon 6973P) — reverted |
 | PBATCH 64 | `4ad18e2` (ab/v2-pb64) | prefetch batch 32 → 64 | vs e450f86: −0.9% (4/7) / **−2.3% (5/5)** (EPYC 9V45) — take |
 | CHUNK 2 MiB | `788ec62` (ab/v2-chunk2) | scan granule 4 → 2 MiB | vs e450f86: **+6.7% (0/7) / +8.2% (0/5)** (EPYC 9V74) — dropped |
-| 1 link thread | `ab/v2-lk1` | link pool ncpu/4 | vs e450f86 pending |
+| 1 link thread | `039fd37` (ab/v2-lk1) | link pool ncpu/4 | vs e450f86: −0.0% (4/7) / −0.7% (4/5) (EPYC 7763) — neutral, keep ncpu/2 |
 | links-overlap | `e450f86` | links on own pool concurrent with the events scan; persons in dedup | vs 80c1ff3: **−3.9% (6/7) / −2.9% (4/5)** (EPYC 9V74); Docker PASS |
 
 Whole-branch checks vs b9481b1: `e450f86` **−17.8% (7/7) / −16.8% (5/5)** on EPYC 7763; `9b850aa` **−14.5% (7/7) / −14.0% (5/5)** on EPYC 9V45; `537f83e` **−15.4% (7/7) / −12.9% (5/5)** on EPYC 7763; `571ea2e` −2.2% (6/7) / −12.4% (5/5) on Xeon 6975P; `70d5eef` −13.0% (7/7) /
