@@ -1,0 +1,59 @@
+{
+ "base": "e450f86724aa71882be512bc7ae8ba39bc0fd221",
+ "cand": "4ad18e2b109b01b6230444a6911deb57ae198afa",
+ "gate": "pass",
+ "cpu": "AMD EPYC 9V45 96-Core Processor x 4",
+ "notes": "",
+ "sizes": {
+  "d20": {
+   "base": [
+    1.5232,
+    1.5329,
+    1.5375,
+    1.569,
+    1.5677,
+    1.5449,
+    1.5442
+   ],
+   "cand": [
+    1.5518,
+    1.5433,
+    1.53,
+    1.5797,
+    1.5265,
+    1.5184,
+    1.5217
+   ],
+   "base_median": 1.5442,
+   "cand_median": 1.53,
+   "delta_pct": -0.92,
+   "cand_wins": 4,
+   "pairs": 7,
+   "base_rss_gb": 3.15,
+   "cand_rss_gb": 3.15
+  },
+  "d60": {
+   "base": [
+    4.8796,
+    4.8899,
+    4.7973,
+    4.7368,
+    4.7286
+   ],
+   "cand": [
+    4.6683,
+    4.7158,
+    4.6861,
+    4.676,
+    4.6954
+   ],
+   "base_median": 4.7973,
+   "cand_median": 4.6861,
+   "delta_pct": -2.32,
+   "cand_wins": 5,
+   "pairs": 5,
+   "base_rss_gb": 9.43,
+   "cand_rss_gb": 9.43
+  }
+ }
+}
